@@ -1,4 +1,5 @@
-FROM quay.io/centos-bootc/centos-bootc-dev:stream9
+# FROM quay.io/centos-bootc/centos-bootc-dev:stream9
+FROM quay.io/ckyrouac/bootc-dev:logically-bound
 
 COPY ./etc/sysctl.conf /etc/sysctl.conf
 COPY ./etc/systemd/system/lldb-server.service /etc/systemd/system/lldb-server.service
