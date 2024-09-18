@@ -25,7 +25,7 @@ enabled_metadata=1
 EOF
 
 # Our tests depend on this
-dnf -y install skopeo zstd
+dnf -y install skopeo zstd podman
 
 case $OS_ID in
     fedora) dnf -y builddep bootc ;;
