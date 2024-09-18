@@ -47,6 +47,12 @@ jobs:
         run: mkdir -p target/man && cargo run --features=docgen -- man --directory target/man
       - name: Clippy (gate on correctness and suspicous)
         run: make validate-rust
+  tmt-tests:
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'control/skip-ci') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: tmt booted tests
+        run: make test-tmt
   fedora-container-tests:
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'control/skip-ci') }}
     runs-on: ubuntu-24.04
