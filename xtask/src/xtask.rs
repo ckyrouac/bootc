@@ -182,6 +182,13 @@ fn test_tmt(sh: &Shell) -> Result<()> {
 
     cmd!(sh, "cargo run -p tests-integration run-vm prepare-tmt").run()?;
 
+    // pull some small images that are used for LBI installation tests
+    cmd!(
+        sh,
+        "podman pull quay.io/curl/curl-base:latest quay.io/curl/curl:latest"
+    )
+    .run()?;
+
     for (_prio, name) in all_plan_files {
         // cc https://pagure.io/testcloud/pull-request/174
         cmd!(sh, "rm -vf /var/tmp/tmt/testcloud/images/disk.qcow2").run()?;
