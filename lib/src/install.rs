@@ -513,19 +513,25 @@ impl SourceInfo {
             require_skopeo_with_containers_storage()?;
         }
 
+        let selinux = if Path::new("/ostree/repo").try_exists()? {
+            Self::have_selinux_from_repo(root)?
+        } else {
+            lsm::have_selinux_policy(root)?
+        };
+
         Self::new(
             imageref,
             Some(digest),
-            root,
             true,
             have_host_container_storage,
+            selinux,
         )
     }
 
     #[context("Creating source info from a given imageref")]
-    pub(crate) fn from_imageref(imageref: &str, root: &Dir) -> Result<Self> {
+    pub(crate) fn from_imageref(imageref: &str) -> Result<Self> {
         let imageref = ostree_container::ImageReference::try_from(imageref)?;
-        Self::new(imageref, None, root, false, false)
+        Self::new(imageref, None, false, false, true)
     }
 
     fn have_selinux_from_repo(root: &Dir) -> Result<bool> {
@@ -549,15 +555,10 @@ impl SourceInfo {
     fn new(
         imageref: ostree_container::ImageReference,
         digest: Option<String>,
-        root: &Dir,
         in_host_mountns: bool,
         have_host_container_storage: bool,
+        selinux: bool,
     ) -> Result<Self> {
-        let selinux = if Path::new("/ostree/repo").try_exists()? {
-            Self::have_selinux_from_repo(root)?
-        } else {
-            lsm::have_selinux_policy(root)?
-        };
         Ok(Self {
             imageref,
             digest,
@@ -657,7 +658,7 @@ async fn install_container(
     state: &State,
     root_setup: &RootSetup,
     sysroot: &ostree::Sysroot,
-) -> Result<(ostree::Deployment, InstallAleph)> {
+) -> Result<(ostree::Deployment, String, InstallAleph)> {
     let sepolicy = state.load_policy()?;
     let sepolicy = sepolicy.as_ref();
     let stateroot = state.stateroot();
@@ -821,7 +822,7 @@ async fn install_container(
         selinux: state.selinux_state.to_aleph().to_string(),
     };
 
-    Ok((deployment, aleph))
+    Ok((deployment, path.to_string(), aleph))
 }
 
 /// Run a command in the host mount namespace
@@ -1192,7 +1193,7 @@ async fn prepare_install(
 
             SourceInfo::from_container(&rootfs, &container_info)?
         }
-        Some(source) => SourceInfo::from_imageref(&source, &rootfs)?,
+        Some(source) => SourceInfo::from_imageref(&source)?,
     };
 
     // Parse the target CLI image reference options and create the *target* image
@@ -1252,12 +1253,17 @@ async fn prepare_install(
         println!("Digest: {digest}");
     }
 
-    let install_config = config::load_config()?;
-    if install_config.is_some() {
-        tracing::debug!("Loaded install configuration");
+    let install_config = if external_source {
+        None
     } else {
-        tracing::debug!("No install configuration found");
-    }
+        let install_config = config::load_config()?;
+        if install_config.is_some() {
+            tracing::debug!("Loaded install configuration");
+        } else {
+            tracing::debug!("No install configuration found");
+        }
+        install_config
+    };
 
     // Eagerly read the file now to ensure we error out early if e.g. it doesn't exist,
     // instead of much later after we're 80% of the way through an install.
@@ -1298,7 +1304,7 @@ async fn install_with_sysroot(
 ) -> Result<()> {
     // And actually set up the container in that root, returning a deployment and
     // the aleph state (see below).
-    let (_deployment, aleph) = install_container(state, rootfs, &sysroot).await?;
+    let (_deployment, deployment_root, aleph) = install_container(state, rootfs, &sysroot).await?;
     // Write the aleph data that captures the system state at the time of provisioning for aid in future debugging.
     rootfs
         .rootfs_fd
@@ -1314,6 +1320,7 @@ async fn install_with_sysroot(
     } else {
         crate::bootloader::install_via_bootupd(
             &rootfs.device_info,
+            deployment_root,
             &rootfs.rootfs,
             &state.config_opts,
         )?;

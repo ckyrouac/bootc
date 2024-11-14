@@ -1,7 +1,5 @@
 use std::{
-    ffi::OsStr,
-    io::{Seek, Write},
-    process::{Command, Stdio},
+    ffi::OsStr, io::{Seek, Write}, os::unix::process::CommandExt, process::{Command, Stdio}
 };
 
 use anyhow::{Context, Result};
@@ -26,6 +24,7 @@ pub(crate) struct Task {
     description: String,
     verbosity: CmdVerbosity,
     quiet_output: bool,
+    container_root: Option<String>,
     pub(crate) cmd: Command,
 }
 
@@ -48,6 +47,32 @@ impl Task {
         Ok(self)
     }
 
+    #[allow(unsafe_code)]
+    pub(crate) fn container_root(mut self, dir: String) -> Result<Self> {
+        // self.cmd = Command::new("chroot");
+        // self.cmd.arg(&dir);
+        // self.cmd.args(self.cmd.get_args());
+
+        println!("!!!!!!!! container_root: {:?}", self.container_root);
+        if let Some(root) = self.container_root {
+            unsafe {
+                self.cmd.pre_exec(move || {
+                    // Change the root directory
+                    // nix::unistd::chroot(new_root)?;
+
+                    let root = root.clone();
+                    rustix::process::chroot(format!("{:?}", root))?;
+                    // Change the working directory to the root of the new environment
+                    // std::env::set_current_dir("/")?;
+                    Ok(())
+                });
+            };
+        }
+
+        self.container_root = Some(dir);
+        Ok(self)
+    }
+
     pub(crate) fn new_cmd(description: impl AsRef<str>, mut cmd: Command) -> Self {
         let description = description.as_ref().to_string();
         // Default to noninteractive
@@ -57,6 +82,7 @@ impl Task {
             verbosity: Default::default(),
             quiet_output: false,
             cmd,
+            container_root: None,
         }
     }
 

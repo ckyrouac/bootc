@@ -18,42 +18,79 @@ pub(crate) const PREPBOOT_MBR_TYPE: &str = "41";
 /// we explicitly find one with a specific label.
 ///
 /// This should get fixed once we execute on https://github.com/coreos/bootupd/issues/432
-fn get_bootupd_device(device: &PartitionTable) -> Result<Utf8PathBuf> {
-    #[cfg(target_arch = "powerpc64")]
-    {
-        return device
-            .partitions
-            .iter()
-            .find(|p| matches!(p.parttype.as_str(), PREPBOOT_GUID | PREPBOOT_MBR_TYPE))
-            .ok_or_else(|| {
-                anyhow::anyhow!("Failed to find PReP partition with GUID {PREPBOOT_GUID}")
-            })
-            .map(|dev| dev.node.as_str().into());
-    }
-    #[cfg(not(target_arch = "powerpc64"))]
-    return Ok(device.path().into());
-}
+// fn get_bootupd_device(device: &PartitionTable) -> Result<Utf8PathBuf> {
+//     #[cfg(target_arch = "powerpc64")]
+//     {
+//         return device
+//             .partitions
+//             .iter()
+//             .find(|p| matches!(p.parttype.as_str(), PREPBOOT_GUID | PREPBOOT_MBR_TYPE))
+//             .ok_or_else(|| {
+//                 anyhow::anyhow!("Failed to find PReP partition with GUID {PREPBOOT_GUID}")
+//             })
+//             .map(|dev| dev.node.as_str().into());
+//     }
+//     #[cfg(not(target_arch = "powerpc64"))]
+//     return Ok(device.path().into());
+// }
 
 #[context("Installing bootloader")]
 pub(crate) fn install_via_bootupd(
     device: &PartitionTable,
+    src_root: String,
     rootfs: &Utf8Path,
     configopts: &crate::install::InstallConfigOpts,
 ) -> Result<()> {
-    let verbose = std::env::var_os("BOOTC_BOOTLOADER_DEBUG").map(|_| "-vvvv");
-    // bootc defaults to only targeting the platform boot method.
-    let bootupd_opts = (!configopts.generic_image).then_some(["--update-firmware", "--auto"]);
+    let chroot = format!("{}/{}", rootfs, src_root);
+    let args = [
+        "run",
+        "--privileged",
+        "--rm",
+        "-e",
+        "PATH=/usr/bin:/usr/sbin",
+        "-v",
+        "/dev:/dev",
+        "-v",
+        "/var/mnt/boot:/boot",
+        "--rootfs",
+        chroot.as_str(),
+        "bootupctl",
+        "backend",
+        "install",
+        // "--update-firmware",
+        "--write-uuid",
+        "-vvvv",
+        "--auto",
+        "--device",
+        "/dev/loop49",
+        "/",
+    ]
+    .into_iter();
 
-    let devpath = get_bootupd_device(device)?;
-    let args = ["backend", "install", "--write-uuid"]
-        .into_iter()
-        .chain(verbose)
-        .chain(bootupd_opts.iter().copied().flatten())
-        .chain(["--device", devpath.as_str(), rootfs.as_str()]);
-    Task::new("Running bootupctl to install bootloader", "bootupctl")
+    Task::new("Running podman", "podman")
         .args(args)
         .verbose()
         .run()
+
+    // let verbose = std::env::var_os("BOOTC_BOOTLOADER_DEBUG").map(|_| "-vvvv");
+    // // bootc defaults to only targeting the platform boot method.
+    // let bootupd_opts = (!configopts.generic_image).then_some(["--update-firmware", "--auto"]);
+    //
+    // let devpath = get_bootupd_device(device)?;
+    // let args = [chroot.as_str(), "bootupctl", "backend", "install", "--write-uuid"]
+    //     .into_iter()
+    //     .chain(verbose)
+    //     .chain(bootupd_opts.iter().copied().flatten())
+    //     .chain([
+    //         // "--src-root=.",
+    //         "--device",
+    //         devpath.as_str(),
+    //         "/",
+    //     ]);
+    // Task::new("Running bootupctl to install bootloader", "chroot")
+    //     .args(args)
+    //     .verbose()
+    //     .run()
 }
 
 #[context("Installing bootloader using zipl")]

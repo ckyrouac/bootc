@@ -6,11 +6,12 @@ resolver = "2"
 opt-level = 1 # No optimizations are too slow for us.
 
 [profile.release]
-lto = "thin"
-# We use FFI so this is safest
-panic = "abort"
-# We assume we're being delivered via e.g. RPM which supports split debuginfo
-debug = true
+# changed these to make the binary tiny for use in anaconda
+opt-level = 'z'     # Optimize for size
+lto = true          # Enable link-time optimization
+codegen-units = 1   # Reduce number of codegen units to increase optimizations
+panic = 'abort'     # Abort on panic
+strip = true        # Strip symbols from binary*
 
 [profile.releaselto]
 codegen-units = 1
