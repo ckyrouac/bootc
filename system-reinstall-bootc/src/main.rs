@@ -25,10 +25,7 @@ fn run() -> Result<()> {
     podman::ensure_podman_installed()?;
 
     //pull image early so it can be inspected, e.g. to check for cloud-init
-    let mut pull_image_command = podman::pull_image_command(&config.bootc_image);
-    pull_image_command
-        .run_with_cmd_context()
-        .context(format!("pulling image {}", &config.bootc_image))?;
+    podman::pull_if_not_present(&config.bootc_image)?;
 
     println!();
 

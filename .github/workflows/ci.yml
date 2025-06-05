@@ -115,8 +115,8 @@ jobs:
           sudo mkdir -p /run/sshd
 
           sudo install -m 0755 target/release/system-reinstall-bootc /usr/bin/system-reinstall-bootc
-          sudo podman pull quay.io/fedora/fedora-bootc:42
-          sudo bootc-integration-tests system-reinstall quay.io/fedora/fedora-bootc:42 --test-threads=1
+          // These tests may mutate the system live so we can't run in parallel
+          sudo bootc-integration-tests system-reinstall localhost/bootc --test-threads=1
 
           # And the fsverity case
           sudo podman run --privileged --pid=host localhost/bootc-fsverity bootc install to-existing-root --stateroot=other \

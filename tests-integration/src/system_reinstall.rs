@@ -10,7 +10,7 @@ use std::{
 
 use crate::install;
 
-const TIMEOUT: u64 = 120000;
+const TIMEOUT: u64 = 60000;
 
 fn get_deployment_dir() -> Result<std::path::PathBuf> {
     let base_path = Path::new("/ostree/deploy/default/deploy");
@@ -62,11 +62,14 @@ pub(crate) fn run(image: &str, testargs: libtest_mimic::Arguments) -> Result<()>
             )?;
 
             // Basic flow stdout verification
+            p.exp_string(
+                format!("Image {image} is already present locally, skipping pull.").as_str(),
+            )?;
             p.exp_regex("Found only one user ([^:]+) with ([\\d]+) SSH authorized keys.")?;
             p.exp_string("Would you like to import its SSH authorized keys")?;
             p.exp_string("into the root user on the new bootc system?")?;
             p.exp_string("Then you can login as root@ using those keys. [Y/n]")?;
-            p.send_line("a")?;
+            p.send_line("y")?;
 
             p.exp_string("Going to run command:")?;
 
@@ -133,10 +136,32 @@ pub(crate) fn run(image: &str, testargs: libtest_mimic::Arguments) -> Result<()>
             )?;
 
             p.exp_regex("Found only one user ([^:]+) with ([\\d]+) SSH authorized keys.")?;
-            p.send_line("a")?;
+            p.exp_string("[Y/n]")?;
+            p.send_line("y")?;
             p.exp_string("NOTICE: This will replace the installed operating system and reboot. Are you sure you want to continue? [y/N]")?;
             p.send_line("y")?;
             p.exp_string("Insufficient free space")?;
+            p.exp_eof()?;
+            Ok(())
+        }),
+        Trial::test("image pull check", move || {
+            let sh = &xshell::Shell::new()?;
+            install::reset_root(sh, image)?;
+
+            // Run system-reinstall-bootc
+            let mut p: PtySession = rexpect::spawn(
+                "/usr/bin/system-reinstall-bootc quay.io/centos-bootc/centos-bootc:stream10",
+                Some(600000), // Increase timeout for pulling the image
+            )?;
+
+            p.exp_string("Image quay.io/centos-bootc/centos-bootc:stream10 is not present locally, pulling it now.")?;
+            p.exp_regex("Found only one user ([^:]+) with ([\\d]+) SSH authorized keys.")?;
+            p.exp_string("[Y/n]")?;
+            p.send_line("y")?;
+            p.exp_string("NOTICE: This will replace the installed operating system and reboot. Are you sure you want to continue? [y/N]")?;
+            p.send_line("y")?;
+            p.exp_string("Operation complete, rebooting in 10 seconds. Press Ctrl-C to cancel reboot, or press enter to continue immediately.")?;
+            p.send_control('c')?;
             p.exp_eof()?;
             Ok(())
         }),

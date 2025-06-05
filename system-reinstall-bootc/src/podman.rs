@@ -96,10 +96,33 @@ pub(crate) fn reinstall_command(image: &str, ssh_key_file: &str) -> Result<Comma
     Ok(command)
 }
 
-pub(crate) fn pull_image_command(image: &str) -> Command {
+fn pull_image_command(image: &str) -> Command {
     let mut command = Command::new("podman");
     command.args(["pull", image]);
     command
+}
+
+fn image_exists_command(image: &str) -> Command {
+    let mut command = Command::new("podman");
+    command.args(["image", "exists", image]);
+    command
+}
+
+pub(crate) fn pull_if_not_present(image: &str) -> Result<()> {
+    let result = image_exists_command(image).status()?;
+
+    if result.success() {
+        println!("Image {} is already present locally, skipping pull.", image);
+        return Ok(());
+    } else {
+        println!("Image {} is not present locally, pulling it now.", image);
+        println!();
+        pull_image_command(image)
+            .run_with_cmd_context()
+            .context(format!("pulling image {}", image))?;
+    }
+
+    Ok(())
 }
 
 /// Path to the podman installation script. Can be influenced by the build
