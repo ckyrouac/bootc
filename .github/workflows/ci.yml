@@ -108,12 +108,12 @@ jobs:
           # # Install tests
           # sudo bootc-integration-tests install-alongside localhost/bootc
           #
-          # # system-reinstall-bootc tests
-          # cargo build --release -p system-reinstall-bootc
-          #
-          # # not sure why this is missing in the ubuntu image but just creating this directory allows the tests to pass
-          # sudo mkdir -p /run/sshd
-          #
+          # system-reinstall-bootc tests
+          cargo build --release -p system-reinstall-bootc
+
+          # not sure why this is missing in the ubuntu image but just creating this directory allows the tests to pass
+          sudo mkdir -p /run/sshd
+
           sudo install -m 0755 target/release/system-reinstall-bootc /usr/bin/system-reinstall-bootc
           // These tests may mutate the system live so we can't run in parallel
           sudo bootc-integration-tests system-reinstall localhost/bootc --test-threads=1
