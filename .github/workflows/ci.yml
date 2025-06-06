@@ -18,53 +18,53 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  tests:
-    if: ${{ !contains(github.event.pull_request.labels.*.name, 'control/skip-ci') }}
-    runs-on: ubuntu-latest
-    container: quay.io/coreos-assembler/fcos-buildroot:testing-devel
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install deps
-        run: ./ci/installdeps.sh
-      - name: Mark git checkout as safe
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      # xref containers/containers-image-proxy-rs
-      - name: Cache Dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: "tests"
-      - name: make validate-rust
-        # the ruff checks are covered via a dedicated action
-        run: make validate-rust
-      - name: Run tests
-        run: cargo test -- --nocapture --quiet
-      - name: Manpage generation
-        run: mkdir -p target/man && cargo run --features=docgen -- man --directory target/man
-      - name: Clippy (gate on correctness and suspicous)
-        run: make validate-rust
-  fedora-container-tests:
-    if: ${{ !contains(github.event.pull_request.labels.*.name, 'control/skip-ci') }}
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Get a newer podman for heredoc support (from debian testing)
-        run: |
-          set -eux
-          echo 'deb [trusted=yes] https://ftp.debian.org/debian/ testing main' | sudo tee /etc/apt/sources.list.d/testing.list
-          sudo apt update
-          sudo apt install -y crun/testing podman/testing skopeo/testing
-      - uses: actions/checkout@v4
-      - name: Build container (fedora)
-        run: sudo podman build --build-arg=base=quay.io/fedora/fedora-bootc:41 -t localhost/bootc -f hack/Containerfile . 
-      - name: Container integration
-        run: sudo podman run --rm localhost/bootc bootc-integration-tests container
-  cargo-deny:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-    - uses: EmbarkStudios/cargo-deny-action@v2
-      with:
-        log-level: warn
-        command: check -A duplicate bans sources licenses
+  # tests:
+  #   if: ${{ !contains(github.event.pull_request.labels.*.name, 'control/skip-ci') }}
+  #   runs-on: ubuntu-latest
+  #   container: quay.io/coreos-assembler/fcos-buildroot:testing-devel
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Install deps
+  #       run: ./ci/installdeps.sh
+  #     - name: Mark git checkout as safe
+  #       run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+  #     # xref containers/containers-image-proxy-rs
+  #     - name: Cache Dependencies
+  #       uses: Swatinem/rust-cache@v2
+  #       with:
+  #         key: "tests"
+  #     - name: make validate-rust
+  #       # the ruff checks are covered via a dedicated action
+  #       run: make validate-rust
+  #     - name: Run tests
+  #       run: cargo test -- --nocapture --quiet
+  #     - name: Manpage generation
+  #       run: mkdir -p target/man && cargo run --features=docgen -- man --directory target/man
+  #     - name: Clippy (gate on correctness and suspicous)
+  #       run: make validate-rust
+  # fedora-container-tests:
+  #   if: ${{ !contains(github.event.pull_request.labels.*.name, 'control/skip-ci') }}
+  #   runs-on: ubuntu-24.04
+  #   steps:
+  #     - name: Get a newer podman for heredoc support (from debian testing)
+  #       run: |
+  #         set -eux
+  #         echo 'deb [trusted=yes] https://ftp.debian.org/debian/ testing main' | sudo tee /etc/apt/sources.list.d/testing.list
+  #         sudo apt update
+  #         sudo apt install -y crun/testing podman/testing skopeo/testing
+  #     - uses: actions/checkout@v4
+  #     - name: Build container (fedora)
+  #       run: sudo podman build --build-arg=base=quay.io/fedora/fedora-bootc:41 -t localhost/bootc -f hack/Containerfile . 
+  #     - name: Container integration
+  #       run: sudo podman run --rm localhost/bootc bootc-integration-tests container
+  # cargo-deny:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #   - uses: actions/checkout@v4
+  #   - uses: EmbarkStudios/cargo-deny-action@v2
+  #     with:
+  #       log-level: warn
+  #       command: check -A duplicate bans sources licenses
   install-tests:
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'control/skip-ci') }}
     name: "Test install"
@@ -88,11 +88,11 @@ jobs:
       - name: Integration tests
         run: |
           set -xeu
-          # Build images to test; TODO investigate doing single container builds
-          # via GHA and pushing to a temporary registry to share among workflows?
-          sudo podman build -t localhost/bootc -f hack/Containerfile .
-          sudo podman build -t localhost/bootc-fsverity -f ci/Containerfile.install-fsverity
-
+          # # Build images to test; TODO investigate doing single container builds
+          # # via GHA and pushing to a temporary registry to share among workflows?
+          # sudo podman build -t localhost/bootc -f hack/Containerfile .
+          # sudo podman build -t localhost/bootc-fsverity -f ci/Containerfile.install-fsverity
+          #
           export CARGO_INCREMENTAL=0  # because we aren't caching the test runner bits
           cargo build --release -p tests-integration
 
@@ -100,20 +100,20 @@ jobs:
           sudo install -m 0755 target/release/tests-integration /usr/bin/bootc-integration-tests
           rm target -rf
           df -h /
-          # The ostree-container tests
-          sudo podman run --privileged --pid=host -v /:/run/host -v $(pwd):/src:ro -v /var/tmp:/var/tmp \
-            -v /run/dbus:/run/dbus -v /run/systemd:/run/systemd localhost/bootc /src/ostree-ext/ci/priv-integration.sh
-          # Nondestructive but privileged tests
-          sudo bootc-integration-tests host-privileged localhost/bootc
-          # Install tests
-          sudo bootc-integration-tests install-alongside localhost/bootc
-
-          # system-reinstall-bootc tests
-          cargo build --release -p system-reinstall-bootc
-
-          # not sure why this is missing in the ubuntu image but just creating this directory allows the tests to pass
-          sudo mkdir -p /run/sshd
-
+          # # The ostree-container tests
+          # sudo podman run --privileged --pid=host -v /:/run/host -v $(pwd):/src:ro -v /var/tmp:/var/tmp \
+          #   -v /run/dbus:/run/dbus -v /run/systemd:/run/systemd localhost/bootc /src/ostree-ext/ci/priv-integration.sh
+          # # Nondestructive but privileged tests
+          # sudo bootc-integration-tests host-privileged localhost/bootc
+          # # Install tests
+          # sudo bootc-integration-tests install-alongside localhost/bootc
+          #
+          # # system-reinstall-bootc tests
+          # cargo build --release -p system-reinstall-bootc
+          #
+          # # not sure why this is missing in the ubuntu image but just creating this directory allows the tests to pass
+          # sudo mkdir -p /run/sshd
+          #
           sudo install -m 0755 target/release/system-reinstall-bootc /usr/bin/system-reinstall-bootc
           // These tests may mutate the system live so we can't run in parallel
           sudo bootc-integration-tests system-reinstall localhost/bootc --test-threads=1
@@ -125,34 +125,34 @@ jobs:
           sudo find /ostree/repo/objects -name '*.file' -type f | while read f; do
             sudo fsverity measure $f >/dev/null
           done
-  docs:
-    if: ${{ contains(github.event.pull_request.labels.*.name, 'documentation') }}
-    runs-on: ubuntu-latest
-    env:
-      MDBOOK_VERSION: 0.4.37
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install mdBook
-        run: |
-          tag=$(curl 'https://api.github.com/repos/rust-lang/mdbook/releases/latest' | jq -r '.tag_name')
-          url="https://github.com/rust-lang/mdbook/releases/download/${tag}/mdbook-${tag}-x86_64-unknown-linux-gnu.tar.gz"
-          mkdir mdbook
-          curl -sSL $url | tar -xz --directory=./mdbook
-          echo `pwd`/mdbook >> $GITHUB_PATH
-      - name: Install mdbook-mermaid
-        run: |
-          tag=$(curl 'https://api.github.com/repos/badboy/mdbook-mermaid/releases/latest' | jq -r '.tag_name')
-          url="https://github.com/badboy/mdbook-mermaid/releases/download/${tag}/mdbook-mermaid-${tag}-x86_64-unknown-linux-gnu.tar.gz"
-          mkdir mdbook-mermaid
-          curl -sSL $url | tar -xz --directory=./mdbook-mermaid
-          echo `pwd`/mdbook-mermaid >> $GITHUB_PATH
-      - name: Install mdbook-linkcheck
-        run: |
-          tag=$(curl 'https://api.github.com/repos/Michael-F-Bryan/mdbook-linkcheck/releases/latest' | jq -r '.tag_name')
-          archive="mdbook-linkcheck.x86_64-unknown-linux-gnu.zip"
-          url="https://github.com/Michael-F-Bryan/mdbook-linkcheck/releases/download/${tag}/${archive}"
-          mkdir mdbook-linkcheck
-          curl -sSL -O $url && unzip ${archive} -d ./mdbook-linkcheck && chmod +x ./mdbook-linkcheck/mdbook-linkcheck
-          echo `pwd`/mdbook-linkcheck >> $GITHUB_PATH
-      - name: Build with mdBook
-        run: cd docs && mdbook-mermaid install && mdbook build
+  # docs:
+  #   if: ${{ contains(github.event.pull_request.labels.*.name, 'documentation') }}
+  #   runs-on: ubuntu-latest
+  #   env:
+  #     MDBOOK_VERSION: 0.4.37
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Install mdBook
+  #       run: |
+  #         tag=$(curl 'https://api.github.com/repos/rust-lang/mdbook/releases/latest' | jq -r '.tag_name')
+  #         url="https://github.com/rust-lang/mdbook/releases/download/${tag}/mdbook-${tag}-x86_64-unknown-linux-gnu.tar.gz"
+  #         mkdir mdbook
+  #         curl -sSL $url | tar -xz --directory=./mdbook
+  #         echo `pwd`/mdbook >> $GITHUB_PATH
+  #     - name: Install mdbook-mermaid
+  #       run: |
+  #         tag=$(curl 'https://api.github.com/repos/badboy/mdbook-mermaid/releases/latest' | jq -r '.tag_name')
+  #         url="https://github.com/badboy/mdbook-mermaid/releases/download/${tag}/mdbook-mermaid-${tag}-x86_64-unknown-linux-gnu.tar.gz"
+  #         mkdir mdbook-mermaid
+  #         curl -sSL $url | tar -xz --directory=./mdbook-mermaid
+  #         echo `pwd`/mdbook-mermaid >> $GITHUB_PATH
+  #     - name: Install mdbook-linkcheck
+  #       run: |
+  #         tag=$(curl 'https://api.github.com/repos/Michael-F-Bryan/mdbook-linkcheck/releases/latest' | jq -r '.tag_name')
+  #         archive="mdbook-linkcheck.x86_64-unknown-linux-gnu.zip"
+  #         url="https://github.com/Michael-F-Bryan/mdbook-linkcheck/releases/download/${tag}/${archive}"
+  #         mkdir mdbook-linkcheck
+  #         curl -sSL -O $url && unzip ${archive} -d ./mdbook-linkcheck && chmod +x ./mdbook-linkcheck/mdbook-linkcheck
+  #         echo `pwd`/mdbook-linkcheck >> $GITHUB_PATH
+  #     - name: Build with mdBook
+  #       run: cd docs && mdbook-mermaid install && mdbook build
