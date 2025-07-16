@@ -55,4 +55,4 @@ happen when new deployments are created.
 
 # VERSION
 
-v1.4.0
+v1.5.0

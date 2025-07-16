@@ -5,7 +5,7 @@ bootc-status - Display status
 # SYNOPSIS
 
 **bootc status** \[**\--format**\] \[**\--format-version**\]
-\[**\--booted**\] \[**-h**\|**\--help**\]
+\[**\--booted**\] \[**-v**\|**\--verbose**\] \[**-h**\|**\--help**\]
 
 # DESCRIPTION
 
@@ -53,10 +53,14 @@ not \`null\`.
 
 :   Only display status for the booted deployment
 
+**-v**, **\--verbose**
+
+:   Include additional fields in human readable format
+
 **-h**, **\--help**
 
 :   Print help (see a summary with \'-h\')
 
 # VERSION
 
-v1.4.0
+v1.5.0
