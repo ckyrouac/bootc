@@ -25,6 +25,9 @@ jobs:
       - name: Mark git checkout as safe
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       
+      - name: Install vendor tool
+        run: cargo install cargo-vendor-filterer
+      
       - name: Cache Dependencies
         uses: Swatinem/rust-cache@v2
         with:
