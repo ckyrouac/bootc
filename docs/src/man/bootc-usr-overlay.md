@@ -39,4 +39,4 @@ unmount\".
 
 # VERSION
 
-v1.5.0
+v1.6.0
