@@ -9,6 +9,7 @@ jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
+    container: quay.io/coreos-assembler/fcos-buildroot:testing-devel
     permissions:
       contents: write
     
@@ -18,16 +19,16 @@ jobs:
         with:
           fetch-depth: 0
       
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install deps
+        run: ./ci/installdeps.sh
       
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Mark git checkout as safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      
+      - name: Cache Dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: "release"
       
       - name: Get version from tag
         id: get_version
