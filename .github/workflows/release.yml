@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Get version from tag
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+      
+      - name: Run cargo xtask package
+        run: cargo xtask package
+      
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref_name }}
+          draft: true
+          prerelease: false
+          body: |
+            ## bootc ${{ steps.get_version.outputs.VERSION }}
+            
+            ### Changes
+            
+            Auto-generated release notes will be populated here.
+            
+            ### Assets
+            
+            - `bootc-${{ steps.get_version.outputs.VERSION }}-vendor.tar.zstd` - Vendored dependencies archive
+            - `bootc-${{ steps.get_version.outputs.VERSION }}.tar.zstd` - Source archive
+      
+      - name: Upload vendor archive
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./target/bootc-${{ steps.get_version.outputs.VERSION }}-vendor.tar.zstd
+          asset_name: bootc-${{ steps.get_version.outputs.VERSION }}-vendor.tar.zstd
+          asset_content_type: application/zstd
+      
+      - name: Upload source archive
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./target/bootc-${{ steps.get_version.outputs.VERSION }}.tar.zstd
+          asset_name: bootc-${{ steps.get_version.outputs.VERSION }}.tar.zstd
+          asset_content_type: application/zstd
