@@ -1,12 +1,11 @@
-name: Scheduled Release PR
+name: Create Release PR
 
 on:
   schedule:
     # Run every 3 weeks on Monday at 8:00 AM UTC
     # Note: GitHub Actions doesn't support "every 3 weeks" directly,
     # so we use a workaround by running weekly and checking if it's been 3 weeks
-    # - cron: '0 8 * * 1'
-    - cron: '*/5 * * * *' # TODO: temporaryily use 5 min interval for testing
+    - cron: '0 8 * * 1'
   workflow_dispatch:
     inputs:
       version:
