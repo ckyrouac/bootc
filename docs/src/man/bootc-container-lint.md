@@ -53,4 +53,4 @@ part of a build process; it will error if any problems are detected.
 
 # VERSION
 
-v1.8.2
+v1.8.3

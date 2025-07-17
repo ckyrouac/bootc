@@ -160,4 +160,4 @@ more complex such as RAID, LVM, LUKS etc.
 
 # VERSION
 
-v1.8.2
+v1.8.3
