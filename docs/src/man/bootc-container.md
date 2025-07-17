@@ -30,4 +30,4 @@ bootc-container-help(8)
 
 # VERSION
 
-v1.8.2
+v1.8.3
