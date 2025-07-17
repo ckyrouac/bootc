@@ -27,7 +27,7 @@ EOF
 # TODO: Recursively extract this from the existing cargo system-deps metadata
 case $OS_ID in
     fedora) dnf -y builddep bootc ;;
-    *) dnf -y install libzstd-devel openssl-devel ostree-devel cargo ;;
+    *) dnf -y install libzstd-devel openssl-devel ostree-devel cargo pandoc ;;
 esac
 
 bindeps=$(cargo metadata --format-version 1 --no-deps | jq -r '.metadata.["binary-dependencies"].bins | map("/usr/bin/" + .) | join(" ")')
