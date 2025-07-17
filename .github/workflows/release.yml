@@ -47,6 +47,12 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "TAG_NAME=v$VERSION" >> $GITHUB_OUTPUT
       
+      - name: Install deps
+        run: ./ci/installdeps.sh
+      
+      - name: Mark git checkout as safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      
       - name: Import GPG key
         if: github.event_name != 'push'
         uses: crazy-max/ghaction-import-gpg@v6
@@ -79,12 +85,6 @@ jobs:
           
           # Switch to the tagged commit for building
           git checkout "$TAG_NAME"
-      
-      - name: Install deps
-        run: ./ci/installdeps.sh
-      
-      - name: Mark git checkout as safe
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       
       - name: Install vendor tool
         run: cargo install cargo-vendor-filterer
