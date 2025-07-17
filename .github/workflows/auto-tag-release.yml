@@ -1,0 +1,63 @@
+name: Auto Tag Release
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+
+jobs:
+  tag-release:
+    if: |
+      github.event.pull_request.merged == true &&
+      contains(github.event.pull_request.labels.*.name, 'release')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+      
+      - name: Extract version from commit message
+        id: extract_version
+        run: |
+          # Get the merge commit message
+          MERGE_COMMIT_SHA="${{ github.event.pull_request.merge_commit_sha }}"
+          COMMIT_MESSAGE=$(git log -1 --pretty=%s $MERGE_COMMIT_SHA)
+          echo "Commit message: $COMMIT_MESSAGE"
+          
+          # Extract version from "Release X.Y.Z" pattern
+          if [[ "$COMMIT_MESSAGE" =~ Release[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            VERSION="${BASH_REMATCH[1]}"
+            echo "Extracted version: $VERSION"
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+          else
+            echo "Could not extract version from commit message"
+            exit 1
+          fi
+      
+      - name: Configure git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+      
+      - name: Create and push tag
+        run: |
+          VERSION="${{ steps.extract_version.outputs.version }}"
+          TAG_NAME="v$VERSION"
+          
+          # Check if tag already exists
+          if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Tag $TAG_NAME already exists"
+            exit 1
+          fi
+          
+          # Create annotated tag (not signed since we can't sign in CI)
+          git tag -a -m "Release $VERSION" "$TAG_NAME"
+          
+          # Push the tag
+          git push origin "$TAG_NAME"
+          
+          echo "Successfully created and pushed tag $TAG_NAME"
