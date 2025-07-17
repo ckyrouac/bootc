@@ -99,3 +99,26 @@ vendor:
 package-rpm:
 	cargo xtask $@
 .PHONY: package-rpm
+
+# Create a release commit with updated version
+# Usage: make release-commit VERSION=1.5.0
+release-commit:
+	@if [ -z "$(VERSION)" ]; then \
+		echo "Error: VERSION is required. Usage: make release-commit VERSION=1.5.0"; \
+		exit 1; \
+	fi
+	@echo "Creating release commit for version $(VERSION)..."
+	# Update version in lib/Cargo.toml
+	sed -i 's/^version = ".*"/version = "$(VERSION)"/' lib/Cargo.toml
+	# Update Cargo.lock with new version
+	cargo update --workspace
+	# Run cargo xtask update-generated to update generated files
+	cargo xtask update-generated
+	# Stage all changes
+	git add lib/Cargo.toml Cargo.lock
+	git add -A  # Add any files updated by cargo xtask update-generated
+	# Create commit
+	git commit -m "Release $(VERSION)"
+	# Create signed tag
+	git tag -s -m "Release $(VERSION)" v$(VERSION)
+.PHONY: release-commit
