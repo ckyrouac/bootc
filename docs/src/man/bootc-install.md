@@ -71,4 +71,4 @@ bootc-install-help(8)
 
 # VERSION
 
-v1.8.3
+v1.8.4
