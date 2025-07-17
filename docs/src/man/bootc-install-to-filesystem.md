@@ -173,4 +173,4 @@ is currently expected to be empty by default.
 
 # VERSION
 
-v1.8.0
+v1.8.1
