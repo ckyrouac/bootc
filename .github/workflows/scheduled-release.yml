@@ -84,11 +84,15 @@ jobs:
           echo "New version: $NEW_VERSION"
           echo "VERSION=$NEW_VERSION" >> $GITHUB_OUTPUT
       
-      - name: Configure git
+      - name: Import GPG key
         if: steps.check_schedule.outputs.should_release == 'true'
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+          git_user_signingkey: true
+          git_commit_gpgsign: true
+          git_tag_gpgsign: true
       
       - name: Create release branch
         if: steps.check_schedule.outputs.should_release == 'true'
@@ -101,13 +105,13 @@ jobs:
       - name: Create release commit
         if: steps.check_schedule.outputs.should_release == 'true'
         run: |
-          # Run make release-commit but skip the git tag step since we can't sign in CI
+          # Update version and create signed commit
           sed -i 's/^version = ".*"/version = "${{ steps.next_version.outputs.VERSION }}"/' lib/Cargo.toml
           cargo update --workspace
           dnf -y install pandoc
           cargo xtask update-generated
           git add -A
-          git commit -m "Release ${{ steps.next_version.outputs.VERSION }}"
+          git commit -S -m "Release ${{ steps.next_version.outputs.VERSION }}"
       
       - name: Push branch
         if: steps.check_schedule.outputs.should_release == 'true'
@@ -132,13 +136,7 @@ jobs:
             1. Review the changes in this PR
             2. Ensure all tests pass
             3. Merge the PR
-            4. After merge, manually create and push the signed tag:
-               \`\`\`bash
-               git checkout main
-               git pull
-               git tag -s -m "Release ${{ steps.next_version.outputs.VERSION }}" v${{ steps.next_version.outputs.VERSION }}
-               git push origin v${{ steps.next_version.outputs.VERSION }}
-               \`\`\`
+            4. The release tag will be automatically created and signed when this PR is merged
             
             The release workflow will automatically trigger when the tag is pushed.`,
               head: `${{ steps.create_branch.outputs.branch_name }}`,
