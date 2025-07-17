@@ -19,6 +19,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: main
+          token: ${{ secrets.PAT_TOKEN }}
       
       - name: Extract version from commit message
         id: extract_version
@@ -61,7 +62,8 @@ jobs:
           # Create signed annotated tag
           git tag -s -m "Release $VERSION" "$TAG_NAME"
           
-          # Push the tag
+          # Push the tag using PAT token to trigger other workflows
+          git remote set-url origin https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}.git
           git push origin "$TAG_NAME"
           
           echo "Successfully created and pushed tag $TAG_NAME"
