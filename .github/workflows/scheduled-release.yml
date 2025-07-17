@@ -104,6 +104,7 @@ jobs:
           # Run make release-commit but skip the git tag step since we can't sign in CI
           sed -i 's/^version = ".*"/version = "${{ steps.next_version.outputs.VERSION }}"/' lib/Cargo.toml
           cargo update --workspace
+          dnf -y install pandoc
           cargo xtask update-generated
           git add -A
           git commit -m "Release ${{ steps.next_version.outputs.VERSION }}"
