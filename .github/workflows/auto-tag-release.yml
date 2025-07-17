@@ -62,8 +62,23 @@ jobs:
           # Create signed annotated tag
           git tag -s -m "Release $VERSION" "$TAG_NAME"
           
-          # Push the tag using PAT token to trigger other workflows
-          git remote set-url origin https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}.git
+          # Push the tag (will use the persisted auth from checkout)
           git push origin "$TAG_NAME"
           
           echo "Successfully created and pushed tag $TAG_NAME"
+      
+      - name: Trigger release workflow
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'release.yml',
+              ref: 'main',
+              inputs: {
+                tag: 'v${{ steps.extract_version.outputs.version }}'
+              }
+            });
+            console.log('Triggered release workflow for tag v${{ steps.extract_version.outputs.version }}');
