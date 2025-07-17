@@ -1,6 +1,8 @@
 name: Release
 
 on:
+  pull_request:
+    types: [closed]
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
@@ -11,20 +13,105 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: write
+
 jobs:
-  release:
+  tag-release:
+    name: Create Release Tag
+    if: |
+      (github.event_name == 'pull_request' && 
+       github.event.pull_request.merged == true &&
+       contains(github.event.pull_request.labels.*.name, 'release')) ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract_version.outputs.version }}
+      tag_created: ${{ steps.tag_status.outputs.created }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || 'main' }}
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+      
+      - name: Extract version
+        id: extract_version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # For manual dispatch, use the provided tag
+            VERSION="${{ github.event.inputs.tag }}"
+            VERSION="${VERSION#v}"
+          else
+            # For PR merge, extract from commit message
+            MERGE_COMMIT_SHA="${{ github.event.pull_request.merge_commit_sha }}"
+            COMMIT_MESSAGE=$(git log -1 --pretty=%s $MERGE_COMMIT_SHA)
+            echo "Commit message: $COMMIT_MESSAGE"
+            
+            # Extract version from "Release X.Y.Z" pattern
+            if [[ "$COMMIT_MESSAGE" =~ Release[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+              VERSION="${BASH_REMATCH[1]}"
+            else
+              echo "Could not extract version from commit message"
+              exit 1
+            fi
+          fi
+          
+          echo "Extracted version: $VERSION"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+      
+      - name: Import GPG key
+        if: github.event_name != 'push'
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+          git_user_signingkey: true
+          git_commit_gpgsign: true
+          git_tag_gpgsign: true
+      
+      - name: Create and push tag
+        if: github.event_name != 'push'
+        id: create_tag
+        run: |
+          VERSION="${{ steps.extract_version.outputs.version }}"
+          TAG_NAME="v$VERSION"
+          
+          # Check if tag already exists
+          if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Tag $TAG_NAME already exists"
+            echo "created=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Create signed annotated tag
+          git tag -s -m "Release $VERSION" "$TAG_NAME"
+          
+          # Push the tag
+          git push origin "$TAG_NAME"
+          
+          echo "Successfully created and pushed tag $TAG_NAME"
+          echo "created=true" >> $GITHUB_OUTPUT
+      
+      - name: Set tag status for push events
+        if: github.event_name == 'push'
+        id: tag_status
+        run: echo "created=true" >> $GITHUB_OUTPUT
+
+  create-release:
     name: Create Release
+    needs: tag-release
+    if: |
+      (needs.tag-release.outputs.tag_created == 'true' || github.event_name == 'push')
     runs-on: ubuntu-latest
     container: quay.io/coreos-assembler/fcos-buildroot:testing-devel
-    permissions:
-      contents: write
-    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.event_name == 'push' && github.ref || format('v{0}', needs.tag-release.outputs.version) }}
       
       - name: Install deps
         run: ./ci/installdeps.sh
@@ -40,14 +127,13 @@ jobs:
         with:
           key: "release"
       
-      - name: Get version from tag
+      - name: Get version
         id: get_version
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ github.event.inputs.tag }}"
-            VERSION="${VERSION#v}"
-          else
+          if [ "${{ github.event_name }}" = "push" ]; then
             VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="${{ needs.tag-release.outputs.version }}"
           fi
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
           echo "TAG_NAME=v$VERSION" >> $GITHUB_OUTPUT
