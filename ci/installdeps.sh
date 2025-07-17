@@ -26,7 +26,7 @@ EOF
 
 # TODO: Recursively extract this from the existing cargo system-deps metadata
 case $OS_ID in
-    fedora) dnf -y builddep bootc ;;
+    fedora) dnf -y builddep bootc pandoc;;
     *) dnf -y install libzstd-devel openssl-devel ostree-devel cargo pandoc ;;
 esac
 
