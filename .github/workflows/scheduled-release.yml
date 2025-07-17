@@ -1,0 +1,156 @@
+name: Scheduled Release PR
+
+on:
+  schedule:
+    # Run every 3 weeks on Monday at 8:00 AM UTC
+    # Note: GitHub Actions doesn't support "every 3 weeks" directly,
+    # so we use a workaround by running weekly and checking if it's been 3 weeks
+    # - cron: '0 8 * * 1'
+    - cron: '*/5 * * * *' # TODO: temporaryily use 5 min interval for testing
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 1.5.1). Leave empty to auto-increment.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  create-release-pr:
+    runs-on: ubuntu-latest
+    container: quay.io/coreos-assembler/fcos-buildroot:testing-devel
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Install deps
+        run: ./ci/installdeps.sh
+      
+      - name: Mark git checkout as safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      
+      - name: Check if it's time for a release
+        id: check_schedule
+        run: |
+          # For manual workflow dispatch, always proceed
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_release=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # For scheduled runs, check if it's been 3 weeks since the last release
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          LAST_TAG_DATE=$(git log -1 --format=%ct $LAST_TAG 2>/dev/null || echo "0")
+          CURRENT_DATE=$(date +%s)
+          DAYS_SINCE_RELEASE=$(( (CURRENT_DATE - LAST_TAG_DATE) / 86400 ))
+          
+          echo "Last tag: $LAST_TAG"
+          echo "Days since last release: $DAYS_SINCE_RELEASE"
+          
+          # Release if it's been at least 21 days (3 weeks)
+          if [ $DAYS_SINCE_RELEASE -ge 21 ]; then
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Determine next version
+        if: steps.check_schedule.outputs.should_release == 'true'
+        id: next_version
+        run: |
+          # If version is provided via workflow dispatch, use it
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "VERSION=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Otherwise, auto-increment the patch version
+          CURRENT_VERSION=$(grep '^version = ' lib/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "Current version: $CURRENT_VERSION"
+          
+          # Split version into components
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+          
+          # Increment patch version
+          NEW_PATCH=$((PATCH + 1))
+          NEW_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
+          
+          echo "New version: $NEW_VERSION"
+          echo "VERSION=$NEW_VERSION" >> $GITHUB_OUTPUT
+      
+      - name: Configure git
+        if: steps.check_schedule.outputs.should_release == 'true'
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+      
+      - name: Create release branch
+        if: steps.check_schedule.outputs.should_release == 'true'
+        id: create_branch
+        run: |
+          BRANCH_NAME="release-${{ steps.next_version.outputs.VERSION }}"
+          git checkout -b $BRANCH_NAME
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+      
+      - name: Create release commit
+        if: steps.check_schedule.outputs.should_release == 'true'
+        run: |
+          # Run make release-commit but skip the git tag step since we can't sign in CI
+          sed -i 's/^version = ".*"/version = "${{ steps.next_version.outputs.VERSION }}"/' lib/Cargo.toml
+          cargo update --workspace
+          cargo xtask update-generated
+          git add -A
+          git commit -m "Release ${{ steps.next_version.outputs.VERSION }}"
+      
+      - name: Push branch
+        if: steps.check_schedule.outputs.should_release == 'true'
+        run: |
+          git push origin ${{ steps.create_branch.outputs.branch_name }}
+      
+      - name: Create Pull Request
+        if: steps.check_schedule.outputs.should_release == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Release ${{ steps.next_version.outputs.VERSION }}`,
+              body: `## Release ${{ steps.next_version.outputs.VERSION }}
+            
+            This is an automated release PR created by the scheduled release workflow.
+            
+            ### Release Process
+            
+            1. Review the changes in this PR
+            2. Ensure all tests pass
+            3. Merge the PR
+            4. After merge, manually create and push the signed tag:
+               \`\`\`bash
+               git checkout main
+               git pull
+               git tag -s -m "Release ${{ steps.next_version.outputs.VERSION }}" v${{ steps.next_version.outputs.VERSION }}
+               git push origin v${{ steps.next_version.outputs.VERSION }}
+               \`\`\`
+            
+            The release workflow will automatically trigger when the tag is pushed.`,
+              head: `${{ steps.create_branch.outputs.branch_name }}`,
+              base: 'main',
+              draft: false
+            });
+            
+            // Add the release label
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              labels: ['release']
+            });
+            
+            console.log(`Created PR #${pr.number}: ${pr.html_url}`);
