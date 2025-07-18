@@ -3088,6 +3088,7 @@ dependencies = [
  "chrono",
  "fn-error-context",
  "mandown",
+ "serde_json",
  "tar",
  "tempfile",
  "toml",
