@@ -26,7 +26,15 @@ jobs:
       - name: Extract version
         id: extract_version
         run: |
-          VERSION=$(make next-minor-version)
+          # Extract version from crates/lib/Cargo.toml
+          VERSION=$(grep '^version' crates/lib/Cargo.toml | sed 's/version = "//;s/"//')
+          
+          # Validate version format
+          if ! echo "$VERSION" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' >/dev/null; then
+            echo "Error: Invalid version format in Cargo.toml: $VERSION"
+            exit 1
+          fi
+          
           echo "Extracted version: $VERSION"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "TAG_NAME=v$VERSION" >> $GITHUB_OUTPUT
