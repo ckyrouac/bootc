@@ -122,3 +122,26 @@ release-commit:
 	# Create signed tag
 	git tag -s -m "Release $(VERSION)" v$(VERSION)
 .PHONY: release-commit
+
+# Get the next minor version by bumping the minor version of the most recent tag
+# Outputs the new version string (e.g., "1.3.0" if latest tag is "v1.2.4")
+next-minor-version:
+	@LATEST_TAG=$$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -n1); \
+	if [ -z "$$LATEST_TAG" ]; then \
+		echo "Error: No version tags found matching v*.*.* pattern" >&2; \
+		exit 1; \
+	fi; \
+	VERSION=$$(echo "$$LATEST_TAG" | sed 's/^v//'); \
+	if ! echo "$$VERSION" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$$' >/dev/null; then \
+		echo "Error: Invalid version format in tag $$LATEST_TAG" >&2; \
+		exit 1; \
+	fi; \
+	MAJOR=$$(echo "$$VERSION" | cut -d. -f1); \
+	MINOR=$$(echo "$$VERSION" | cut -d. -f2); \
+	if ! [ "$$MAJOR" -eq "$$MAJOR" ] 2>/dev/null || ! [ "$$MINOR" -eq "$$MINOR" ] 2>/dev/null; then \
+		echo "Error: Invalid version numbers in $$VERSION" >&2; \
+		exit 1; \
+	fi; \
+	NEW_MINOR=$$((MINOR + 1)); \
+	echo "$$MAJOR.$$NEW_MINOR.0"
+.PHONY: next-minor-version
