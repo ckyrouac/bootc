@@ -96,7 +96,7 @@ jobs:
         if: steps.check_schedule.outputs.should_release == 'true'
         run: |
           # Update version and create signed commit
-          sed -i 's/^version = ".*"/version = "${{ steps.next_version.outputs.VERSION }}"/' lib/Cargo.toml
+          sed -i 's/^version = ".*"/version = "${{ steps.next_version.outputs.VERSION }}"/' crates/lib/Cargo.toml
           cargo update --workspace
           dnf -y install pandoc
           cargo xtask update-generated

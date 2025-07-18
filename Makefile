@@ -109,13 +109,13 @@ release-commit:
 	fi
 	@echo "Creating release commit for version $(VERSION)..."
 	# Update version in lib/Cargo.toml
-	sed -i 's/^version = ".*"/version = "$(VERSION)"/' lib/Cargo.toml
+	sed -i 's/^version = ".*"/version = "$(VERSION)"/' crates/lib/Cargo.toml
 	# Update Cargo.lock with new version
 	cargo update --workspace
 	# Run cargo xtask update-generated to update generated files
 	cargo xtask update-generated
 	# Stage all changes
-	git add lib/Cargo.toml Cargo.lock
+	git add crates/lib/Cargo.toml Cargo.lock
 	git add -A  # Add any files updated by cargo xtask update-generated
 	# Create commit
 	git commit -m "Release $(VERSION)"
@@ -123,17 +123,16 @@ release-commit:
 	git tag -s -m "Release $(VERSION)" v$(VERSION)
 .PHONY: release-commit
 
-# Get the next minor version by bumping the minor version of the most recent tag
-# Outputs the new version string (e.g., "1.3.0" if latest tag is "v1.2.4")
+# Get the next minor version by bumping the minor version from crates/lib/Cargo.toml
+# Outputs the new version string (e.g., "1.3.0" if current version is "1.2.4")
 next-minor-version:
-	@LATEST_TAG=$$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -n1); \
-	if [ -z "$$LATEST_TAG" ]; then \
-		echo "Error: No version tags found matching v*.*.* pattern" >&2; \
+	@VERSION=$$(grep '^version' crates/lib/Cargo.toml | sed 's/version = "//;s/"//'); \
+	if [ -z "$$VERSION" ]; then \
+		echo "Error: Could not find version in crates/lib/Cargo.toml" >&2; \
 		exit 1; \
 	fi; \
-	VERSION=$$(echo "$$LATEST_TAG" | sed 's/^v//'); \
 	if ! echo "$$VERSION" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$$' >/dev/null; then \
-		echo "Error: Invalid version format in tag $$LATEST_TAG" >&2; \
+		echo "Error: Invalid version format in Cargo.toml: $$VERSION" >&2; \
 		exit 1; \
 	fi; \
 	MAJOR=$$(echo "$$VERSION" | cut -d. -f1); \
