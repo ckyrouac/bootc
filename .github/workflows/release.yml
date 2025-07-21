@@ -27,7 +27,7 @@ jobs:
         id: extract_version
         run: |
           # Extract version from crates/lib/Cargo.toml
-          VERSION=$(grep '^version' crates/lib/Cargo.toml | sed 's/version = "//;s/"//')
+          VERSION=$(cargo read-manifest --manifest-path crates/lib/Cargo.toml | jq -r '.version')
           
           # Validate version format
           if ! echo "$VERSION" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' >/dev/null; then
@@ -61,21 +61,16 @@ jobs:
           VERSION="${{ steps.extract_version.outputs.version }}"
           TAG_NAME="v$VERSION"
           
-          # Check if tag already exists
           if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
             echo "Tag $TAG_NAME already exists"
             exit 0
           fi
-          
-          # Create signed annotated tag
+
           git tag -s -m "Release $VERSION" "$TAG_NAME"
-          
-          # Push the tag
           git push origin "$TAG_NAME"
           
           echo "Successfully created and pushed tag $TAG_NAME"
           
-          # Switch to the tagged commit for building
           git checkout "$TAG_NAME"
       
       - name: Install vendor tool
