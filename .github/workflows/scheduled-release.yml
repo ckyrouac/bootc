@@ -105,6 +105,7 @@ jobs:
         env:
           VERSION: ${{ steps.next_version.outputs.VERSION }}
         run: |
+          dnf -y install pandoc
           cargo install cargo-edit
           cargo set-version --manifest-path crates/lib/Cargo.toml --package bootc-lib "$VERSION"
           cargo update --workspace
