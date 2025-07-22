@@ -39,7 +39,6 @@ const TASKS: &[(&str, fn(&Shell) -> Result<()>)] = &[
     ("package-srpm", package_srpm),
     ("spec", spec),
     ("test-tmt", test_tmt),
-    ("next-version", next_version),
 ];
 
 fn try_main() -> Result<()> {
@@ -60,17 +59,11 @@ fn try_main() -> Result<()> {
 
     let sh = xshell::Shell::new()?;
     if let Some(cmd) = task.as_deref() {
-        // Special handling for next-version command which takes an argument
-        if cmd == "next-version" {
-            let bump_type = std::env::args().nth(2);
-            next_version_with_arg(&sh, bump_type)?;
-        } else {
-            let f = TASKS
-                .iter()
-                .find_map(|(k, f)| (*k == cmd).then_some(*f))
-                .unwrap_or(print_help);
-            f(&sh)?;
-        }
+        let f = TASKS
+            .iter()
+            .find_map(|(k, f)| (*k == cmd).then_some(*f))
+            .unwrap_or(print_help);
+        f(&sh)?;
     } else {
         print_help(&sh)?;
     }
@@ -476,64 +469,5 @@ fn print_help(_sh: &Shell) -> Result<()> {
     for (name, _) in TASKS {
         println!("  - {name}");
     }
-    Ok(())
-}
-
-fn next_version(_sh: &Shell) -> Result<()> {
-    eprintln!("Usage: cargo xtask next-version <major|minor|patch>");
-    eprintln!("\nBumps the specified version component and prints the result.");
-    std::process::exit(1);
-}
-
-fn next_version_with_arg(sh: &Shell, segment: Option<String>) -> Result<()> {
-    let segment = segment.ok_or_else(|| {
-        anyhow!("Missing argument. Usage: cargo xtask next-version <major|minor|patch>")
-    })?;
-
-    if !matches!(segment.as_str(), "major" | "minor" | "patch") {
-        anyhow::bail!(
-            "Invalid type '{}'. Must be one of: major, minor, patch",
-            segment
-        );
-    }
-
-    let manifest_output = cmd!(
-        sh,
-        "cargo read-manifest --manifest-path crates/lib/Cargo.toml"
-    )
-    .read()
-    .context("Failed to read manifest from crates/lib/Cargo.toml")?;
-
-    let manifest: serde_json::Value =
-        serde_json::from_str(&manifest_output).context("Failed to parse manifest JSON")?;
-
-    let version = manifest["version"]
-        .as_str()
-        .ok_or_else(|| anyhow!("Could not find version in crates/lib/Cargo.toml"))?;
-
-    let parts: Vec<&str> = version.split('.').collect();
-    if parts.len() != 3 {
-        anyhow::bail!("Invalid version format in Cargo.toml: {}", version);
-    }
-
-    let major: u32 = parts[0]
-        .parse()
-        .with_context(|| format!("Invalid major version: {}", parts[0]))?;
-    let minor: u32 = parts[1]
-        .parse()
-        .with_context(|| format!("Invalid minor version: {}", parts[1]))?;
-    let patch: u32 = parts[2]
-        .parse()
-        .with_context(|| format!("Invalid patch version: {}", parts[2]))?;
-
-    let new_version = match segment.as_str() {
-        "major" => format!("{}.0.0", major + 1),
-        "minor" => format!("{}.{}.0", major, minor + 1),
-        "patch" => format!("{}.{}.{}", major, minor, patch + 1),
-        _ => unreachable!(),
-    };
-
-    println!("{}", new_version);
-
     Ok(())
 }
