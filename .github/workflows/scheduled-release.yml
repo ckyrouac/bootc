@@ -69,6 +69,7 @@ jobs:
           git_tag_gpgsign: true
       
       - name: Create release commit
+        id: create_commit
         if: steps.check_schedule.outputs.should_release == 'true'
         env:
           INPUT_VERSION: ${{ github.event.inputs.version }}
@@ -100,7 +101,7 @@ jobs:
         if: steps.check_schedule.outputs.should_release == 'true'
         id: create_branch
         env:
-          VERSION: ${{ steps.next_version.outputs.VERSION }}
+          VERSION: ${{ steps.create_commit.outputs.VERSION }}
         run: |
           BRANCH_NAME="release-${VERSION}"
           git checkout -b "$BRANCH_NAME"
@@ -117,7 +118,7 @@ jobs:
         if: steps.check_schedule.outputs.should_release == 'true'
         uses: actions/github-script@v7
         env:
-          VERSION: ${{ steps.next_version.outputs.VERSION }}
+          VERSION: ${{ steps.create_commit.outputs.VERSION }}
           BRANCH_NAME: ${{ steps.create_branch.outputs.branch_name }}
         with:
           script: |
