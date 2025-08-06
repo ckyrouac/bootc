@@ -27,16 +27,16 @@ jobs:
         with:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
-          
-      - name: Get GitHub App User ID
-        id: get-user-id
-        run: echo "user-id=$(gh api "/users/${{ steps.app-token.outputs.app-slug }}[bot]" --jq .id)" >> "$GITHUB_OUTPUT"
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-
-      - run: |
-          git config --global user.name '${{ steps.app-token.outputs.app-slug }}[bot]'
-          git config --global user.email '${{ steps.get-user-id.outputs.user-id }}+${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com'
+      #
+      # - name: Get GitHub App User ID
+      #   id: get-user-id
+      #   run: echo "user-id=$(gh api "/users/${{ steps.app-token.outputs.app-slug }}[bot]" --jq .id)" >> "$GITHUB_OUTPUT"
+      #   env:
+      #     GH_TOKEN: ${{ steps.app-token.outputs.token }}
+      #
+      # - run: |
+      #     git config --global user.name '${{ steps.app-token.outputs.app-slug }}[bot]'
+      #     git config --global user.email '${{ steps.get-user-id.outputs.user-id }}+${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com'
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -67,7 +67,7 @@ jobs:
 
           echo "Days since start date ($START_DATE): $DAYS_SINCE_START"
           echo "Weeks since start date: $WEEKS_SINCE_START"
-          
+
           # Release every 3 weeks
           if [ $WEEKS_SINCE_START -gt 0 ] && [ $((WEEKS_SINCE_START % 3)) -eq 0 ]; then
             echo "should_release=true" >> $GITHUB_OUTPUT
@@ -121,17 +121,16 @@ jobs:
         uses: peter-evans/create-pull-request@v6
         env:
           VERSION: ${{ steps.create_commit.outputs.VERSION }}
-          USER: '${{ steps.app-token.outputs.app-slug }}[bot] <${{ steps.get-user-id.outputs.user-id }}+${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com>'
+          # USER: '${{ steps.app-token.outputs.app-slug }}[bot] <${{ steps.get-user-id.outputs.user-id }}+${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com>'
         with:
           token: ${{ steps.app-token.outputs.token }}
-          author: '$USER'
-          commiter: '$USER'
-          signoff: false
+          # author: '$USER'
+          # commiter: '$USER'
+          signoff: true
           title: 'Release $VERSION'
           commit-message: 'Release $VERSION'
           branch: 'release-${VERSION}'
           delete-branch: true
-          sign-commits: true
           labels: release
           body: >
             ## Release ${version}
