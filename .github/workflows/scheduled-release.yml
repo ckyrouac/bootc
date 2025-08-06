@@ -118,22 +118,21 @@ jobs:
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Create Pull Request
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@v7
         env:
           VERSION: ${{ steps.create_commit.outputs.VERSION }}
           # USER: '${{ steps.app-token.outputs.app-slug }}[bot] <${{ steps.get-user-id.outputs.user-id }}+${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com>'
         with:
           token: ${{ steps.app-token.outputs.token }}
-          # author: '$USER'
-          # commiter: '$USER'
           signoff: true
-          title: 'Release $VERSION'
-          commit-message: 'Release $VERSION'
-          branch: 'release-${VERSION}'
+          sign-commits: true
+          title: "Release ${VERSION}"
+          commit-message: "Release ${VERSION}"
+          branch: "release-${VERSION}"
           delete-branch: true
           labels: release
-          body: >
-            ## Release ${version}
+          body: |
+            ## Release ${VERSION}
 
             This is an automated release PR created by the scheduled release workflow.
 
