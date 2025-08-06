@@ -115,13 +115,13 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
           signoff: true
           sign-commits: true
-          title: "Release ${{ vars.VERSION }}"
-          commit-message: "Release ${{ vars.VERSION }}"
-          branch: "release-${{ vars.VERSION }}"
+          title: "Release ${{ env.VERSION }}"
+          commit-message: "Release ${{ env.VERSION }}"
+          branch: "release-${{ env.VERSION }}"
           delete-branch: true
           labels: release
           body: |
-            ## Release ${{ vars.VERSION }}
+            ## Release ${{ env.VERSION }}
 
             This is an automated release PR created by the scheduled release workflow.
 
