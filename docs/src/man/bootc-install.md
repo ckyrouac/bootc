@@ -71,4 +71,4 @@ bootc-install-help(8)
 
 # VERSION
 
-v1.5.1
+v1.11.0
