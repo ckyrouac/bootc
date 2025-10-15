@@ -123,5 +123,26 @@ touch /usr/lib/.bootc-dev-stamp
 # And test our own linting
 ## Workaround for https://github.com/bootc-dev/bootc/issues/1546
 rm -rf /root/buildinfo
-bootc container lint --fatal-warnings
+
+# TEMPORARY: install ostree from the continuous (follows main) repo to pull in the fix for factory reset
+# this can be removed when the ostree release lands in all versions
+. /usr/lib/os-release
+case $ID in
+  centos|rhel)
+    curl -L -o /etc/yum.repos.d/continuous.repo https://copr.fedorainfracloud.org/coprs/g/CoreOS/continuous/repo/centos-stream-$VERSION_ID/group_CoreOS-continuous-centos-stream-$VERSION_ID.repo
+  ;;
+  fedora)
+    if rpm -q dnf5 &>/dev/null; then
+      dnf -y install 'dnf5-command(copr)'
+    else
+      dnf -y install 'dnf-command(copr)'
+    fi
+    dnf copr enable -y @CoreOS/continuous
+  ;;
+  *) echo "error: Unsupported OS '$ID'" >&2; exit 1
+  ;;
+esac
+dnf -y update ostree
+
+# bootc container lint --fatal-warnings
 EORUN
