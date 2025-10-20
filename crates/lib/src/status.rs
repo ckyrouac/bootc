@@ -95,6 +95,11 @@ impl From<ImageReference> for OstreeImageReference {
 
 /// Check if a deployment has soft reboot capability
 fn has_soft_reboot_capability(sysroot: &SysrootLock, deployment: &ostree::Deployment) -> bool {
+    // this version fixes a bug when validating kargs during a factory reset
+    if !ostree::check_version(2025, 7) {
+        return false;
+    }
+
     ostree_ext::systemd_has_soft_reboot() && sysroot.deployment_can_soft_reboot(deployment)
 }
 
