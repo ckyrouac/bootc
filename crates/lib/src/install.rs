@@ -2245,6 +2245,36 @@ pub(crate) async fn install_to_existing_root(opts: InstallToExistingRootOpts) ->
     install_to_filesystem(opts, true, cleanup).await
 }
 
+/// Read the /boot entry from /etc/fstab, if it exists
+fn read_boot_fstab_entry(root: &Dir) -> Result<Option<MountSpec>> {
+    let fstab_path = "etc/fstab";
+    let fstab = match root.open_optional(fstab_path)? {
+        Some(f) => f,
+        None => return Ok(None),
+    };
+
+    let reader = std::io::BufReader::new(fstab);
+    for line in std::io::BufRead::lines(reader) {
+        let line = line?;
+        let line = line.trim();
+
+        // Skip empty lines and comments
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        // Parse the mount spec
+        let spec = MountSpec::from_str(line)?;
+
+        // Check if this is a /boot entry
+        if spec.target == "/boot" {
+            return Ok(Some(spec));
+        }
+    }
+
+    Ok(None)
+}
+
 pub(crate) async fn install_reset(opts: InstallResetOpts) -> Result<()> {
     let rootfs = &Dir::open_ambient_dir("/", cap_std::ambient_authority())?;
     if !opts.experimental {
@@ -2319,10 +2349,34 @@ pub(crate) async fn install_reset(opts: InstallResetOpts) -> Result<()> {
         .collect::<Vec<_>>();
 
     let from = MergeState::Reset {
-        stateroot: target_stateroot,
+        stateroot: target_stateroot.clone(),
         kargs,
     };
     crate::deploy::stage(sysroot, from, &fetched, &spec, prog.clone()).await?;
+
+    // Copy /boot entry from /etc/fstab to the new stateroot if it exists
+    if let Some(boot_spec) = read_boot_fstab_entry(rootfs)? {
+        let staged_deployment = ostree
+            .staged_deployment()
+            .ok_or_else(|| anyhow!("No staged deployment found"))?;
+        let deployment_path = ostree.deployment_dirpath(&staged_deployment);
+        let sysroot_dir = crate::utils::sysroot_dir(ostree)?;
+        let deployment_root = sysroot_dir.open_dir(&deployment_path)?;
+
+        // Write the /boot entry to /etc/fstab in the new deployment
+        crate::lsm::atomic_replace_labeled(
+            &deployment_root,
+            "etc/fstab",
+            0o644.into(),
+            None,
+            |w| writeln!(w, "{}", boot_spec.to_fstab()).map_err(Into::into),
+        )?;
+
+        tracing::debug!(
+            "Copied /boot entry to new stateroot: {}",
+            boot_spec.to_fstab()
+        );
+    }
 
     sysroot.update_mtime()?;
 
@@ -2454,6 +2508,48 @@ mod tests {
         remove_all_in_dir_no_xdev(&td, true).unwrap();
 
         assert_eq!(td.entries()?.count(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_boot_fstab_entry() -> Result<()> {
+        let td = cap_std_ext::cap_tempfile::TempDir::new(cap_std::ambient_authority())?;
+
+        // Test with no /etc/fstab
+        assert!(read_boot_fstab_entry(&td)?.is_none());
+
+        // Test with /etc/fstab but no /boot entry
+        td.create_dir("etc")?;
+        td.write("etc/fstab", "UUID=test-uuid / ext4 defaults 0 0\n")?;
+        assert!(read_boot_fstab_entry(&td)?.is_none());
+
+        // Test with /boot entry
+        let fstab_content = "\
+# /etc/fstab
+UUID=root-uuid / ext4 defaults 0 0
+UUID=boot-uuid /boot ext4 ro 0 0
+UUID=home-uuid /home ext4 defaults 0 0
+";
+        td.write("etc/fstab", fstab_content)?;
+        let boot_spec = read_boot_fstab_entry(&td)?.unwrap();
+        assert_eq!(boot_spec.source, "UUID=boot-uuid");
+        assert_eq!(boot_spec.target, "/boot");
+        assert_eq!(boot_spec.fstype, "ext4");
+        assert_eq!(boot_spec.options, Some("ro".to_string()));
+
+        // Test with /boot entry with comments
+        let fstab_content = "\
+# /etc/fstab
+# Created by anaconda
+UUID=root-uuid / ext4 defaults 0 0
+# Boot partition
+UUID=boot-uuid /boot ext4 defaults 0 0
+";
+        td.write("etc/fstab", fstab_content)?;
+        let boot_spec = read_boot_fstab_entry(&td)?.unwrap();
+        assert_eq!(boot_spec.source, "UUID=boot-uuid");
+        assert_eq!(boot_spec.target, "/boot");
 
         Ok(())
     }
