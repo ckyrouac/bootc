@@ -59,6 +59,7 @@
 - [bootc image](experimental-bootc-image.md)
 - [composefs backend](experimental-composefs.md)
 - [fsck](experimental-fsck.md)
+- [install reset](experimental-install-reset.md)
 - [--progress-fd](experimental-progress-fd.md)
 
 # More information
