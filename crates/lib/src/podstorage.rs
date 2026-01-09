@@ -119,6 +119,15 @@ fn bind_storage_roots(cmd: &mut Command, storage_root: &Dir, run_root: &Dir) -> 
     Ok(())
 }
 
+/// Get the global authfile from the host root filesystem.
+/// This is used as a fallback when the authfile is not found in the sysroot,
+/// such as during upgrades where the new image may not have auth.json
+/// but the running system does.
+fn get_host_authfile() -> Result<Option<(camino::Utf8PathBuf, std::fs::File)>> {
+    let host_root = Dir::open_ambient_dir("/", cap_std::ambient_authority())?;
+    ostree_ext::globals::get_global_authfile(&host_root)
+}
+
 // Initialize a `podman` subprocess with:
 // - storage overridden to point to to storage_root
 // - Authentication (auth.json) using the bootc/ostree owned auth
@@ -133,10 +142,22 @@ fn new_podman_cmd_in(sysroot: &Dir, storage_root: &Dir, run_root: &Dir) -> Resul
 
     // Keep this in sync with https://github.com/bootc-dev/containers-image-proxy-rs/blob/b5e0861ad5065f47eaf9cda0d48da3529cc1bc43/src/imageproxy.rs#L310
     // We always override the auth to match the bootc setup.
-    let authfile_fd = ostree_ext::globals::get_global_authfile(sysroot)?.map(|v| v.1);
-    if let Some(mut fd) = authfile_fd {
+    // First try to get the authfile from the sysroot (e.g., upgrade image), and if not found,
+    // fall back to the host root. This handles the case where during an upgrade, the new image
+    // may not have auth.json but the running system does.
+    let authfile = if let Some((path, file)) = ostree_ext::globals::get_global_authfile(sysroot)? {
+        tracing::debug!("Using authfile from sysroot: {path}");
+        Some(file)
+    } else if let Some((path, file)) = get_host_authfile()? {
+        tracing::debug!("Using authfile from host root: {path}");
+        Some(file)
+    } else {
+        None
+    };
+    if let Some(mut fd) = authfile {
         std::io::copy(&mut fd, &mut tempfile)?;
     } else {
+        tracing::debug!("No authfile found, using empty auth");
         // Note that if there's no bootc-owned auth, then we force an empty authfile to ensure
         // that podman doesn't fall back to searching the user-owned paths.
         tempfile.write_all(b"{}")?;

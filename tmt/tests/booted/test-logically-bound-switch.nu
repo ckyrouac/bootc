@@ -12,6 +12,10 @@
 # <verify new bound images are pulled>
 # <reboot>
 # <verify booted state>
+#
+# If CSTOR_DIST_AUTH is set (format: "username:password"), the test also includes
+# an authenticated LBI from cstor-dist running on the host. This tests the auth
+# fallback fix from https://github.com/bootc-dev/bootc/pull/1852
 
 use std assert
 use tap.nu
@@ -21,10 +25,92 @@ bootc status
 let st = bootc status --json | from json
 let booted = $st.status.booted.image
 
-# The tests here aren't fetching from a registry which requires auth by default,
-# but we can replicate the failure in https://github.com/bootc-dev/bootc/pull/1852
-# by just injecting any auth file.
-echo '{}' | save -f /run/ostree/auth.json
+# cstor-dist configuration for authenticated LBI testing
+const CSTOR_DIST_IMAGE = "ghcr.io/cgwalters/cstor-dist:latest"
+const CSTOR_DIST_USER = "testuser"
+const CSTOR_DIST_PASS = "testpass"
+const CSTOR_DIST_PORT = 8000
+
+# Start cstor-dist with basic auth on localhost
+# Returns the registry address (localhost:port)
+def start_cstor_dist [] {
+    # Check if CSTOR_DIST_AUTH is set to enable authenticated LBI testing
+    if $env.CSTOR_DIST_AUTH? == null {
+        return null
+    }
+
+    print "Starting cstor-dist with basic auth..."
+
+    # Pull a test image that cstor-dist will serve
+    # This image will be used as the authenticated LBI
+    print "Pulling test image for cstor-dist to serve..."
+    podman pull docker.io/library/alpine:latest
+
+    # Run cstor-dist container with auth enabled
+    # Mount the local containers storage so cstor-dist can serve images from it
+    let storage_path = if ("/var/lib/containers/storage" | path exists) {
+        "/var/lib/containers/storage"
+    } else {
+        $"($env.HOME)/.local/share/containers/storage"
+    }
+
+    (podman run --privileged --rm -d --name cstor-dist-auth
+        -p $"($CSTOR_DIST_PORT):8000"
+        -v $"($storage_path):/var/lib/containers/storage"
+        $CSTOR_DIST_IMAGE --username $CSTOR_DIST_USER --password $CSTOR_DIST_PASS)
+
+    # Wait for cstor-dist to be ready
+    print "Waiting for cstor-dist to be ready..."
+    sleep 2sec
+
+    # Verify it's running
+    let running = podman ps --filter name=cstor-dist-auth --format "{{.Names}}" | str trim
+    if $running != "cstor-dist-auth" {
+        print "WARNING: cstor-dist container not running, skipping auth test"
+        return null
+    }
+
+    print $"cstor-dist running on localhost:($CSTOR_DIST_PORT)"
+    $"localhost:($CSTOR_DIST_PORT)"
+}
+
+# Get cstor-dist config if it's running
+def get_cstor_dist_config [] {
+    if $env.CSTOR_DIST_AUTH? == null {
+        return null
+    }
+
+    let registry = $"localhost:($CSTOR_DIST_PORT)"
+    # Base64 encode the credentials for auth.json
+    let auth_b64 = $"($CSTOR_DIST_USER):($CSTOR_DIST_PASS)" | encode base64
+    {
+        registry: $registry,
+        auth_b64: $auth_b64,
+        # Use alpine image that we pulled and cstor-dist is serving
+        image: "docker.io/library/alpine:latest"
+    }
+}
+
+# Set up auth.json with cstor-dist credentials if available
+def setup_auth [] {
+    mkdir /run/ostree
+    let cstor = get_cstor_dist_config
+    if $cstor != null {
+        print $"Setting up auth for cstor-dist at ($cstor.registry)"
+        let auth_json = $'{"auths": {"($cstor.registry)": {"auth": "($cstor.auth_b64)"}}}'
+        echo $auth_json | save -f /run/ostree/auth.json
+        # Configure insecure registry for cstor-dist (no TLS)
+        mkdir /etc/containers/registries.conf.d
+        echo $"[[registry]]\nlocation=\"($cstor.registry)\"\ninsecure=true" | save -f /etc/containers/registries.conf.d/99-cstor-dist.conf
+    } else {
+        # The tests here aren't fetching from a registry which requires auth by default,
+        # but we can replicate the failure in https://github.com/bootc-dev/bootc/pull/1852
+        # by just injecting any auth file.
+        echo '{}' | save -f /run/ostree/auth.json
+    }
+}
+
+setup_auth
 
 def initial_setup [] {
     bootc image copy-to-storage
@@ -89,14 +175,28 @@ def first_boot [] {
 
     initial_setup
 
+    # Start cstor-dist if auth testing is enabled
+    start_cstor_dist
+
     # build a bootc image that includes bound images
-    let images = [
+    mut images = [
         { "bound": true, "image": "registry.access.redhat.com/ubi9/ubi-minimal:9.4", "name": "ubi-minimal" },
         { "bound": false, "image": "quay.io/centos-bootc/centos-bootc:stream9", "name": "centos-bootc" }
     ]
 
+    # Add authenticated LBI from cstor-dist if configured
+    let cstor = get_cstor_dist_config
+    if $cstor != null {
+        print $"Adding authenticated LBI from cstor-dist: ($cstor.registry)/($cstor.image)"
+        $images = ($images | append [{
+            "bound": true,
+            "image": $"($cstor.registry)/($cstor.image)",
+            "name": "cstor-auth-test"
+        }])
+    }
+
     let containers = [{
-        "bound": true, "image": "docker.io/library/alpine:latest", "name": "alpine" 
+        "bound": true, "image": "docker.io/library/alpine:latest", "name": "alpine"
     }]
 
     let image_name = "localhost/bootc-bound"
@@ -111,14 +211,27 @@ def second_boot [] {
     assert equal $booted.image.transport containers-storage
     assert equal $booted.image.image localhost/bootc-bound
 
+    # Start cstor-dist again if auth testing is enabled (container doesn't survive reboot)
+    start_cstor_dist
+
     # verify images are still there after boot
-    let images = [
+    mut images = [
         { "bound": true, "image": "registry.access.redhat.com/ubi9/ubi-minimal:9.4", "name": "ubi-minimal" },
         { "bound": false, "image": "quay.io/centos-bootc/centos-bootc:stream9", "name": "centos-bootc" }
     ]
 
+    # Add authenticated LBI from cstor-dist if configured
+    let cstor = get_cstor_dist_config
+    if $cstor != null {
+        $images = ($images | append [{
+            "bound": true,
+            "image": $"($cstor.registry)/($cstor.image)",
+            "name": "cstor-auth-test"
+        }])
+    }
+
     let containers = [{
-        "bound": true, "image": "docker.io/library/alpine:latest", "name": "alpine" 
+        "bound": true, "image": "docker.io/library/alpine:latest", "name": "alpine"
     }]
     verify_images $images $containers
 
@@ -137,14 +250,24 @@ def third_boot [] {
     assert equal $booted.image.transport containers-storage
     assert equal $booted.image.image localhost/bootc-bound
 
-    let images = [
+    mut images = [
         { "bound": true, "image": "registry.access.redhat.com/ubi9/ubi-minimal:9.4", "name": "ubi-minimal" },
         { "bound": true, "image": "registry.access.redhat.com/ubi9/ubi-minimal:9.3", "name": "ubi-minimal-9-3" },
         { "bound": false, "image": "quay.io/centos-bootc/centos-bootc:stream9", "name": "centos-bootc" }
     ]
 
+    # Add authenticated LBI from cstor-dist if configured
+    let cstor = get_cstor_dist_config
+    if $cstor != null {
+        $images = ($images | append [{
+            "bound": true,
+            "image": $"($cstor.registry)/($cstor.image)",
+            "name": "cstor-auth-test"
+        }])
+    }
+
     let containers = [{
-        "bound": true, "image": "docker.io/library/alpine:latest", "name": "alpine" 
+        "bound": true, "image": "docker.io/library/alpine:latest", "name": "alpine"
     }]
 
     verify_images $images $containers
