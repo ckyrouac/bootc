@@ -1255,7 +1255,8 @@ pub(crate) async fn setup_composefs_boot(
 
     if cfg!(target_arch = "s390x") {
         // TODO: Integrate s390x support into install_via_bootupd
-        crate::bootloader::install_via_zipl(&root_setup.device_info, boot_uuid)?;
+        // zipl only supports single device
+        crate::bootloader::install_via_zipl(root_setup.device_info.first(), boot_uuid)?;
     } else if postfetch.detected_bootloader == Bootloader::Grub {
         crate::bootloader::install_via_bootupd(
             &root_setup.device_info,
@@ -1264,8 +1265,9 @@ pub(crate) async fn setup_composefs_boot(
             None,
         )?;
     } else {
+        // systemd-boot only supports a single ESP
         crate::bootloader::install_systemd_boot(
-            &root_setup.device_info,
+            root_setup.device_info.first(),
             &root_setup.physical_root_path,
             &state.config_opts,
             None,
