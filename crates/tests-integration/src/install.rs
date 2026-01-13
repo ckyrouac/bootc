@@ -99,6 +99,10 @@ pub(crate) fn run_alongside(image: &str, mut testargs: libtest_mimic::Arguments)
                 let sh = &xshell::Shell::new()?;
                 reset_root(sh, image)?;
 
+                // Clean up any leftover LVM state from previous failed runs
+                let _ = cmd!(sh, "sudo vgchange -an BL").ignore_status().run();
+                let _ = cmd!(sh, "sudo vgremove -f BL").ignore_status().run();
+
                 // Create work directory for the test
                 let tmpd = sh.create_temp_dir()?;
                 let work_dir = tmpd.path();
@@ -153,13 +157,13 @@ pub(crate) fn run_alongside(image: &str, mut testargs: libtest_mimic::Arguments)
                     cmd!(sh, "sudo partprobe {loop_dev}").run()?;
                     std::thread::sleep(std::time::Duration::from_secs(2));
 
-                    let loop_part2 = format!("{}p2", loop_dev); // EFI
-                    let loop_part3 = format!("{}p3", loop_dev); // Boot
+                    let efi_part2 = format!("{}p2", loop_dev); // EFI
+                    let root_part3 = format!("{}p3", loop_dev); // Boot
                     let loop_part4 = format!("{}p4", loop_dev); // LVM
 
                     // Create filesystems on boot partitions
-                    cmd!(sh, "sudo mkfs.vfat -F32 {loop_part2}").run()?;
-                    cmd!(sh, "sudo mkfs.ext4 -F {loop_part3}").run()?;
+                    cmd!(sh, "sudo mkfs.vfat -F32 {efi_part2}").run()?;
+                    cmd!(sh, "sudo mkfs.ext4 -F {root_part3}").run()?;
 
                     // Setup LVM
                     cmd!(sh, "sudo pvcreate {loop_part4}").run()?;
@@ -178,7 +182,7 @@ pub(crate) fn run_alongside(image: &str, mut testargs: libtest_mimic::Arguments)
                         .read()?
                         .trim()
                         .to_string();
-                    let boot_uuid = cmd!(sh, "sudo blkid -s UUID -o value {loop_part2}")
+                    let boot_uuid = cmd!(sh, "sudo blkid -s UUID -o value {efi_part2}")
                         .read()?
                         .trim()
                         .to_string();
@@ -190,9 +194,15 @@ pub(crate) fn run_alongside(image: &str, mut testargs: libtest_mimic::Arguments)
 
                     cmd!(sh, "sudo mount /dev/BL/root02 {target}").run()?;
                     cmd!(sh, "sudo mkdir -p {target}/boot").run()?;
-                    cmd!(sh, "sudo mount {loop_part3} {target}/boot").run()?;
+                    cmd!(sh, "sudo mount {root_part3} {target}/boot").run()?;
                     cmd!(sh, "sudo mkdir -p {target}/boot/efi").run()?;
-                    cmd!(sh, "sudo mount {loop_part2} {target}/boot/efi").run()?;
+                    cmd!(sh, "sudo mount {efi_part2} {target}/boot/efi").run()?;
+
+                    // Create EFI directory structure with some files (simulating existing EFI content)
+                    // This tests that bootc correctly handles /boot/efi as a mount point
+                    cmd!(sh, "sudo mkdir -p {target}/boot/efi/EFI/fedora").run()?;
+                    cmd!(sh, "sudo touch {target}/boot/efi/EFI/fedora/shimx64.efi").run()?;
+                    cmd!(sh, "sudo touch {target}/boot/efi/EFI/fedora/grubx64.efi").run()?;
 
                     // Critical: Mount /var as a separate partition
                     cmd!(sh, "sudo mkdir -p {target}/var").run()?;

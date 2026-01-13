@@ -1874,8 +1874,10 @@ pub(crate) async fn install_to_disk(mut opts: InstallToDiskOpts) -> Result<()> {
 /// /var/lib/containers (a mount point).
 #[context("Requiring directory contains only mount points")]
 fn require_dir_contains_only_mounts(parent_fd: &Dir, dir_name: &str) -> Result<()> {
+    tracing::trace!("Checking directory {dir_name} for non-mount entries");
     let Some(dir_fd) = parent_fd.open_dir_noxdev(dir_name)? else {
         // The directory itself is a mount point
+        tracing::trace!("{dir_name} is a mount point");
         return Ok(());
     };
 
@@ -1884,6 +1886,7 @@ fn require_dir_contains_only_mounts(parent_fd: &Dir, dir_name: &str) -> Result<(
     }
 
     for entry in dir_fd.entries()? {
+        tracing::trace!("Checking entry in {dir_name}");
         let entry = DirEntryUtf8::from_cap_std(entry?);
         let entry_name = entry.file_name()?;
 
@@ -1892,7 +1895,7 @@ fn require_dir_contains_only_mounts(parent_fd: &Dir, dir_name: &str) -> Result<(
         }
 
         let etype = entry.file_type()?;
-        if etype == FileType::dir() && dir_fd.open_dir_noxdev(&entry_name)?.is_some() {
+        if etype == FileType::dir() {
             require_dir_contains_only_mounts(&dir_fd, &entry_name)?;
         } else {
             anyhow::bail!("Found entry in {dir_name}: {entry_name}");
