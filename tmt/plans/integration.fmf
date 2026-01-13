@@ -159,4 +159,15 @@ execute:
     how: fmf
     test:
       - /tmt/tests/tests/test-32-install-to-filesystem-var-mount
+
+/plan-33-multi-device-esp:
+  summary: Test multi-device ESP detection for to-existing-root
+  provision:
+    hardware:
+      boot:
+        method: uefi
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/test-32-multi-device-esp
 # END GENERATED PLANS
