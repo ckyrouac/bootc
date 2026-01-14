@@ -109,7 +109,7 @@ pub(crate) fn run_alongside(image: &str, mut testargs: libtest_mimic::Arguments)
 
                 // Create a disk image with partitions for root and var
                 let disk_img = work_dir.join("disk.img");
-                let size = 12 * 1024 * 1024 * 1024;
+                let size = 1024 * 1024 * 1024; // 1 GiB
                 let disk_file = std::fs::File::create(&disk_img)?;
                 disk_file.set_len(size)?;
                 drop(disk_file);
@@ -170,8 +170,8 @@ pub(crate) fn run_alongside(image: &str, mut testargs: libtest_mimic::Arguments)
                     cmd!(sh, "sudo vgcreate BL {loop_part4}").run()?;
 
                     // Create logical volumes
-                    cmd!(sh, "sudo lvcreate -L 4G -n var02 BL").run()?;
-                    cmd!(sh, "sudo lvcreate -L 5G -n root02 BL").run()?;
+                    cmd!(sh, "sudo lvcreate -L 100M -n var02 BL").run()?;
+                    cmd!(sh, "sudo lvcreate -L 100M -n root02 BL").run()?;
 
                     // Create filesystems on logical volumes
                     cmd!(sh, "sudo mkfs.ext4 -F /dev/BL/var02").run()?;
