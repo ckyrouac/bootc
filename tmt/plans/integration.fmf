@@ -18,6 +18,11 @@ prepare:
       - expect
       - ansible-core
       - zstd
+      # Required for test-32-install-to-filesystem-var-mount
+      - parted
+      - lvm2
+      - dosfstools
+      - e2fsprogs
     when: running_env != image_mode
   - how: shell
     order: 98
@@ -147,4 +152,11 @@ execute:
     how: fmf
     test:
       - /tmt/tests/tests/test-31-switch-to-unified
+
+/plan-32-install-to-filesystem-var-mount:
+  summary: Test bootc install to-filesystem with separate /var mount
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/tests/test-32-install-to-filesystem-var-mount
 # END GENERATED PLANS

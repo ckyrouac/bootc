@@ -79,3 +79,13 @@
   summary: Onboard to unified storage, build derived image, and switch to it
   duration: 30m
   test: nu booted/test-switch-to-unified.nu
+
+/test-32-install-to-filesystem-var-mount:
+  summary: Test bootc install to-filesystem with separate /var mount
+  duration: 30m
+  require:
+    - parted
+    - lvm2
+    - dosfstools
+    - e2fsprogs
+  test: bash booted/test-install-to-filesystem-var-mount.sh

@@ -1,0 +1,148 @@
+# number: 32
+# tmt:
+#   summary: Test bootc install to-filesystem with separate /var mount
+#   duration: 30m
+#   require:
+#     - parted
+#     - lvm2
+#     - dosfstools
+#     - e2fsprogs
+#
+#!/bin/bash
+# Test bootc install to-filesystem with a pre-existing /var mount point.
+# This verifies that bootc correctly handles scenarios where /var is on a
+# separate filesystem, which is a common production setup for managing
+# persistent data separately from the OS.
+
+set -xeuo pipefail
+
+# Use a generic target image to test skew between the bootc binary doing
+# the install and the target image
+TARGET_IMAGE="docker://quay.io/centos-bootc/centos-bootc:stream10"
+
+echo "Testing bootc install to-filesystem with separate /var mount"
+
+# Disable SELinux enforcement for the install
+setenforce 0
+
+# Enable usr-overlay to allow modifications
+bootc usr-overlay
+
+# Install required packages (bootc images are immutable, so we need to install
+# after usr-overlay is enabled)
+dnf install -y parted lvm2 dosfstools e2fsprogs
+
+# Mask off conflicting ostree state
+if test -d /sysroot/ostree; then
+    mount --bind /usr/share/empty /sysroot/ostree
+fi
+rm -vrf /usr/lib/bootupd/updates
+rm -vrf /usr/lib/bootc/bound-images.d
+
+# Create a 12GB sparse disk image in /var/tmp (not /tmp which may be tmpfs)
+DISK_IMG=/var/tmp/disk-var-mount-test.img
+truncate -s 12G "$DISK_IMG"
+
+# Setup loop device
+LOOP_DEV=$(losetup -f --show "$DISK_IMG")
+echo "Using loop device: $LOOP_DEV"
+
+# Cleanup function
+cleanup() {
+    set +e
+    echo "Cleaning up..."
+    umount -R /var/mnt/target 2>/dev/null
+    vgchange -an BL 2>/dev/null
+    vgremove -f BL 2>/dev/null
+    losetup -d "$LOOP_DEV" 2>/dev/null
+    rm -f "$DISK_IMG" 2>/dev/null
+}
+trap cleanup EXIT
+
+# Create partition table
+parted -s "$LOOP_DEV" mklabel gpt
+# BIOS boot partition (for GRUB on GPT)
+parted -s "$LOOP_DEV" mkpart primary 1MiB 2MiB
+parted -s "$LOOP_DEV" set 1 bios_grub on
+# EFI partition (200 MiB)
+parted -s "$LOOP_DEV" mkpart primary fat32 2MiB 202MiB
+parted -s "$LOOP_DEV" set 2 esp on
+# Boot partition (1 GiB)
+parted -s "$LOOP_DEV" mkpart primary ext4 202MiB 1226MiB
+# LVM partition (rest of disk)
+parted -s "$LOOP_DEV" mkpart primary 1226MiB 100%
+
+# Reload partition table
+partprobe "$LOOP_DEV"
+sleep 2
+
+# Partition device names
+EFI_PART="${LOOP_DEV}p2"
+BOOT_PART="${LOOP_DEV}p3"
+LVM_PART="${LOOP_DEV}p4"
+
+# Create filesystems on boot partitions
+mkfs.vfat -F32 "$EFI_PART"
+mkfs.ext4 -F "$BOOT_PART"
+
+# Setup LVM
+pvcreate "$LVM_PART"
+vgcreate BL "$LVM_PART"
+
+# Create logical volumes
+lvcreate -L 4G -n var02 BL
+lvcreate -L 5G -n root02 BL
+
+# Create filesystems on logical volumes
+mkfs.ext4 -F /dev/BL/var02
+mkfs.ext4 -F /dev/BL/root02
+
+# Get UUIDs for bootc install
+ROOT_UUID=$(blkid -s UUID -o value /dev/BL/root02)
+BOOT_UUID=$(blkid -s UUID -o value "$EFI_PART")
+
+# Mount the partitions
+mkdir -p /var/mnt/target
+mount /dev/BL/root02 /var/mnt/target
+mkdir -p /var/mnt/target/boot
+mount "$BOOT_PART" /var/mnt/target/boot
+mkdir -p /var/mnt/target/boot/efi
+mount "$EFI_PART" /var/mnt/target/boot/efi
+
+# Create EFI directory structure with some files (simulating existing EFI content)
+mkdir -p /var/mnt/target/boot/efi/EFI/fedora
+touch /var/mnt/target/boot/efi/EFI/fedora/shimx64.efi
+touch /var/mnt/target/boot/efi/EFI/fedora/grubx64.efi
+
+# Critical: Mount /var as a separate partition
+mkdir -p /var/mnt/target/var
+mount /dev/BL/var02 /var/mnt/target/var
+
+echo "Filesystem layout:"
+mount | grep /var/mnt/target || true
+df -h /var/mnt/target /var/mnt/target/boot /var/mnt/target/boot/efi /var/mnt/target/var
+
+# Run bootc install to-filesystem
+# This should succeed and handle the separate /var mount correctly
+podman run \
+    --rm --privileged \
+    -v /var/mnt/target:/target \
+    -v /dev:/dev \
+    --pid=host \
+    --security-opt label=type:unconfined_t \
+    "$TARGET_IMAGE" \
+    bootc install to-filesystem \
+        --disable-selinux \
+        --karg=root=UUID="$ROOT_UUID" \
+        --root-mount-spec=UUID="$ROOT_UUID" \
+        --boot-mount-spec=UUID="$BOOT_UUID" \
+        /target
+
+# Verify the installation succeeded
+echo "Verifying installation..."
+test -d /var/mnt/target/ostree
+test -d /var/mnt/target/ostree/repo
+# Verify bootloader was installed (grub2 or loader for different configurations)
+test -d /var/mnt/target/boot/grub2 || test -d /var/mnt/target/boot/loader
+
+echo "Installation to-filesystem with separate /var mount succeeded!"
