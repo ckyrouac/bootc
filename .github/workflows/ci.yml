@@ -255,17 +255,3 @@ jobs:
         with:
           name: tmt-log-PR-${{ github.event.number }}-fedora-43-coreos-${{ env.ARCH }}
           path: /var/tmp/tmt
-
-  # Sentinel job for required checks - configure this job name in repository settings
-  required-checks:
-    if: always()
-    needs: [cargo-deny, validate, package, test-integration, test-coreos]
-    runs-on: ubuntu-latest
-    steps:
-      - run: exit 1
-        if: >-
-          needs.cargo-deny.result != 'success' ||
-          needs.validate.result != 'success' ||
-          needs.package.result != 'success' ||
-          needs.test-integration.result != 'success' ||
-          needs.test-coreos.result != 'success'
