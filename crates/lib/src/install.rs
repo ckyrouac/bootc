@@ -2315,14 +2315,25 @@ pub(crate) async fn install_to_filesystem(
     };
     tracing::debug!("Backing devices: {backing_devices:?}");
 
+    let is_efi = crate::utils::is_efi_booted();
+    tracing::debug!("System boot mode: {}", if is_efi { "UEFI" } else { "BIOS" });
+
     // Determine the device and partition info to use for bootloader installation.
-    // If there are multiple backing devices, we search for all that contain an ESP.
+    // The strategy differs based on boot mode and number of backing devices:
+    //
+    // Single backing device: Use it directly regardless of boot mode.
+    //
+    // Multiple backing devices (e.g., LVM across disks):
+    //   - UEFI: Find devices with ESP partitions and install bootloader to each.
+    //     This allows booting from any disk that has an ESP.
+    //   - BIOS: Don't specify devices; let bootupd auto-detect. GRUB for BIOS
+    //     uses MBR or BIOS Boot Partition, not ESP, and bootupd handles this.
     let device_info: Vec<bootc_blockdev::PartitionTable> = if backing_devices.len() == 1 {
         // Single backing device - use it directly
         let dev = &backing_devices[0];
         vec![bootc_blockdev::partitions_of(Utf8Path::new(dev))?]
-    } else {
-        // Multiple backing devices - find all with ESP
+    } else if is_efi {
+        // Multiple backing devices on UEFI - find all with ESP
         let mut esp_devices = Vec::new();
         for dev in &backing_devices {
             match bootc_blockdev::partitions_of(Utf8Path::new(dev)) {
@@ -2340,16 +2351,22 @@ pub(crate) async fn install_to_filesystem(
             }
         }
         if esp_devices.is_empty() {
-            // No ESP found on any backing device. This is not fatal because:
-            // - BIOS boot uses MBR, not ESP
-            // - bootupd may auto-detect ESP via mounted /boot/efi
-            // However, UEFI boot without a detectable ESP will fail.
             tracing::warn!(
-                "No ESP found on any backing device ({:?}); UEFI boot may fail",
+                "No ESP found on any backing device ({:?}); bootloader installation may fail. \
+                 For UEFI boot with multi-device root (e.g., LVM across disks), at least one \
+                 backing device must have an EFI System Partition.",
                 backing_devices
             );
         }
         esp_devices
+    } else {
+        // Multiple backing devices on BIOS - let bootupd auto-detect.
+        // GRUB for BIOS uses MBR or BIOS Boot Partition, not ESP.
+        tracing::debug!(
+            "BIOS boot with multiple backing devices ({:?}); bootupd will auto-detect target",
+            backing_devices
+        );
+        Vec::new()
     };
 
     let rootarg = format!("root={}", root_info.mount_spec);

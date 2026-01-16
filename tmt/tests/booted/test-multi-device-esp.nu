@@ -11,6 +11,11 @@
 # 2. Dual ESP: Both backing devices have ESP partitions
 #
 # This validates the fix for https://github.com/bootc-dev/bootc/issues/481
+#
+# IMPORTANT: This test requires UEFI firmware on the host VM.
+# bootc install detects firmware type from /sys/firmware/efi/efivars on the host,
+# not from the target block devices. On BIOS systems, it installs GRUB for i386-pc
+# which requires a BIOS Boot Partition (not ESP) for GPT disks with LVM.
 
 use std assert
 use tap.nu
@@ -18,10 +23,27 @@ use tap.nu
 # Use a generic target image
 let target_image = "docker://quay.io/centos-bootc/centos-bootc:stream10"
 
+# Path used by bootc to detect UEFI firmware
+const EFIVARFS = "/sys/firmware/efi/efivars"
+
 # ESP partition type GUID
 const ESP_TYPE = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
 # Linux LVM partition type GUID
 const LVM_TYPE = "E6D6D379-F507-44C2-A23C-238F2A3DF928"
+
+# Verify the host is running with UEFI firmware.
+# This test creates ESP partitions which are only used by bootc when installing
+# on a UEFI system. On BIOS systems, bootc would try to install GRUB for i386-pc
+# which requires a BIOS Boot Partition instead, causing the test to fail.
+def require_uefi [] {
+    if not ($EFIVARFS | path exists) {
+        error make {
+            msg: $"This test requires UEFI firmware but the host is running in BIOS mode.
+The test plan must specify 'provision: hardware: boot: method: uefi'.
+bootc detects firmware type from ($EFIVARFS) on the host, not from target devices."
+        }
+    }
+}
 
 # Cleanup function for LVM and loop devices
 def cleanup [vg_name: string, loop1: string, loop2: string, mountpoint: string] {
@@ -227,6 +249,9 @@ def test_dual_esp [] {
 }
 
 def main [] {
+    # Fail early with a clear message if not running on UEFI
+    require_uefi
+
     # See https://tmt.readthedocs.io/en/stable/stories/features.html#reboot-during-test
     match $env.TMT_REBOOT_COUNT? {
         null | "0" => test_single_esp,

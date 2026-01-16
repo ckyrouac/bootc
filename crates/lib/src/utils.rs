@@ -201,6 +201,12 @@ pub(crate) fn digested_pullspec(image: &str, digest: &str) -> String {
     format!("{image}@{digest}")
 }
 
+/// Returns true if the system is currently booted in UEFI mode.
+/// This is detected by checking for the existence of /sys/firmware/efi/efivars.
+pub fn is_efi_booted() -> bool {
+    std::path::Path::new(crate::install::EFIVARFS).exists()
+}
+
 #[derive(Debug)]
 pub enum EfiError {
     SystemNotUEFI,
