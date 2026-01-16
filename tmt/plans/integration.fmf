@@ -162,10 +162,6 @@ execute:
 
 /plan-33-multi-device-esp:
   summary: Test multi-device ESP detection for to-existing-root
-  provision:
-    hardware:
-      boot:
-        method: uefi
   discover:
     how: fmf
     test:
