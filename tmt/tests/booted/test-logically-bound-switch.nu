@@ -15,16 +15,12 @@
 
 use std assert
 use tap.nu
+use bootc_testlib.nu [get_cstor_auth]
 
 # This code runs on *each* boot.
 bootc status
 let st = bootc status --json | from json
 let booted = $st.status.booted.image
-
-# The tests here aren't fetching from a registry which requires auth by default,
-# but we can replicate the failure in https://github.com/bootc-dev/bootc/pull/1852
-# by just injecting any auth file.
-echo '{}' | save -f /run/ostree/auth.json
 
 def initial_setup [] {
     bootc image copy-to-storage
@@ -32,7 +28,8 @@ def initial_setup [] {
     podman image inspect localhost/bootc | from json
 }
 
-def build_image [name images containers] {
+# Build an image with optional auth.json baked in
+def build_image [name images containers --with-auth] {
     let td = mktemp -d
     cd $td
     mkdir usr/share/containers/systemd
@@ -59,6 +56,16 @@ RUN echo sanity check > /usr/share/bound-image-sanity-check.txt
         }
     }
 
+    # Optionally bake auth.json into the image
+    if $with_auth {
+        let cstor = get_cstor_auth
+        print "Baking auth.json into the image"
+        mkdir etc/ostree
+        let auth_json = $'{"auths": {"($cstor.registry)": {"auth": "($cstor.auth_b64)"}}}'
+        echo $auth_json | save etc/ostree/auth.json
+        echo "COPY etc/ /etc/\n" | save Dockerfile --append
+    }
+
     # Build it
     podman build -t $name .
     # Just sanity check it
@@ -74,12 +81,13 @@ def verify_images [images containers] {
     let image_names = podman --storage-opt=additionalimagestore=/usr/lib/bootc/storage images --format json | from json | select -i Names
 
     for $image in $bound_images {
-        let found = $image_names | where Names == [$image.image]
+        # Check if the expected image name is IN the Names array (not exact match)
+        let found = $image_names | where { |row| $image.image in $row.Names }
         assert (($found | length) > 0) $"($image.image) not found"
     }
 
     for $container in $bound_containers {
-        let found = $image_names | where Names == [$container.image]
+        let found = $image_names | where { |row| $container.image in $row.Names }
         assert (($found | length) > 0) $"($container.image) not found"
     }
 }
@@ -89,14 +97,14 @@ def first_boot [] {
 
     initial_setup
 
-    # build a bootc image that includes bound images
+    # Build a bootc image that includes bound images
     let images = [
         { "bound": true, "image": "registry.access.redhat.com/ubi9/ubi-minimal:9.4", "name": "ubi-minimal" },
         { "bound": false, "image": "quay.io/centos-bootc/centos-bootc:stream9", "name": "centos-bootc" }
     ]
 
     let containers = [{
-        "bound": true, "image": "docker.io/library/alpine:latest", "name": "alpine" 
+        "bound": true, "image": "docker.io/library/alpine:latest", "name": "alpine"
     }]
 
     let image_name = "localhost/bootc-bound"
@@ -111,18 +119,18 @@ def second_boot [] {
     assert equal $booted.image.transport containers-storage
     assert equal $booted.image.image localhost/bootc-bound
 
-    # verify images are still there after boot
+    # Verify images are still there after boot
     let images = [
         { "bound": true, "image": "registry.access.redhat.com/ubi9/ubi-minimal:9.4", "name": "ubi-minimal" },
         { "bound": false, "image": "quay.io/centos-bootc/centos-bootc:stream9", "name": "centos-bootc" }
     ]
 
     let containers = [{
-        "bound": true, "image": "docker.io/library/alpine:latest", "name": "alpine" 
+        "bound": true, "image": "docker.io/library/alpine:latest", "name": "alpine"
     }]
     verify_images $images $containers
 
-    # build a new bootc image with an additional bound image
+    # Build a new bootc image with an additional bound image
     print "bootc upgrade with another bound image"
     let image_name = "localhost/bootc-bound"
     let more_images = $images | append [{ "bound": true, "image": "registry.access.redhat.com/ubi9/ubi-minimal:9.3", "name": "ubi-minimal-9-3" }]
@@ -144,7 +152,7 @@ def third_boot [] {
     ]
 
     let containers = [{
-        "bound": true, "image": "docker.io/library/alpine:latest", "name": "alpine" 
+        "bound": true, "image": "docker.io/library/alpine:latest", "name": "alpine"
     }]
 
     verify_images $images $containers
