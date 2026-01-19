@@ -47,7 +47,7 @@ jobs:
             exit 0
           fi
 
-          START_DATE="2025-08-04" # start of a 3 week sprint
+          START_DATE="2026-01-05" # start of a 3 week sprint
           START_TIMESTAMP=$(date -d "$START_DATE" +%s)
           CURRENT_TIMESTAMP=$(date +%s)
           # Add 12 hour buffer (43200 seconds) to account for scheduling delays
