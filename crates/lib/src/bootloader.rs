@@ -25,8 +25,8 @@ const BOOTUPD_UPDATES: &str = "usr/lib/bootupd/updates";
 const SYSTEMD_KEY_DIR: &str = "loader/keys";
 
 #[allow(dead_code)]
-pub(crate) fn esp_in(device: &PartitionTable) -> Result<&Partition> {
-    device
+pub(crate) fn esp_in(partition_table: &PartitionTable) -> Result<&Partition> {
+    partition_table
         .find_partition_of_type(discoverable_partition_specification::ESP)
         .ok_or(anyhow::anyhow!("ESP not found in partition table"))
 }
@@ -82,7 +82,6 @@ pub(crate) fn supports_bootupd(root: &Dir) -> Result<bool> {
 
 #[context("Installing bootloader")]
 pub(crate) fn install_via_bootupd(
-    device: &PartitionTable,
     rootfs: &Utf8Path,
     configopts: &crate::install::InstallConfigOpts,
     deployment_path: Option<&str>,
@@ -97,27 +96,29 @@ pub(crate) fn install_via_bootupd(
     } else {
         vec![]
     };
-    let devpath = device.path();
+
+    // Use --filesystem to let bootupd auto-detect backing devices from the rootfs
     println!("Installing bootloader via bootupd");
     Command::new("bootupctl")
         .args(["backend", "install", "--write-uuid"])
         .args(verbose)
         .args(bootupd_opts.iter().copied().flatten())
-        .args(src_root_arg)
-        .args(["--device", devpath.as_str(), rootfs.as_str()])
+        .args(&src_root_arg)
+        .args(["--filesystem", rootfs.as_str()])
+        .arg(rootfs.as_str())
         .log_debug()
         .run_inherited_with_cmd_context()
 }
 
 #[context("Installing bootloader")]
 pub(crate) fn install_systemd_boot(
-    device: &PartitionTable,
+    partition_table: &PartitionTable,
     _rootfs: &Utf8Path,
     _configopts: &crate::install::InstallConfigOpts,
     _deployment_path: Option<&str>,
     autoenroll: Option<SecurebootKeys>,
 ) -> Result<()> {
-    let esp_part = device
+    let esp_part = partition_table
         .find_partition_of_type(discoverable_partition_specification::ESP)
         .ok_or_else(|| anyhow::anyhow!("ESP partition not found"))?;
 
@@ -161,17 +162,22 @@ pub(crate) fn install_systemd_boot(
 }
 
 #[context("Installing bootloader using zipl")]
-pub(crate) fn install_via_zipl(device: &PartitionTable, boot_uuid: &str) -> Result<()> {
+pub(crate) fn install_via_zipl(partition_table: &PartitionTable, boot_uuid: &str) -> Result<()> {
     // Identify the target boot partition from UUID
     let fs = mount::inspect_filesystem_by_uuid(boot_uuid)?;
     let boot_dir = Utf8Path::new(&fs.target);
     let maj_min = fs.maj_min;
 
     // Ensure that the found partition is a part of the target device
-    let device_path = device.path();
+    let device = &partition_table.device;
+    let device_path = device
+        .path
+        .clone()
+        .ok_or_else(|| anyhow!("device path is missing"))?;
 
-    let partitions = bootc_blockdev::list_dev(device_path)?
+    let partitions = device
         .children
+        .as_ref()
         .with_context(|| format!("no partition found on {device_path}"))?;
     let boot_part = partitions
         .iter()
@@ -229,7 +235,7 @@ pub(crate) fn install_via_zipl(device: &PartitionTable, boot_uuid: &str) -> Resu
         .args(["--image", image.as_str()])
         .args(["--ramdisk", ramdisk.as_str()])
         .args(["--parameters", options])
-        .args(["--targetbase", device_path.as_str()])
+        .args(["--targetbase", &device_path.clone()])
         .args(["--targettype", "SCSI"])
         .args(["--targetblocksize", "512"])
         .args(["--targetoffset", &boot_part_offset.to_string()])

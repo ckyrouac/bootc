@@ -485,10 +485,10 @@ pub(crate) fn install_create_rootfs(
         BlockSetup::Direct => None,
         BlockSetup::Tpm2Luks => Some(luks_name.to_string()),
     };
-    let device_info = bootc_blockdev::partitions_of(&devpath)?;
+    let partition_table = bootc_blockdev::partitions_of(&devpath)?;
     Ok(RootSetup {
         luks_device,
-        device_info,
+        partition_table,
         physical_root_path,
         physical_root,
         target_root_path: None,

@@ -24,8 +24,9 @@ struct DevicesOutput {
     blockdevices: Vec<Device>,
 }
 
+/// Block device info from lsblk, with optional parent/child hierarchy.
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct Device {
     pub name: String,
     pub serial: Option<String>,
@@ -46,6 +47,12 @@ pub struct Device {
     pub fstype: Option<String>,
     pub uuid: Option<String>,
     pub path: Option<String>,
+
+    /// Parent devices in the block device hierarchy (e.g., disk for partition,
+    /// PV for LVM LV). Populated separately via `lsblk --inverse`, not from
+    /// normal lsblk JSON output.
+    #[serde(skip)]
+    pub parents: Option<Vec<Device>>,
 }
 
 impl Device {
@@ -58,6 +65,21 @@ impl Device {
     #[allow(dead_code)]
     pub fn has_children(&self) -> bool {
         self.children.as_ref().is_some_and(|v| !v.is_empty())
+    }
+
+    /// Get all backing physical devices by walking up the parent hierarchy.
+    /// Returns devices that have no further parents (physical disks, mpath endpoints).
+    pub fn backing_devices(&self) -> Vec<&Device> {
+        let Some(parents) = &self.parents else {
+            // Parents not populated - shouldn't happen if Device came from list_dev()
+            return vec![self];
+        };
+        if parents.is_empty() {
+            // No parents means this is a leaf device (physical disk, mpath endpoint)
+            return vec![self];
+        }
+        // Recursively collect leaf devices from parent hierarchy
+        parents.iter().flat_map(|p| p.backing_devices()).collect()
     }
 
     // The "start" parameter was only added in a version of util-linux that's only
@@ -94,8 +116,14 @@ impl Device {
     }
 }
 
+/// List device with children and parent hierarchy populated.
+///
+/// This calls `lsblk` twice: once normally to get children (partitions),
+/// and once with `--inverse` to get parent devices (e.g., disk for partition,
+/// PVs for LVM LV). The parent hierarchy is stored in the `parents` field.
 #[context("Listing device {dev}")]
 pub fn list_dev(dev: &Utf8Path) -> Result<Device> {
+    // Get device with children (normal lsblk)
     let mut devs: DevicesOutput = Command::new("lsblk")
         .args(["-J", "-b", "-O"])
         .arg(dev)
@@ -104,10 +132,33 @@ pub fn list_dev(dev: &Utf8Path) -> Result<Device> {
     for dev in devs.blockdevices.iter_mut() {
         dev.backfill_missing()?;
     }
-    devs.blockdevices
+    let mut device = devs
+        .blockdevices
         .into_iter()
         .next()
-        .ok_or_else(|| anyhow!("no device output from lsblk for {dev}"))
+        .ok_or_else(|| anyhow!("no device output from lsblk for {dev}"))?;
+
+    // Get parent hierarchy (lsblk --inverse)
+    // The inverse output has the device as root with parents in "children" field
+    let mut inverse: DevicesOutput = Command::new("lsblk")
+        .args(["-J", "-b", "-O", "--inverse"])
+        .arg(dev)
+        .log_debug()
+        .run_and_parse_json()?;
+
+    // The inverse output uses "children" to represent parents in the hierarchy.
+    // We take the first device's children as our parents.
+    if let Some(inv_dev) = inverse.blockdevices.first_mut() {
+        // Backfill any missing properties in parent devices
+        for parent in inv_dev.children.iter_mut().flatten() {
+            parent.backfill_missing()?;
+        }
+        device.parents = inv_dev.children.take();
+    } else {
+        device.parents = Some(vec![]);
+    }
+
+    Ok(device)
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,6 +166,7 @@ struct SfDiskOutput {
     partitiontable: PartitionTable,
 }
 
+/// Partition entry from sfdisk JSON output.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct Partition {
@@ -136,18 +188,25 @@ pub enum PartitionType {
     Unknown(String),
 }
 
+/// Partition table from sfdisk, enriched with lsblk device info.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct PartitionTable {
     pub label: PartitionType,
     pub id: String,
-    pub device: String,
+    /// Device path string from sfdisk output (e.g., "/dev/vda")
+    #[serde(rename = "device")]
+    pub device_path: String,
     // We're not using these fields
     // pub unit: String,
     // pub firstlba: u64,
     // pub lastlba: u64,
     // pub sectorsize: u64,
     pub partitions: Vec<Partition>,
+
+    /// Full device information from lsblk, including parent hierarchy.
+    #[serde(skip)]
+    pub device: Device,
 }
 
 impl PartitionTable {
@@ -155,10 +214,6 @@ impl PartitionTable {
     #[allow(dead_code)]
     pub fn find<'a>(&'a self, devname: &str) -> Option<&'a Partition> {
         self.partitions.iter().find(|p| p.node.as_str() == devname)
-    }
-
-    pub fn path(&self) -> &Utf8Path {
-        self.device.as_str().into()
     }
 
     // Find the partition with the given offset (starting at 1)
@@ -218,14 +273,21 @@ impl Partition {
     }
 }
 
+/// List partitions with full device information including parent hierarchy.
+///
+/// This combines `sfdisk` partition table data with `lsblk` device data,
+/// providing a complete view of the device including its parent devices
+/// (useful for multi-device setups like LVM, RAID, mpath).
 #[context("Listing partitions of {dev}")]
 pub fn partitions_of(dev: &Utf8Path) -> Result<PartitionTable> {
-    let o: SfDiskOutput = Command::new("sfdisk")
+    let mut o: SfDiskOutput = Command::new("sfdisk")
         .args(["-J", dev.as_str()])
         .run_and_parse_json()?;
+    o.partitiontable.device = list_dev(dev)?;
     Ok(o.partitiontable)
 }
 
+/// Loopback block device handle; automatically detached on drop.
 pub struct LoopbackDevice {
     pub dev: Option<Utf8PathBuf>,
     // Handle to the cleanup helper process
@@ -685,5 +747,98 @@ mod test {
         let esp1 = table.partitiontable.find_partition_of_esp()?.unwrap();
         assert_eq!(esp1.node, "/dev/mmcblk0p1");
         Ok(())
+    }
+
+    /// Helper to create a minimal Device for testing
+    fn make_device(name: &str) -> Device {
+        Device {
+            name: name.to_string(),
+            serial: None,
+            model: None,
+            partlabel: None,
+            parttype: None,
+            partuuid: None,
+            children: None,
+            size: 0,
+            maj_min: None,
+            start: None,
+            label: None,
+            fstype: None,
+            uuid: None,
+            path: Some(format!("/dev/{}", name)),
+            parents: None,
+        }
+    }
+
+    #[test]
+    fn test_backing_devices_no_parents_fallback() {
+        // A device with parents=None falls back to returning itself
+        let dev = make_device("sda");
+        let backing = dev.backing_devices();
+        assert_eq!(backing.len(), 1);
+        assert_eq!(backing[0].name, "sda");
+    }
+
+    #[test]
+    fn test_backing_devices_empty_parents() {
+        // A device with empty parents vec is a leaf device (physical disk)
+        let mut dev = make_device("sda");
+        dev.parents = Some(vec![]);
+        let backing = dev.backing_devices();
+        assert_eq!(backing.len(), 1);
+        assert_eq!(backing[0].name, "sda");
+    }
+
+    #[test]
+    fn test_backing_devices_single_parent() {
+        // Partition with single disk parent: sda3 -> sda
+        let mut partition = make_device("sda3");
+        let mut disk = make_device("sda");
+        disk.parents = Some(vec![]); // disk is a leaf device
+        partition.parents = Some(vec![disk]);
+
+        let backing = partition.backing_devices();
+        assert_eq!(backing.len(), 1);
+        assert_eq!(backing[0].name, "sda");
+    }
+
+    #[test]
+    fn test_backing_devices_nested_hierarchy() {
+        // LVM hierarchy: vg-root -> sda2 -> sda
+        let mut lv = make_device("dm-0");
+        let mut pv = make_device("sda2");
+        let mut disk = make_device("sda");
+
+        disk.parents = Some(vec![]); // disk is a leaf device
+        pv.parents = Some(vec![disk]);
+        lv.parents = Some(vec![pv]);
+
+        let backing = lv.backing_devices();
+        assert_eq!(backing.len(), 1);
+        assert_eq!(backing[0].name, "sda");
+    }
+
+    #[test]
+    fn test_backing_devices_multi_device() {
+        // LVM across two disks: vg-root -> [sda2 -> sda, sdb2 -> sdb]
+        let mut lv = make_device("dm-0");
+
+        let mut pv1 = make_device("sda2");
+        let mut disk1 = make_device("sda");
+        disk1.parents = Some(vec![]); // disk is a leaf device
+        pv1.parents = Some(vec![disk1]);
+
+        let mut pv2 = make_device("sdb2");
+        let mut disk2 = make_device("sdb");
+        disk2.parents = Some(vec![]); // disk is a leaf device
+        pv2.parents = Some(vec![disk2]);
+
+        lv.parents = Some(vec![pv1, pv2]);
+
+        let backing = lv.backing_devices();
+        assert_eq!(backing.len(), 2);
+        let names: Vec<_> = backing.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"sda"));
+        assert!(names.contains(&"sdb"));
     }
 }

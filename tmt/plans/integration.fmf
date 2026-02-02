@@ -173,4 +173,40 @@ execute:
     how: fmf
     test:
       - /tmt/tests/tests/test-34-user-agent
+
+/plan-35-multi-device-esp:
+  summary: Test multi-device ESP detection for to-existing-root
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/test-32-multi-device-esp
+  # To test with a local bootupd binary:
+  # 1. Copy the binary: cp /path/to/bootupd tmt/tests/booted/local-bootupd
+  # 2. Run: tmt run -e USE_LOCAL_BOOTUPD=1 plan -n multi-device-esp
+  prepare+:
+    - how: shell
+      order: 95
+      script:
+        - |
+          echo "=== Local bootupd prepare step ==="
+          echo "USE_LOCAL_BOOTUPD=${USE_LOCAL_BOOTUPD:-<not set>}"
+          echo "TMT_TREE=${TMT_TREE:-<not set>}"
+          LOCAL_BINARY="${TMT_TREE}/tmt/tests/booted/local-bootupd"
+          echo "Looking for local binary at: ${LOCAL_BINARY}"
+          if [ -f "${LOCAL_BINARY}" ]; then
+            echo "Local binary EXISTS"
+            ls -la "${LOCAL_BINARY}"
+          else
+            echo "Local binary NOT FOUND"
+          fi
+          if [ "${USE_LOCAL_BOOTUPD:-}" = "1" ] && [ -f "${LOCAL_BINARY}" ]; then
+            echo "Installing local bootupd to /var/tmp/local-bootupd"
+            cp "${LOCAL_BINARY}" /var/tmp/local-bootupd
+            chmod +x /var/tmp/local-bootupd
+            echo "Installed bootupd version:"
+            /var/tmp/local-bootupd --help | head -1 || true
+          else
+            echo "Using system bootupd (USE_LOCAL_BOOTUPD not set or local-bootupd not found)"
+          fi
+          echo "=== End prepare step ==="
 # END GENERATED PLANS
