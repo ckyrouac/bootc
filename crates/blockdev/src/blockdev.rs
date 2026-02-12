@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
+use cap_std_ext::cap_std::fs::Dir;
 use fn_error_context::context;
 use regex::Regex;
 use serde::Deserialize;
@@ -25,7 +26,7 @@ struct DevicesOutput {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Device {
     pub name: String,
     pub serial: Option<String>,
@@ -60,6 +61,22 @@ impl Device {
     #[allow(dead_code)]
     pub fn has_children(&self) -> bool {
         self.children.as_ref().is_some_and(|v| !v.is_empty())
+    }
+
+    /// Find a child partition by partition type GUID (case-insensitive).
+    pub fn find_partition_of_type(&self, uuid: &str) -> Option<&Device> {
+        self.children.as_ref()?.iter().find(|child| {
+            child
+                .parttype
+                .as_ref()
+                .is_some_and(|pt| pt.eq_ignore_ascii_case(uuid))
+        })
+    }
+
+    /// Find the EFI System Partition (ESP) among children.
+    pub fn find_partition_of_esp(&self) -> Result<&Device> {
+        self.find_partition_of_type(ESP)
+            .ok_or(anyhow::anyhow!("ESP not found in partition table"))
     }
 
     // The "start" parameter was only added in a version of util-linux that's only
@@ -116,6 +133,67 @@ impl Device {
         }
         Ok(())
     }
+
+    /// Query parent devices via `lsblk --inverse`.
+    ///
+    /// Returns `Ok(None)` if this device is already a root device (no parents).
+    /// In the returned `Vec<Device>`, each device's `children` field contains
+    /// *its own* parents (grandparents, etc.), forming the full chain to the
+    /// root device(s). A device can have multiple parents (e.g. RAID, LVM).
+    pub fn list_parents(&self) -> Result<Option<Vec<Device>>> {
+        let path = self.path();
+        let output: DevicesOutput = Command::new("lsblk")
+            .args(["-J", "-b", "-O", "--inverse"])
+            .arg(&path)
+            .log_debug()
+            .run_and_parse_json()?;
+
+        let device = output
+            .blockdevices
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no device output from lsblk --inverse for {path}"))?;
+
+        match device.children {
+            Some(mut children) if !children.is_empty() => {
+                for child in &mut children {
+                    child.backfill_missing()?;
+                }
+                Ok(Some(children))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Walk the parent chain to find the root (whole disk) device.
+    ///
+    /// Returns the root device with its children (partitions) populated.
+    /// If this device is already a root device, returns a clone of `self`.
+    /// Fails if the device has multiple parents at any level.
+    pub fn root_disk(&self) -> Result<Device> {
+        let Some(parents) = self.list_parents()? else {
+            // Already a root device; re-query to ensure children are populated
+            return list_dev(Utf8Path::new(&self.path()));
+        };
+        let mut current = parents;
+        loop {
+            anyhow::ensure!(
+                current.len() == 1,
+                "Device {} has multiple parents; cannot determine root disk",
+                self.path()
+            );
+            let mut parent = current.into_iter().next().unwrap();
+            match parent.children.take() {
+                Some(grandparents) if !grandparents.is_empty() => {
+                    current = grandparents;
+                }
+                _ => {
+                    // Found the root; re-query to populate its actual children
+                    return list_dev(Utf8Path::new(&parent.path()));
+                }
+            }
+        }
+    }
 }
 
 #[context("Listing device {dev}")]
@@ -132,6 +210,12 @@ pub fn list_dev(dev: &Utf8Path) -> Result<Device> {
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("no device output from lsblk for {dev}"))
+}
+
+/// List the device containing the filesystem mounted at the given directory.
+pub fn list_dev_by_dir(dir: &Dir) -> Result<Device> {
+    let fsinfo = bootc_mount::inspect_filesystem_of_dir(dir)?;
+    list_dev(&Utf8PathBuf::from(&fsinfo.source))
 }
 
 #[derive(Debug, Deserialize)]
