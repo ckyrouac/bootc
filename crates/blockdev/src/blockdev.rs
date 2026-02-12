@@ -33,6 +33,8 @@ pub struct Device {
     pub partlabel: Option<String>,
     pub parttype: Option<String>,
     pub partuuid: Option<String>,
+    /// Partition number (1-indexed). None for whole disk devices.
+    pub partn: Option<u32>,
     pub children: Option<Vec<Device>>,
     pub size: u64,
     #[serde(rename = "maj:min")]
@@ -82,10 +84,32 @@ impl Device {
         Ok(())
     }
 
+    // The "partn" column was added in util-linux 2.39, which is newer than
+    // what CentOS 9 / RHEL 9 ship (2.37).
+    fn backfill_partn(&mut self) -> Result<()> {
+        let Some(majmin) = self.maj_min.as_deref() else {
+            return Ok(());
+        };
+        let sysfs_partn_path = format!("/sys/dev/block/{majmin}/partition");
+        if Utf8Path::new(&sysfs_partn_path).try_exists()? {
+            let partn = std::fs::read_to_string(&sysfs_partn_path)
+                .with_context(|| format!("Reading {sysfs_partn_path}"))?;
+            tracing::debug!("backfilled partn to {partn}");
+            self.partn = Some(
+                partn
+                    .trim()
+                    .parse()
+                    .context("Parsing sysfs partition property")?,
+            );
+        }
+        Ok(())
+    }
+
     /// Older versions of util-linux may be missing some properties. Backfill them if they're missing.
     pub fn backfill_missing(&mut self) -> Result<()> {
         // Add new properties to backfill here
         self.backfill_start()?;
+        self.backfill_partn()?;
         // And recurse to child devices
         for child in self.children.iter_mut().flatten() {
             child.backfill_missing()?;
