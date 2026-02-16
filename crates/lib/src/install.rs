@@ -2523,51 +2523,16 @@ pub(crate) async fn install_to_filesystem(
     let backing_devices = device_info.find_all_roots()?;
     tracing::debug!("Backing devices: {backing_devices:?}");
 
-    //
-    // // Determine the device and partition info to use for bootloader installation.
-    // // If there are multiple backing devices, we search for all that contain an ESP.
-    // let device_info: Vec<bootc_blockdev::PartitionTable> = if backing_devices.len() == 1 {
-    //     // Single backing device - use it directly
-    //     let dev = &backing_devices[0];
-    //     vec![bootc_blockdev::partitions_of(Utf8Path::new(dev))?]
-    // } else {
-    //     // Multiple backing devices - find all with ESP
-    //     let mut esp_devices = Vec::new();
-    //     for dev in &backing_devices {
-    //         match bootc_blockdev::partitions_of(Utf8Path::new(dev)) {
-    //             Ok(table) => {
-    //                 match table.find_partition_of_esp() {
-    //                     Ok(Some(_)) => {
-    //                         tracing::info!("Found ESP on device {dev}");
-    //                         esp_devices.push(table);
-    //                     }
-    //                     Ok(None) => (),
-    //                     Err(e) => {
-    //                         // Some partition table types may not be supported for ESP detection.
-    //                         // Log and continue checking other devices.
-    //                         tracing::debug!("Could not check for ESP on {dev}: {e}");
-    //                     }
-    //                 }
-    //             }
-    //             Err(e) => {
-    //                 // Some backing devices may not have partition tables (e.g., raw LVM PVs
-    //                 // or whole-disk filesystems). These can't have an ESP, so skip them.
-    //                 tracing::debug!("Failed to read partition table from {dev}: {e}");
-    //             }
-    //         }
-    //     }
-    //     if esp_devices.is_empty() {
-    //         // No ESP found on any backing device. This is not fatal because:
-    //         // - BIOS boot uses MBR, not ESP
-    //         // - bootupd may auto-detect ESP via mounted /boot/efi
-    //         // However, UEFI boot without a detectable ESP will fail.
-    //         tracing::warn!(
-    //             "No ESP found on any backing device ({:?}); UEFI boot may fail",
-    //             backing_devices
-    //         );
-    //     }
-    //     esp_devices
-    // };
+    for dev in &backing_devices {
+        match dev.find_partition_of_esp() {
+            Ok(esp) => {
+                tracing::debug!("Found ESP on {}: {}", dev.path(), esp.path());
+            }
+            Err(e) => {
+                tracing::debug!("No ESP found on {}: {e}", dev.path());
+            }
+        }
+    }
 
     let rootarg = format!("root={}", root_info.mount_spec);
     // CLI takes precedence over config file.
