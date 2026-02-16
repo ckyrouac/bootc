@@ -2519,32 +2519,10 @@ pub(crate) async fn install_to_filesystem(
         tracing::debug!("Backing device: {}", dev.path());
         dev
     };
-    // // Walk up the block device hierarchy to find physical backing device(s).
-    // // Examples:
-    // //   /dev/sda3 -> /dev/sda (single disk)
-    // //   /dev/mapper/vg-lv -> /dev/sda2, /dev/sdb2 (LVM across two disks)
-    // let backing_devices: Vec<String> = {
-    //     let mut dev = inspect.source;
-    //     loop {
-    //         tracing::debug!("Finding parents for {dev}");
-    //         let parents = bootc_blockdev::find_parent_devices(&dev)?;
-    //         if parents.is_empty() {
-    //             // Reached a physical disk
-    //             break vec![dev];
-    //         }
-    //         if parents.len() > 1 {
-    //             // Multi-device (e.g., LVM across disks) - return all
-    //             tracing::debug!(
-    //                 "Found multiple parent devices: {:?}; will search for ESP",
-    //                 parents
-    //             );
-    //             break parents;
-    //         }
-    //         // Single parent (e.g. LVM LV -> VG -> PV) - keep walking up
-    //         dev = parents.into_iter().next().unwrap();
-    //     }
-    // };
-    // tracing::debug!("Backing devices: {backing_devices:?}");
+
+    let backing_devices = device_info.find_all_roots()?;
+    tracing::debug!("Backing devices: {backing_devices:?}");
+
     //
     // // Determine the device and partition info to use for bootloader installation.
     // // If there are multiple backing devices, we search for all that contain an ESP.

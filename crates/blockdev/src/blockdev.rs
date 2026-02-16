@@ -232,6 +232,34 @@ impl Device {
             }
         }
     }
+
+    /// Walk the parent chain to find all root (whole disk) devices.
+    ///
+    /// Returns all root devices with their children (partitions) populated.
+    /// Unlike [`find_single_root`], this handles devices backed by multiple
+    /// parents (e.g. RAID arrays) by following all branches of the parent tree.
+    /// If this device is already a root device, returns a single-element list.
+    pub fn find_all_roots(&self) -> Result<Vec<Device>> {
+        let Some(parents) = self.list_parents()? else {
+            // Already a root device; re-query to ensure children are populated
+            return Ok(vec![list_dev(Utf8Path::new(&self.path()))?]);
+        };
+
+        let mut roots = Vec::new();
+        let mut queue = parents;
+        while let Some(mut device) = queue.pop() {
+            match device.children.take() {
+                Some(grandparents) if !grandparents.is_empty() => {
+                    queue.extend(grandparents);
+                }
+                _ => {
+                    // Found a root; re-query to populate its actual children
+                    roots.push(list_dev(Utf8Path::new(&device.path()))?);
+                }
+            }
+        }
+        Ok(roots)
+    }
 }
 
 #[context("Listing device {dev}")]
