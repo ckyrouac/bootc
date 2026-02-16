@@ -545,7 +545,8 @@ pub(crate) fn setup_composefs_bls_boot(
             cmdline.add_or_modify(&param);
 
             // Locate ESP partition device
-            let root_dev = bootc_blockdev::list_dev_by_dir(&storage.physical_root)?.root_disk()?;
+            let root_dev =
+                bootc_blockdev::list_dev_by_dir(&storage.physical_root)?.find_single_root()?;
             let esp_dev = root_dev.find_partition_of_esp()?;
 
             (
@@ -1083,7 +1084,8 @@ pub(crate) fn setup_composefs_uki_boot(
             let bootloader = host.require_composefs_booted()?.bootloader.clone();
 
             // Locate ESP partition device
-            let root_dev = bootc_blockdev::list_dev_by_dir(&storage.physical_root)?.root_disk()?;
+            let root_dev =
+                bootc_blockdev::list_dev_by_dir(&storage.physical_root)?.find_single_root()?;
             let esp_dev = root_dev.find_partition_of_esp()?;
 
             (
@@ -1255,8 +1257,7 @@ pub(crate) async fn setup_composefs_boot(
 
     if cfg!(target_arch = "s390x") {
         // TODO: Integrate s390x support into install_via_bootupd
-        // zipl only supports single device
-        crate::bootloader::install_via_zipl(root_setup.device_info.first(), boot_uuid)?;
+        crate::bootloader::install_via_zipl(&root_setup.device_info, boot_uuid)?;
     } else if postfetch.detected_bootloader == Bootloader::Grub {
         crate::bootloader::install_via_bootupd(
             &root_setup.device_info,
@@ -1265,9 +1266,8 @@ pub(crate) async fn setup_composefs_boot(
             None,
         )?;
     } else {
-        // systemd-boot only supports a single ESP
         crate::bootloader::install_systemd_boot(
-            root_setup.device_info.first(),
+            &root_setup.device_info,
             &root_setup.physical_root_path,
             &state.config_opts,
             None,

@@ -45,7 +45,7 @@ pub(crate) fn mount_esp_part(root: &Dir, root_path: &Utf8Path, is_ostree: bool) 
         root
     };
 
-    let dev = bootc_blockdev::list_dev_by_dir(physical_root)?.root_disk()?;
+    let dev = bootc_blockdev::list_dev_by_dir(physical_root)?.find_single_root()?;
     if let Some(esp_dev) = dev.find_partition_of_type(bootc_blockdev::ESP) {
         let esp_path = esp_dev.path();
         bootc_mount::mount(&esp_path, &root_path.join(&efi_path))?;
@@ -198,14 +198,6 @@ pub(crate) fn install_systemd_boot(
     _deployment_path: Option<&str>,
     autoenroll: Option<SecurebootKeys>,
 ) -> Result<()> {
-    // systemd-boot requires the backing device to locate the ESP partition
-    let device = device.ok_or_else(|| {
-        anyhow!(
-            "Cannot install systemd-boot: no single backing device found \
-             (root may span multiple devices such as LVM across multiple disks)"
-        )
-    })?;
-
     let esp_part = device
         .find_partition_of_type(discoverable_partition_specification::ESP)
         .ok_or_else(|| anyhow::anyhow!("ESP partition not found"))?;
@@ -251,14 +243,6 @@ pub(crate) fn install_systemd_boot(
 
 #[context("Installing bootloader using zipl")]
 pub(crate) fn install_via_zipl(device: &bootc_blockdev::Device, boot_uuid: &str) -> Result<()> {
-    // zipl requires the backing device information to install the bootloader
-    let device = device.ok_or_else(|| {
-        anyhow!(
-            "Cannot install zipl bootloader: no single backing device found \
-             (root may span multiple devices such as LVM across multiple disks)"
-        )
-    })?;
-
     // Identify the target boot partition from UUID
     let fs = mount::inspect_filesystem_by_uuid(boot_uuid)?;
     let boot_dir = Utf8Path::new(&fs.target);

@@ -208,7 +208,7 @@ impl Device {
     /// Returns the root device with its children (partitions) populated.
     /// If this device is already a root device, returns a clone of `self`.
     /// Fails if the device has multiple parents at any level.
-    pub fn root_disk(&self) -> Result<Device> {
+    pub fn find_single_root(&self) -> Result<Device> {
         let Some(parents) = self.list_parents()? else {
             // Already a root device; re-query to ensure children are populated
             return list_dev(Utf8Path::new(&self.path()));
