@@ -69,6 +69,77 @@ impl Device {
         self.children.as_ref().is_some_and(|v| !v.is_empty())
     }
 
+    // Check if the device is mpath
+    pub fn is_mpath(&self) -> Result<bool> {
+        let dm_path = Utf8PathBuf::from_path_buf(std::fs::canonicalize(self.path())?)
+            .map_err(|_| anyhow::anyhow!("Non-UTF8 path"))?;
+        let dm_name = dm_path.file_name().unwrap_or("");
+        let uuid_path = Utf8PathBuf::from(format!("/sys/class/block/{dm_name}/dm/uuid"));
+
+        if uuid_path.exists() {
+            let uuid = std::fs::read_to_string(&uuid_path)
+                .with_context(|| format!("Failed to read {uuid_path}"))?;
+            if uuid.trim_start().starts_with("mpath-") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Get esp partition number from device
+    /// TODO: examine this more closely
+    ///       why is this needed? Why the mpath special handling? Why the complicated path construction?
+    pub fn get_esp_partition_number(&self) -> Result<String> {
+        let esp_device = self.find_partition_of_esp()?;
+        let devname = &esp_device.name;
+
+        let partition_path = Utf8PathBuf::from(format!("/sys/class/block/{devname}/partition"));
+        if partition_path.exists() {
+            return std::fs::read_to_string(&partition_path)
+                .with_context(|| format!("Failed to read {partition_path}"));
+        }
+
+        // On multipath the partition attribute is not existing
+        if self.is_mpath()? {
+            if let Some(partn) = esp_device.partn {
+                return Ok(partn.to_string());
+            }
+        }
+        anyhow::bail!("Not supported for {devname}")
+    }
+    //
+    // /// Find bios_boot partition on the same device
+    // #[cfg(any(target_arch = "x86_64", target_arch = "powerpc64"))]
+    // pub fn get_bios_boot_partition(device: &str) -> Result<Option<String>> {
+    //     const BIOS_BOOT_TYPE_GUID: &str = "21686148-6449-6E6F-744E-656564454649";
+    //     let device_info = bootc_internal_blockdev::list_dev(Utf8Path::new(device))?;
+    //     let bios_boot = device_info
+    //         .partitions
+    //         .into_iter()
+    //         .find(|p| p.parttype.as_str() == BIOS_BOOT_TYPE_GUID);
+    //     if let Some(bios_boot) = bios_boot {
+    //         return Ok(Some(bios_boot.node));
+    //     }
+    //     Ok(None)
+    // }
+    //
+    // /// Find all bios_boot partitions on the devices
+    // #[cfg(any(target_arch = "x86_64", target_arch = "powerpc64"))]
+    // pub fn find_colocated_bios_boot(devices: &Vec<String>) -> Result<Option<Vec<String>>> {
+    //     // look for all bios_boot parts on those devices
+    //     let mut bios_boots = Vec::new();
+    //     for device in devices {
+    //         if let Some(bios) = get_bios_boot_partition(&device)? {
+    //             bios_boots.push(bios)
+    //         }
+    //     }
+    //     if bios_boots.is_empty() {
+    //         return Ok(None);
+    //     }
+    //     log::debug!("Found bios_boot partitions: {bios_boots:?}");
+    //     Ok(Some(bios_boots))
+    // }
+
     /// Find a child partition by partition type (case-insensitive).
     pub fn find_partition_of_type(&self, parttype: &str) -> Option<&Device> {
         self.children.as_ref()?.iter().find(|child| {
