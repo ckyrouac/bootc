@@ -19,6 +19,9 @@ pub const ESP_ID_MBR: &[u8] = &[0x06, 0xEF];
 /// EFI System Partition (ESP) for UEFI boot on GPT
 pub const ESP: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
 
+/// BIOS boot partition type GUID for GPT
+pub const BIOS_BOOT: &str = "21686148-6449-6e6f-744e-656564454649";
+
 #[derive(Debug, Deserialize)]
 struct DevicesOutput {
     blockdevices: Vec<Device>,
@@ -107,54 +110,45 @@ impl Device {
         }
         anyhow::bail!("Not supported for {devname}")
     }
-    //
-    // /// Find bios_boot partition on the same device
-    // #[cfg(any(target_arch = "x86_64", target_arch = "powerpc64"))]
-    // pub fn get_bios_boot_partition(device: &str) -> Result<Option<String>> {
-    //     const BIOS_BOOT_TYPE_GUID: &str = "21686148-6449-6E6F-744E-656564454649";
-    //     let device_info = bootc_internal_blockdev::list_dev(Utf8Path::new(device))?;
-    //     let bios_boot = device_info
-    //         .partitions
-    //         .into_iter()
-    //         .find(|p| p.parttype.as_str() == BIOS_BOOT_TYPE_GUID);
-    //     if let Some(bios_boot) = bios_boot {
-    //         return Ok(Some(bios_boot.node));
-    //     }
-    //     Ok(None)
-    // }
-    //
-    // /// Find all bios_boot partitions on the devices
-    // #[cfg(any(target_arch = "x86_64", target_arch = "powerpc64"))]
-    // pub fn find_colocated_bios_boot(devices: &Vec<String>) -> Result<Option<Vec<String>>> {
-    //     // look for all bios_boot parts on those devices
-    //     let mut bios_boots = Vec::new();
-    //     for device in devices {
-    //         if let Some(bios) = get_bios_boot_partition(&device)? {
-    //             bios_boots.push(bios)
-    //         }
-    //     }
-    //     if bios_boots.is_empty() {
-    //         return Ok(None);
-    //     }
-    //     log::debug!("Found bios_boot partitions: {bios_boots:?}");
-    //     Ok(Some(bios_boots))
-    // }
-    // Find all ESP partitions on the devices
-    // TODO: the bootc_internal_blockdev crate can be used to do this
-    // pub fn find_colocated_esps(devices: &Vec<String>) -> Result<Option<Vec<String>>> {
-    //     // look for all ESPs on those devices
-    //     let mut esps = Vec::new();
-    //     for device in devices {
-    //         if let Some(esp) = get_esp_partition(&device)? {
-    //             esps.push(esp)
-    //         }
-    //     }
-    //     if esps.is_empty() {
-    //         return Ok(None);
-    //     }
-    //     log::debug!("Found esp partitions: {esps:?}");
-    //     Ok(Some(esps))
-    // }
+
+    /// Find BIOS boot partition among children.
+    pub fn find_partition_of_bios_boot(&self) -> Option<&Device> {
+        self.find_partition_of_type(BIOS_BOOT)
+    }
+
+    /// Find all ESP partitions across all root devices backing this device.
+    /// Calls find_all_roots() to discover physical disks, then searches each for an ESP.
+    /// Returns None if no ESPs are found.
+    pub fn find_colocated_esps(&self) -> Result<Option<Vec<Device>>> {
+        let roots = self.find_all_roots()?;
+        let mut esps = Vec::new();
+        for root in &roots {
+            if let Ok(esp) = root.find_partition_of_esp() {
+                esps.push(esp.clone());
+            }
+        }
+        if esps.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(esps))
+    }
+
+    /// Find all BIOS boot partitions across all root devices backing this device.
+    /// Calls find_all_roots() to discover physical disks, then searches each for a BIOS boot partition.
+    /// Returns None if no BIOS boot partitions are found.
+    pub fn find_colocated_bios_boot(&self) -> Result<Option<Vec<Device>>> {
+        let roots = self.find_all_roots()?;
+        let mut bios_boots = Vec::new();
+        for root in &roots {
+            if let Some(bios) = root.find_partition_of_bios_boot() {
+                bios_boots.push(bios.clone());
+            }
+        }
+        if bios_boots.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(bios_boots))
+    }
 
     /// Find a child partition by partition type (case-insensitive).
     pub fn find_partition_of_type(&self, parttype: &str) -> Option<&Device> {
@@ -621,6 +615,10 @@ mod test {
         // Verify find_partition_of_esp works
         let esp = dev.find_partition_of_esp().unwrap();
         assert_eq!(esp.partn, Some(2));
+        // Verify find_partition_of_bios_boot works (vda1 is BIOS-BOOT)
+        let bios = dev.find_partition_of_bios_boot().unwrap();
+        assert_eq!(bios.partn, Some(1));
+        assert_eq!(bios.parttype.as_deref().unwrap(), BIOS_BOOT);
     }
 
     #[test]
