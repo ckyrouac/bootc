@@ -343,6 +343,13 @@ impl Device {
     }
 }
 
+/// Get the paths of all backing root devices for the filesystem at the given path.
+pub fn get_backing_device_paths(fs_path: &Utf8Path) -> Result<Vec<String>> {
+    let device = list_dev(fs_path)?;
+    let roots = device.find_all_roots()?;
+    Ok(roots.iter().map(|d| d.path()).collect())
+}
+
 #[context("Listing device {dev}")]
 pub fn list_dev(dev: &Utf8Path) -> Result<Device> {
     let mut devs: DevicesOutput = Command::new("lsblk")
