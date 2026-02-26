@@ -139,6 +139,22 @@ impl Device {
     //     log::debug!("Found bios_boot partitions: {bios_boots:?}");
     //     Ok(Some(bios_boots))
     // }
+    // Find all ESP partitions on the devices
+    // TODO: the bootc_internal_blockdev crate can be used to do this
+    // pub fn find_colocated_esps(devices: &Vec<String>) -> Result<Option<Vec<String>>> {
+    //     // look for all ESPs on those devices
+    //     let mut esps = Vec::new();
+    //     for device in devices {
+    //         if let Some(esp) = get_esp_partition(&device)? {
+    //             esps.push(esp)
+    //         }
+    //     }
+    //     if esps.is_empty() {
+    //         return Ok(None);
+    //     }
+    //     log::debug!("Found esp partitions: {esps:?}");
+    //     Ok(Some(esps))
+    // }
 
     /// Find a child partition by partition type (case-insensitive).
     pub fn find_partition_of_type(&self, parttype: &str) -> Option<&Device> {
@@ -307,7 +323,7 @@ impl Device {
     /// Walk the parent chain to find all root (whole disk) devices.
     ///
     /// Returns all root devices with their children (partitions) populated.
-    /// Unlike [`find_single_root`], this handles devices backed by multiple
+    /// Unlike find_single_root, this handles devices backed by multiple
     /// parents (e.g. RAID arrays) by following all branches of the parent tree.
     /// If this device is already a root device, returns a single-element list.
     pub fn find_all_roots(&self) -> Result<Vec<Device>> {
