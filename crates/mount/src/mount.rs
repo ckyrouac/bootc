@@ -93,6 +93,13 @@ pub fn inspect_filesystem_of_dir(d: &Dir) -> Result<Filesystem> {
     findmnt_filesystem(&["--mountpoint"], Some(d), ".")
 }
 
+#[context("Inspecting filesystem containing {path}")]
+/// Inspect the filesystem that contains the given path.
+/// Unlike inspect_filesystem, this does not require the path to be a mount root.
+pub fn inspect_filesystem_by_target(path: &Utf8Path) -> Result<Filesystem> {
+    findmnt_filesystem(&["--target"], None, path.as_str())
+}
+
 #[context("Inspecting filesystem by UUID {uuid}")]
 /// Inspect a filesystem by partition UUID
 pub fn inspect_filesystem_by_uuid(uuid: &str) -> Result<Filesystem> {

@@ -126,12 +126,28 @@ pub(crate) fn install_via_bootupd(
         let partition_paths: Vec<String> =
             device.children.iter().flatten().map(|p| p.path()).collect();
 
+        // Discover the device backing /boot so that findmnt can resolve its UUID
+        // inside bwrap. When /boot is on a device-mapper volume (e.g. LVM), the
+        // bwrap container's synthetic /dev won't include those device nodes.
+        let boot_backing_device = {
+            let boot_fs = mount::inspect_filesystem_by_target(&boot_path)
+                .context("Inspecting /boot backing device")?;
+            let canonical = std::fs::canonicalize(&boot_fs.source)
+                .with_context(|| format!("Canonicalizing boot device {}", boot_fs.source))?;
+            canonical
+                .into_os_string()
+                .into_string()
+                .map_err(|p| anyhow!("Non-UTF8 boot device path: {p:?}"))?
+        };
+
         let mut cmd = BwrapCmd::new(&target_root)
             // Bind mount /boot from the physical target root so bootupctl can find
             // the boot partition and install the bootloader there
             .bind(&boot_path, &"/boot")
             // Bind the target block device inside the bwrap container so bootupctl can access it
-            .bind_device(&device_path);
+            .bind_device(&device_path)
+            // Bind the device backing /boot so findmnt can resolve its UUID inside bwrap
+            .bind_device(&boot_backing_device);
 
         // Also bind all partitions of the target block device
         for part_path in &partition_paths {
