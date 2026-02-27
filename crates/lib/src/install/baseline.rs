@@ -480,7 +480,7 @@ pub(crate) fn install_create_rootfs(
     };
     Ok(RootSetup {
         luks_device,
-        device_info: device,
+        backing_devices: vec![device],
         physical_root_path,
         physical_root,
         target_root_path: None,

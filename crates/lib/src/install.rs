@@ -1250,7 +1250,7 @@ pub(crate) fn exec_in_host_mountns(args: &[std::ffi::OsString]) -> Result<()> {
 pub(crate) struct RootSetup {
     #[cfg(feature = "install-to-disk")]
     luks_device: Option<String>,
-    pub(crate) device_info: bootc_blockdev::Device,
+    pub(crate) backing_devices: Vec<bootc_blockdev::Device>,
     /// Absolute path to the location where we've mounted the physical
     /// root filesystem for the system we're installing.
     pub(crate) physical_root_path: Utf8PathBuf,
@@ -1275,6 +1275,65 @@ impl RootSetup {
     /// be returned.
     pub(crate) fn get_boot_uuid(&self) -> Result<Option<&str>> {
         self.boot.as_ref().map(require_boot_uuid).transpose()
+    }
+
+    /// Return a single backing device, or bail if there are multiple.
+    /// Used for bootloaders that only support a single device (e.g. zipl on s390x).
+    pub(crate) fn require_single_device(&self) -> Result<&bootc_blockdev::Device> {
+        match self.backing_devices.as_slice() {
+            [device] => Ok(device),
+            [] => anyhow::bail!("No backing devices found"),
+            _ => anyhow::bail!(
+                "Multiple backing devices found; this bootloader requires a single device"
+            ),
+        }
+    }
+
+    /// Find the best device for bootloader installation.
+    /// Prefers a device with an ESP partition, then one with a BIOS boot partition,
+    /// then falls back to the first device.
+    pub(crate) fn find_bootloader_device(&self) -> &bootc_blockdev::Device {
+        self.backing_devices
+            .iter()
+            .find(|d| d.find_partition_of_esp().is_ok())
+            .or_else(|| {
+                self.backing_devices
+                    .iter()
+                    .find(|d| d.find_partition_of_bios_boot().is_some())
+            })
+            .unwrap_or(&self.backing_devices[0])
+    }
+
+    /// Find the first ESP partition across all backing devices.
+    pub(crate) fn find_esp(&self) -> Result<&bootc_blockdev::Device> {
+        for dev in &self.backing_devices {
+            if let Ok(esp) = dev.find_partition_of_esp() {
+                return Ok(esp);
+            }
+        }
+        anyhow::bail!("No ESP partition found on any backing device")
+    }
+
+    /// Emit warnings for partition table types across all backing devices.
+    pub(crate) fn warn_partition_table_types(&self) {
+        for dev in &self.backing_devices {
+            match dev.pttype.as_deref() {
+                Some("dos") => crate::utils::medium_visibility_warning(&format!(
+                    "Device {} has `dos` format partitions; this is not recommended",
+                    dev.path()
+                )),
+                Some("gpt") => {
+                    // The only thing we should be using in general
+                }
+                Some(o) => crate::utils::medium_visibility_warning(&format!(
+                    "Device {} has unknown partition table type {o}",
+                    dev.path()
+                )),
+                None => {
+                    // No partition table type - may be a filesystem install or loop device
+                }
+            }
+        }
     }
 
     // Drop any open file descriptors and return just the mount path and backing luks device, if any
@@ -1796,12 +1855,12 @@ async fn install_with_sysroot(
     if cfg!(target_arch = "s390x") {
         // TODO: Integrate s390x support into install_via_bootupd
         // zipl only supports single device
-        crate::bootloader::install_via_zipl(&rootfs.device_info, boot_uuid)?;
+        crate::bootloader::install_via_zipl(rootfs.require_single_device()?, boot_uuid)?;
     } else {
         match postfetch.detected_bootloader {
             Bootloader::Grub => {
                 crate::bootloader::install_via_bootupd(
-                    &rootfs.device_info,
+                    rootfs.find_bootloader_device(),
                     &rootfs
                         .target_root_path
                         .clone()
@@ -1934,20 +1993,7 @@ async fn install_to_filesystem_impl(
     // Drop exclusive ownership since we're done with mutation
     let rootfs = &*rootfs;
 
-    match rootfs.device_info.pttype.as_deref() {
-        Some("dos") => crate::utils::medium_visibility_warning(
-            "Installing to `dos` format partitions is not recommended",
-        ),
-        Some("gpt") => {
-            // The only thing we should be using in general
-        }
-        Some(o) => {
-            crate::utils::medium_visibility_warning(&format!("Unknown partition table type {o}"))
-        }
-        None => {
-            // No partition table type - may be a filesystem install or loop device
-        }
-    }
+    rootfs.warn_partition_table_types();
 
     if state.composefs_options.composefs_backend {
         // Load a fd for the mounted target physical root
@@ -2512,27 +2558,16 @@ pub(crate) async fn install_to_filesystem(
     };
     tracing::debug!("boot UUID: {boot_uuid:?}");
 
-    // Find the real underlying backing device for the root.  This is currently just required
-    // for GRUB (BIOS) and in the future zipl (I think).
-    let device_info = {
-        let dev = bootc_blockdev::list_dev(Utf8Path::new(&inspect.source))?.find_single_root()?;
-        tracing::debug!("Backing device: {}", dev.path());
-        dev
-    };
-
-    let backing_devices = device_info.find_all_roots()?;
-    tracing::debug!("Backing devices: {backing_devices:?}");
-
-    for dev in &backing_devices {
-        match dev.find_partition_of_esp() {
-            Ok(esp) => {
-                tracing::debug!("Found ESP on {}: {}", dev.path(), esp.path());
-            }
-            Err(e) => {
-                tracing::debug!("No ESP found on {}: {e}", dev.path());
-            }
+    // Find the real underlying backing device(s) for the root.  This is required
+    // for GRUB (BIOS) and zipl.  Multi-device roots (e.g. RAID/LVM) are supported.
+    let backing_devices = {
+        let dev = bootc_blockdev::list_dev(Utf8Path::new(&inspect.source))?;
+        let roots = dev.find_all_roots()?;
+        for d in &roots {
+            tracing::debug!("Backing device: {}", d.path());
         }
-    }
+        roots
+    };
 
     let rootarg = format!("root={}", root_info.mount_spec);
     // CLI takes precedence over config file.
@@ -2592,7 +2627,7 @@ pub(crate) async fn install_to_filesystem(
     let mut rootfs = RootSetup {
         #[cfg(feature = "install-to-disk")]
         luks_device: None,
-        device_info,
+        backing_devices,
         physical_root_path: fsopts.root_path,
         physical_root: rootfs_fd,
         target_root_path: Some(target_root_path.clone()),
