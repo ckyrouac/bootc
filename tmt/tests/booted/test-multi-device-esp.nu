@@ -116,6 +116,7 @@ def run_install [mountpoint: string] {
         -v /usr/share/empty:/usr/lib/bootc/bound-images.d
         --pid=host
         --security-opt label=type:unconfined_t
+        --env BOOTC_BOOTLOADER_DEBUG=1
         $target_image
         bootc install to-existing-root
             --disable-selinux
