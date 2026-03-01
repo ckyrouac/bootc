@@ -19,6 +19,8 @@ pub struct BwrapCmd<'a> {
     bind_mounts: Vec<(&'a str, &'a str)>,
     /// Device nodes to bind into the container
     devices: Vec<&'a str>,
+    /// Symlinks in format (target, link_path)
+    symlinks: Vec<(String, String)>,
     /// Environment variables to set
     env_vars: Vec<(&'a str, &'a str)>,
 }
@@ -32,6 +34,7 @@ impl<'a> BwrapCmd<'a> {
             chroot_path: Cow::Owned(Utf8PathBuf::from(&fd_path)),
             bind_mounts: Vec::new(),
             devices: Vec::new(),
+            symlinks: Vec::new(),
             env_vars: Vec::new(),
         }
     }
@@ -42,6 +45,7 @@ impl<'a> BwrapCmd<'a> {
             chroot_path: Cow::Borrowed(path),
             bind_mounts: Vec::new(),
             devices: Vec::new(),
+            symlinks: Vec::new(),
             env_vars: Vec::new(),
         }
     }
@@ -60,6 +64,12 @@ impl<'a> BwrapCmd<'a> {
     /// Bind a device node into the container.
     pub fn bind_device(mut self, device: &'a str) -> Self {
         self.devices.push(device);
+        self
+    }
+
+    /// Create a symlink inside the container from `link_path` pointing to `target`.
+    pub fn symlink(mut self, target: impl Into<String>, link_path: impl Into<String>) -> Self {
+        self.symlinks.push((target.into(), link_path.into()));
         self
     }
 
@@ -90,6 +100,14 @@ impl<'a> BwrapCmd<'a> {
         // Add device bind mounts
         for device in self.devices {
             cmd.args(["--dev-bind", device, device]);
+        }
+
+        // Add symlinks (create parent directories first)
+        for (target, link_path) in &self.symlinks {
+            if let Some(parent) = Utf8Path::new(link_path).parent() {
+                cmd.args(["--dir", parent.as_str()]);
+            }
+            cmd.args(["--symlink", target, link_path]);
         }
 
         // Add environment variables

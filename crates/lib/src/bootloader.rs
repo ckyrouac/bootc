@@ -129,15 +129,17 @@ pub(crate) fn install_via_bootupd(
         // Discover the device backing /boot so that findmnt can resolve its UUID
         // inside bwrap. When /boot is on a device-mapper volume (e.g. LVM), the
         // bwrap container's synthetic /dev won't include those device nodes.
-        let boot_backing_device = {
+        let (boot_backing_device, boot_source_path) = {
             let boot_fs = mount::inspect_filesystem_by_target(&boot_path)
                 .context("Inspecting /boot backing device")?;
+            let source = boot_fs.source.clone();
             let canonical = std::fs::canonicalize(&boot_fs.source)
                 .with_context(|| format!("Canonicalizing boot device {}", boot_fs.source))?;
-            canonical
+            let canonical = canonical
                 .into_os_string()
                 .into_string()
-                .map_err(|p| anyhow!("Non-UTF8 boot device path: {p:?}"))?
+                .map_err(|p| anyhow!("Non-UTF8 boot device path: {p:?}"))?;
+            (canonical, source)
         };
 
         let mut cmd = BwrapCmd::new(&target_root)
@@ -148,6 +150,13 @@ pub(crate) fn install_via_bootupd(
             .bind_device(&device_path)
             // Bind the device backing /boot so findmnt can resolve its UUID inside bwrap
             .bind_device(&boot_backing_device);
+
+        // If the original mount source is a symlink (e.g. /dev/mapper/VG-LV ->
+        // /dev/dm-0), recreate that symlink inside bwrap so that findmnt can
+        // resolve the UUID via the original path.
+        if boot_source_path != boot_backing_device {
+            cmd = cmd.symlink(&boot_backing_device, &boot_source_path);
+        }
 
         // Also bind all partitions of the target block device
         for part_path in &partition_paths {
