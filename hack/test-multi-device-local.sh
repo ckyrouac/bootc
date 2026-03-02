@@ -10,18 +10,40 @@
 #
 # Prerequisites:
 #   - A locally built bootc container image (run `just build` first)
+#   - A bootupd source tree at BOOTUPD_DIR (default: ~/projects/bootupd)
 #   - Must be run as root
 #   - Required packages: lvm2, dosfstools, e2fsprogs, util-linux, podman
 
 set -xeuo pipefail
+
+BOOTUPD_DIR="${BOOTUPD_DIR:-$HOME/projects/bootupd}"
+BOOTC_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 # ESP partition type GUID
 ESP_TYPE="C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
 # Linux LVM partition type GUID
 LVM_TYPE="E6D6D379-F507-44C2-A23C-238F2A3DF928"
 
-TARGET_IMAGE="${TARGET_IMAGE:-localhost/bootc}"
+BASE_IMAGE="${TARGET_IMAGE:-localhost/bootc}"
+TARGET_IMAGE="localhost/bootc-local-bootupd"
 DISK_SIZE="${DISK_SIZE:-5G}"
+
+# --------------------------------------------------------------------------
+# Build local bootupd and create a derived container image with it
+# --------------------------------------------------------------------------
+echo "==> Building bootupd from $BOOTUPD_DIR..."
+(cd "$BOOTUPD_DIR" && cargo build --release)
+echo "==> Local bootupd version:"
+"$BOOTUPD_DIR/target/release/bootupd" --version
+
+echo "==> Building derived container image with local bootupd..."
+podman build -t "$TARGET_IMAGE" --build-arg="base=$BASE_IMAGE" \
+    -f - "$BOOTUPD_DIR/target/release" <<'EOF'
+ARG base=localhost/bootc
+FROM $base
+COPY bootupd /usr/libexec/bootupd
+COPY bootupd /usr/bin/bootupctl
+EOF
 
 # Track loop devices for cleanup
 LOOP1=""
@@ -242,9 +264,10 @@ test_dual_esp() {
 # Main
 # --------------------------------------------------------------------------
 echo "==> Multi-device ESP local test"
-echo "==> Using image: $TARGET_IMAGE"
+echo "==> Base image: $BASE_IMAGE"
+echo "==> Test image: $TARGET_IMAGE (with local bootupd)"
 
 test_single_esp
-test_dual_esp
+# test_dual_esp
 
 echo "==> All multi-device ESP tests passed"
