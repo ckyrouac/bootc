@@ -16,7 +16,7 @@
 
 set -xeuo pipefail
 
-BOOTUPD_DIR="${BOOTUPD_DIR:-$HOME/projects/bootupd}"
+BOOTUPD_DIR="${BOOTUPD_DIR:-/home/chris/projects/bootupd}"
 BOOTC_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 # ESP partition type GUID
@@ -187,9 +187,6 @@ test_single_esp() {
     mkdir -p "$MOUNTPOINT"
     mount "$lv_path" "$MOUNTPOINT"
 
-    # Create boot directory
-    mkdir -p "${MOUNTPOINT}/boot"
-
     # Show block device hierarchy
     lsblk --pairs --paths --inverse --output NAME,TYPE "$lv_path"
 
@@ -239,9 +236,6 @@ test_dual_esp() {
     mkfs.ext4 -q "$lv_path"
     mkdir -p "$MOUNTPOINT"
     mount "$lv_path" "$MOUNTPOINT"
-
-    # Create boot directory
-    mkdir -p "${MOUNTPOINT}/boot"
 
     # Show block device hierarchy
     lsblk --pairs --paths --inverse --output NAME,TYPE "$lv_path"
