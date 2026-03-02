@@ -1860,7 +1860,7 @@ async fn install_with_sysroot(
         match postfetch.detected_bootloader {
             Bootloader::Grub => {
                 crate::bootloader::install_via_bootupd(
-                    rootfs.find_bootloader_device(),
+                    &rootfs.backing_devices,
                     &rootfs
                         .target_root_path
                         .clone()

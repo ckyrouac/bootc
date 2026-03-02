@@ -1260,7 +1260,7 @@ pub(crate) async fn setup_composefs_boot(
         crate::bootloader::install_via_zipl(root_setup.require_single_device()?, boot_uuid)?;
     } else if postfetch.detected_bootloader == Bootloader::Grub {
         crate::bootloader::install_via_bootupd(
-            root_setup.find_bootloader_device(),
+            &root_setup.backing_devices,
             &root_setup.physical_root_path,
             &state.config_opts,
             None,

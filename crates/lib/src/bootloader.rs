@@ -67,9 +67,16 @@ pub(crate) fn supports_bootupd(root: &Dir) -> Result<bool> {
     Ok(r)
 }
 
+/// Install the bootloader via bootupd to all backing devices.
+///
+/// Each backing device is passed as a separate `--device` flag so that
+/// bootupd can install to every ESP in multi-device setups (e.g. LVM
+/// spanning multiple disks).  We use explicit `--device` flags rather than
+/// bootupd's `--filesystem` auto-discovery because the bwrap path uses
+/// bind mounts that `lsblk` cannot resolve back to block devices.
 #[context("Installing bootloader")]
 pub(crate) fn install_via_bootupd(
-    device: &bootc_blockdev::Device,
+    devices: &[bootc_blockdev::Device],
     rootfs: &Utf8Path,
     configopts: &crate::install::InstallConfigOpts,
     deployment_path: Option<&str>,
@@ -78,11 +85,6 @@ pub(crate) fn install_via_bootupd(
     // bootc defaults to only targeting the platform boot method.
     let bootupd_opts = (!configopts.generic_image).then_some(["--update-firmware", "--auto"]);
 
-    // When not running inside the target container (through `--src-imgref`) we use
-    // will bwrap as a chroot to run bootupctl from the deployment.
-    // This makes sure we use binaries from the target image rather than the buildroot.
-    // In that case, the target rootfs is replaced with `/` because this is just used by
-    // bootupd to find the backing device.
     let rootfs_mount = if deployment_path.is_none() {
         rootfs.as_str()
     } else {
@@ -91,7 +93,8 @@ pub(crate) fn install_via_bootupd(
 
     println!("Installing bootloader via bootupd");
 
-    let device_path = device.path();
+    // Collect device paths; they must outlive bootupd_args.
+    let device_paths: Vec<String> = devices.iter().map(|d| d.path()).collect();
 
     // Build the bootupctl arguments
     let mut bootupd_args: Vec<&str> = vec!["backend", "install"];
@@ -103,11 +106,13 @@ pub(crate) fn install_via_bootupd(
     if let Some(v) = verbose {
         bootupd_args.push(v);
     }
-
     if let Some(ref opts) = bootupd_opts {
         bootupd_args.extend(opts.iter().copied());
     }
-    bootupd_args.extend(["--device", &device_path, rootfs_mount]);
+    for devpath in &device_paths {
+        bootupd_args.extend(["--device", devpath.as_str()]);
+    }
+    bootupd_args.push(rootfs_mount);
 
     // Run inside a bwrap container. It takes care of mounting and creating
     // the necessary API filesystems in the target deployment and acts as
@@ -122,9 +127,11 @@ pub(crate) fn install_via_bootupd(
         let mut bwrap_args = vec!["bootupctl"];
         bwrap_args.extend(bootupd_args);
 
-        // Collect partition paths first so they live long enough
-        let partition_paths: Vec<String> =
-            device.children.iter().flatten().map(|p| p.path()).collect();
+        // Collect partition paths for all backing devices so they live long enough
+        let partition_paths: Vec<String> = devices
+            .iter()
+            .flat_map(|d| d.children.iter().flatten().map(|p| p.path()))
+            .collect();
 
         // Discover the device backing /boot so that findmnt can resolve its UUID
         // inside bwrap. When /boot is on a device-mapper volume (e.g. LVM), the
@@ -143,12 +150,7 @@ pub(crate) fn install_via_bootupd(
         };
 
         let mut cmd = BwrapCmd::new(&target_root)
-            // Bind mount /boot from the physical target root so bootupctl can find
-            // the boot partition and install the bootloader there
             .bind(&boot_path, &"/boot")
-            // Bind the target block device inside the bwrap container so bootupctl can access it
-            .bind_device(&device_path)
-            // Bind the device backing /boot so findmnt can resolve its UUID inside bwrap
             .bind_device(&boot_backing_device);
 
         // If the original mount source is a symlink (e.g. /dev/mapper/VG-LV ->
@@ -158,15 +160,31 @@ pub(crate) fn install_via_bootupd(
             cmd = cmd.symlink(&boot_backing_device, &boot_source_path);
         }
 
-        // Also bind all partitions of the target block device
+        // Bind all backing devices and their partitions into the bwrap container
+        // so bootupd can discover and access them via lsblk.
+        for devpath in &device_paths {
+            cmd = cmd.bind_device(devpath);
+        }
         for part_path in &partition_paths {
             cmd = cmd.bind_device(part_path);
         }
 
-        // The $PATH in the bwrap env is not complete enough for some images
-        // so we inject a reasonnable default.
-        // This is causing bootupctl and/or sfdisk binaries
-        // to be not found with fedora 43.
+        // Bind udev data so that lsblk/libblkid inside bwrap can read
+        // partition type GUIDs from the udev database.
+        let udev_path = Utf8Path::new("/run/udev");
+        match udev_path.try_exists() {
+            Ok(true) => {
+                tracing::debug!("Binding /run/udev into bwrap");
+                cmd = cmd.bind(&udev_path, &udev_path);
+            }
+            Ok(false) => {
+                tracing::warn!("/run/udev does not exist, lsblk may not find partition types");
+            }
+            Err(e) => {
+                tracing::warn!("Failed to check /run/udev: {e}");
+            }
+        }
+
         cmd.setenv(
             "PATH",
             "/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/usr/local/sbin",
@@ -179,40 +197,6 @@ pub(crate) fn install_via_bootupd(
             .log_debug()
             .run_inherited_with_cmd_context()
     }
-    // // No backing devices with ESP found. Run bootupd without --device and let it
-    // // try to auto-detect. This works for:
-    // // - BIOS boot (uses MBR, not ESP)
-    // // - Systems where bootupd can find ESP via mounted /boot/efi
-    // // UEFI boot will fail if bootupd cannot locate the ESP.
-    // if devices.is_empty() {
-    //     tracing::warn!(
-    //         "No backing device with ESP found; UEFI boot may fail if ESP cannot be auto-detected"
-    //     );
-    //     println!("Installing bootloader via bootupd (no target device specified)");
-    //     return Command::new("bootupctl")
-    //         .args(["backend", "install", "--write-uuid"])
-    //         .args(verbose)
-    //         .args(bootupd_opts.iter().copied().flatten())
-    //         .args(&src_root_arg)
-    //         .arg(rootfs.as_str())
-    //         .log_debug()
-    //         .run_inherited_with_cmd_context();
-    // }
-    //
-    // // Install bootloader to each device
-    // for dev in devices {
-    //     let devpath = dev.path();
-    //     println!("Installing bootloader via bootupd to {devpath}");
-    //     Command::new("bootupctl")
-    //         .args(["backend", "install", "--write-uuid"])
-    //         .args(verbose)
-    //         .args(bootupd_opts.iter().copied().flatten())
-    //         .args(&src_root_arg)
-    //         .args(["--device", devpath.as_str()])
-    //         .arg(rootfs.as_str())
-    //         .log_debug()
-    //         .run_inherited_with_cmd_context()?;
-    // }
 }
 
 #[context("Installing bootloader")]
