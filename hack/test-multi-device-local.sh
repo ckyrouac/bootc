@@ -2,7 +2,7 @@
 # Test multi-device ESP detection locally using loopback disks with LVM.
 #
 # This is a local equivalent of tmt/tests/booted/test-multi-device-esp.nu
-# that runs `bootc install to-filesystem` on LVM backed by two loopback disks.
+# that runs `bootc install to-existing-root` on LVM backed by two loopback disks.
 #
 # Two scenarios are tested:
 # 1. Single ESP: Only one backing device has an ESP partition
@@ -135,7 +135,7 @@ validate_esp() {
     echo "ESP validation passed for $esp_partition"
 }
 
-# Run bootc install to-filesystem from the container image
+# Run bootc install to-existing-root from the container image
 run_install() {
     local mountpoint="$1"
 
@@ -148,8 +148,9 @@ run_install() {
         --security-opt label=type:unconfined_t \
         --env BOOTC_BOOTLOADER_DEBUG=1 \
         "$TARGET_IMAGE" \
-        bootc install to-filesystem \
+        bootc install to-existing-root \
             --disable-selinux \
+            --acknowledge-destructive \
             --target-no-signature-verification \
             /target
 }
