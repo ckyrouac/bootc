@@ -37,7 +37,7 @@ echo "==> Local bootupd version:"
 "$BOOTUPD_DIR/target/release/bootupd" --version
 
 echo "==> Building derived container image with local bootupd..."
-podman build -t "$TARGET_IMAGE" --build-arg="base=$BASE_IMAGE" \
+podman build --no-cache -t "$TARGET_IMAGE" --build-arg="base=$BASE_IMAGE" \
     -f - "$BOOTUPD_DIR/target/release" <<'EOF'
 ARG base=localhost/bootc
 FROM $base
@@ -143,6 +143,7 @@ run_install() {
         --rm --privileged \
         -v "${mountpoint}:/target" \
         -v /dev:/dev \
+        -v /run/udev:/run/udev:ro \
         -v /usr/share/empty:/usr/lib/bootc/bound-images.d \
         --pid=host \
         --security-opt label=type:unconfined_t \
@@ -187,6 +188,9 @@ test_single_esp() {
     mkfs.ext4 -q "$lv_path"
     mkdir -p "$MOUNTPOINT"
     mount "$lv_path" "$MOUNTPOINT"
+
+    # to-existing-root expects /boot to exist in the target
+    mkdir -p "${MOUNTPOINT}/boot"
 
     # Show block device hierarchy
     lsblk --pairs --paths --inverse --output NAME,TYPE "$lv_path"
@@ -238,6 +242,9 @@ test_dual_esp() {
     mkdir -p "$MOUNTPOINT"
     mount "$lv_path" "$MOUNTPOINT"
 
+    # to-existing-root expects /boot to exist in the target
+    mkdir -p "${MOUNTPOINT}/boot"
+
     # Show block device hierarchy
     lsblk --pairs --paths --inverse --output NAME,TYPE "$lv_path"
 
@@ -263,6 +270,6 @@ echo "==> Base image: $BASE_IMAGE"
 echo "==> Test image: $TARGET_IMAGE (with local bootupd)"
 
 test_single_esp
-# test_dual_esp
+test_dual_esp
 
 echo "==> All multi-device ESP tests passed"
