@@ -15,13 +15,41 @@
 use std assert
 use tap.nu
 
-# Use the currently booted image (copied to container storage)
-const target_image = "localhost/bootc"
+# Base image copied from the booted system; may be overridden with a
+# derived image containing a local bootupd build (see prepare_image).
+const base_image = "localhost/bootc"
+const local_bootupd_image = "localhost/bootc-local-bootupd"
+
+# Path to an optional locally-built bootupd binary shipped alongside
+# this test.  When present, a derived container image is built that
+# replaces bootupd/bootupctl so the test exercises the local build.
+const local_bootupd_path = "/var/tmp/local-bootupd"
 
 # ESP partition type GUID
 const ESP_TYPE = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
 # Linux LVM partition type GUID
 const LVM_TYPE = "E6D6D379-F507-44C2-A23C-238F2A3DF928"
+
+# Copy the booted image to container storage and, if a local bootupd
+# binary is available, build a derived image that includes it.
+# Returns the image name to use for testing.
+def prepare_image [] -> string {
+    bootc image copy-to-storage
+
+    if ($local_bootupd_path | path exists) {
+        print $"Injecting local bootupd from ($local_bootupd_path)"
+        (podman build --no-cache -t $local_bootupd_image
+            -f - ([$local_bootupd_path] | path dirname) <<EOF
+FROM localhost/bootc
+COPY local-bootupd /usr/libexec/bootupd
+COPY local-bootupd /usr/bin/bootupctl
+EOF
+        )
+        $local_bootupd_image
+    } else {
+        $base_image
+    }
+}
 
 # Cleanup function for LVM and loop devices
 def cleanup [vg_name: string, loop1: string, loop2: string, mountpoint: string] {
@@ -107,17 +135,18 @@ def validate_esp [esp_partition: string] {
 }
 
 # Run bootc install to-existing-root from within the container image under test
-def run_install [mountpoint: string] {
+def run_install [mountpoint: string, image: string] {
     (podman run
         --rm
         --privileged
         -v $"($mountpoint):/target"
         -v /dev:/dev
+        -v /run/udev:/run/udev:ro
         -v /usr/share/empty:/usr/lib/bootc/bound-images.d
         --pid=host
         --security-opt label=type:unconfined_t
         --env BOOTC_BOOTLOADER_DEBUG=1
-        $target_image
+        $image
         bootc install to-existing-root
             --disable-selinux
             --acknowledge-destructive
@@ -129,8 +158,8 @@ def run_install [mountpoint: string] {
 def test_single_esp [] {
     tap begin "multi-device ESP detection tests"
 
-    # Copy the currently booted image to container storage for podman to use
-    bootc image copy-to-storage
+    let target_image = (prepare_image)
+    print $"Using image: ($target_image)"
 
     print "Starting single ESP test"
 
@@ -165,7 +194,7 @@ def test_single_esp [] {
         # Show block device hierarchy
         lsblk --pairs --paths --inverse --output NAME,TYPE $lv_path
 
-        run_install $mountpoint
+        run_install $mountpoint $target_image
 
         # Validate ESP was installed correctly
         validate_esp $"($loop1)p1"
@@ -185,6 +214,9 @@ def test_single_esp [] {
 
 # Test scenario 2: ESP on both devices
 def test_dual_esp [] {
+    let target_image = (prepare_image)
+    print $"Using image: ($target_image)"
+
     print "Starting dual ESP test"
 
     let vg_name = "test_dual_esp_vg"
@@ -218,7 +250,7 @@ def test_dual_esp [] {
         # Show block device hierarchy
         lsblk --pairs --paths --inverse --output NAME,TYPE $lv_path
 
-        run_install $mountpoint
+        run_install $mountpoint $target_image
 
         # Validate both ESPs were installed correctly
         validate_esp $"($loop1)p1"

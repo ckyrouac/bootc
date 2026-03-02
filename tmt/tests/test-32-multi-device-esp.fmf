@@ -1,3 +1,16 @@
 summary: Test multi-device ESP detection for to-existing-root
 test: nu booted/test-multi-device-esp.nu
 duration: 45m
+require:
+  - lvm2
+  - dosfstools
+  - e2fsprogs
+prepare:
+  - how: shell
+    script: |
+      if [ -f booted/local-bootupd ]; then
+        cp booted/local-bootupd /var/tmp/local-bootupd
+        chmod +x /var/tmp/local-bootupd
+        echo "Installed local bootupd to /var/tmp/local-bootupd"
+        /var/tmp/local-bootupd --version
+      fi
