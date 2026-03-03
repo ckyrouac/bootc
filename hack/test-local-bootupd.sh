@@ -25,6 +25,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
+cd "$BOOTC_DIR"
 echo "==> Running TMT test (this will rebuild the container image with local bootupd)..."
 # Pass USE_LOCAL_BOOTUPD via --env flag since just/xtask doesn't inherit shell env
 #
