@@ -33,7 +33,7 @@ const LVM_TYPE = "E6D6D379-F507-44C2-A23C-238F2A3DF928"
 # Copy the booted image to container storage and, if a local bootupd
 # binary is available, build a derived image that includes it.
 # Returns the image name to use for testing.
-def prepare_image [] -> string {
+def prepare_image [] {
     bootc image copy-to-storage
 
     if ($local_bootupd_path | path exists) {
