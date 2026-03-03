@@ -38,13 +38,12 @@ def prepare_image [] {
 
     if ($local_bootupd_path | path exists) {
         print $"Injecting local bootupd from ($local_bootupd_path)"
-        (podman build --no-cache -t $local_bootupd_image
-            -f - ([$local_bootupd_path] | path dirname) <<EOF
-FROM localhost/bootc
-COPY local-bootupd /usr/libexec/bootupd
-COPY local-bootupd /usr/bin/bootupctl
-EOF
-        )
+        let build_dir = (mktemp -d)
+        cp $local_bootupd_path $"($build_dir)/local-bootupd"
+        "FROM localhost/bootc\nCOPY local-bootupd /usr/libexec/bootupd\nCOPY local-bootupd /usr/bin/bootupctl\n"
+            | save $"($build_dir)/Containerfile"
+        podman build --no-cache -t $local_bootupd_image $build_dir
+        rm -rf $build_dir
         $local_bootupd_image
     } else {
         $base_image
