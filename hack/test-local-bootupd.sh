@@ -12,27 +12,16 @@ echo "==> Building bootupd with LOCAL_BUILD marker..."
 cd "$BOOTUPD_DIR"
 LOCAL_BUILD="$(date +%Y%m%d-%H%M%S)" cargo build --release
 
-echo "==> Copying bootupd to bootc tree for container image injection..."
-# Copy to contrib/packaging where it will be picked up during container build
-mkdir -p "$BOOTC_DIR/contrib/packaging/local-bootupd"
-cp target/release/bootupd "$BOOTC_DIR/contrib/packaging/local-bootupd/"
-
-echo "==> Verifying version..."
-"$BOOTC_DIR/contrib/packaging/local-bootupd/bootupd" --version
-
-echo "==> Also copying to test tree for test-phase injection..."
+echo "==> Copying bootupd to test tree for injection..."
 cp target/release/bootupd "$BOOTC_DIR/tmt/tests/booted/local-bootupd"
 
-echo "==> Adding local-bootupd to git (required for TMT tree)..."
-cd "$BOOTC_DIR"
-# Force-add the file since it's in .gitignore - TMT needs it in the git tree
-git add -f tmt/tests/booted/local-bootupd
+echo "==> Verifying version..."
+"$BOOTC_DIR/tmt/tests/booted/local-bootupd" --version
 
-# Cleanup function to remove the staged file and local-bootupd dir
+# Cleanup function to remove the local binary after the test
 cleanup() {
-    echo "==> Cleaning up staged local-bootupd..."
-    git reset HEAD -- tmt/tests/booted/local-bootupd 2>/dev/null || true
-    rm -rf "$BOOTC_DIR/contrib/packaging/local-bootupd"
+    echo "==> Cleaning up local-bootupd..."
+    rm -f "$BOOTC_DIR/tmt/tests/booted/local-bootupd"
 }
 trap cleanup EXIT
 

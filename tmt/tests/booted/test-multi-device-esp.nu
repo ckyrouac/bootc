@@ -23,7 +23,7 @@ const local_bootupd_image = "localhost/bootc-local-bootupd"
 # Path to an optional locally-built bootupd binary shipped alongside
 # this test.  When present, a derived container image is built that
 # replaces bootupd/bootupctl so the test exercises the local build.
-const local_bootupd_path = "/var/tmp/local-bootupd"
+const local_bootupd_path = "booted/local-bootupd"
 
 # ESP partition type GUID
 const ESP_TYPE = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
