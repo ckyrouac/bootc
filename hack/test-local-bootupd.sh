@@ -40,5 +40,5 @@ echo "==> Running TMT test (this will rebuild the container image with local boo
 # - systemd-boot on LVM (to-filesystem, composefs only)
 # - zIPL on LVM (to-filesystem, s390x only)
 # - grub on LVM (to-filesystem)
-# just variant=composefs-sealeduki-sdboot test-tmt --env=USE_LOCAL_BOOTUPD=1 multi-device-esp
-just test-tmt --env=USE_LOCAL_BOOTUPD=1 multi-device-esp
+just variant=composefs-sealeduki-sdboot test-tmt --env=USE_LOCAL_BOOTUPD=1 multi-device-esp
+# just test-tmt --env=USE_LOCAL_BOOTUPD=1 multi-device-esp
