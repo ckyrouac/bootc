@@ -45,7 +45,7 @@ pub(crate) fn mount_esp_part(root: &Dir, root_path: &Utf8Path, is_ostree: bool) 
         root
     };
 
-    let dev = bootc_blockdev::list_dev_by_dir(physical_root)?.root_disk()?;
+    let dev = bootc_blockdev::list_dev_by_dir(physical_root)?.require_single_root()?;
     if let Some(esp_dev) = dev.find_partition_of_type(bootc_blockdev::ESP) {
         let esp_path = esp_dev.path();
         bootc_mount::mount(&esp_path, &root_path.join(&efi_path))?;

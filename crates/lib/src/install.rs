@@ -1795,7 +1795,8 @@ async fn install_with_sysroot(
 
     if cfg!(target_arch = "s390x") {
         // TODO: Integrate s390x support into install_via_bootupd
-        crate::bootloader::install_via_zipl(&rootfs.device_info, boot_uuid)?;
+        // zipl only supports single device
+        crate::bootloader::install_via_zipl(&rootfs.device_info.require_single_root()?, boot_uuid)?;
     } else {
         match postfetch.detected_bootloader {
             Bootloader::Grub => {
@@ -2514,7 +2515,8 @@ pub(crate) async fn install_to_filesystem(
     // Find the real underlying backing device for the root.  This is currently just required
     // for GRUB (BIOS) and in the future zipl (I think).
     let device_info = {
-        let dev = bootc_blockdev::list_dev(Utf8Path::new(&inspect.source))?.root_disk()?;
+        let dev =
+            bootc_blockdev::list_dev(Utf8Path::new(&inspect.source))?.require_single_root()?;
         tracing::debug!("Backing device: {}", dev.path());
         dev
     };

@@ -279,34 +279,48 @@ impl Device {
         }
     }
 
-    /// Walk the parent chain to find the root (whole disk) device.
+    /// Walk the parent chain to find all root (whole disk) devices,
+    /// and fail if more than one root is found.
     ///
-    /// Returns the root device with its children (partitions) populated.
-    /// If this device is already a root device, returns a clone of `self`.
-    /// Fails if the device has multiple parents at any level.
-    pub fn root_disk(&self) -> Result<Device> {
+    /// This is a convenience wrapper around `find_all_roots` for callers
+    /// that expect exactly one backing device (e.g. non-RAID setups).
+    pub fn require_single_root(&self) -> Result<Device> {
+        let mut roots = self.find_all_roots()?;
+        match roots.len() {
+            1 => Ok(roots.remove(0)),
+            n => anyhow::bail!(
+                "Expected a single root device for {}, but found {n}",
+                self.path()
+            ),
+        }
+    }
+
+    /// Walk the parent chain to find all root (whole disk) devices.
+    ///
+    /// Returns all root devices with their children (partitions) populated.
+    /// This handles devices backed by multiple parents (e.g. RAID arrays)
+    /// by following all branches of the parent tree.
+    /// If this device is already a root device, returns a single-element list.
+    pub fn find_all_roots(&self) -> Result<Vec<Device>> {
         let Some(parents) = self.list_parents()? else {
             // Already a root device; re-query to ensure children are populated
-            return list_dev(Utf8Path::new(&self.path()));
+            return Ok(vec![list_dev(Utf8Path::new(&self.path()))?]);
         };
-        let mut current = parents;
-        loop {
-            anyhow::ensure!(
-                current.len() == 1,
-                "Device {} has multiple parents; cannot determine root disk",
-                self.path()
-            );
-            let mut parent = current.into_iter().next().unwrap();
-            match parent.children.take() {
+
+        let mut roots = Vec::new();
+        let mut queue = parents;
+        while let Some(mut device) = queue.pop() {
+            match device.children.take() {
                 Some(grandparents) if !grandparents.is_empty() => {
-                    current = grandparents;
+                    queue.extend(grandparents);
                 }
                 _ => {
-                    // Found the root; re-query to populate its actual children
-                    return list_dev(Utf8Path::new(&parent.path()));
+                    // Found a root; re-query to populate its actual children
+                    roots.push(list_dev(Utf8Path::new(&device.path()))?);
                 }
             }
         }
+        Ok(roots)
     }
 }
 
