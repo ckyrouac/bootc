@@ -19,6 +19,9 @@ pub const ESP_ID_MBR: &[u8] = &[0x06, 0xEF];
 /// EFI System Partition (ESP) for UEFI boot on GPT
 pub const ESP: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
 
+/// BIOS boot partition type GUID for GPT
+pub const BIOS_BOOT: &str = "21686148-6449-6e6f-744e-656564454649";
+
 #[derive(Debug, Deserialize)]
 struct DevicesOutput {
     blockdevices: Vec<Device>,
@@ -67,6 +70,79 @@ impl Device {
     #[allow(dead_code)]
     pub fn has_children(&self) -> bool {
         self.children.as_ref().is_some_and(|v| !v.is_empty())
+    }
+
+    // Check if the device is mpath
+    pub fn is_mpath(&self) -> Result<bool> {
+        let dm_path = Utf8PathBuf::from_path_buf(std::fs::canonicalize(self.path())?)
+            .map_err(|_| anyhow::anyhow!("Non-UTF8 path"))?;
+        let dm_name = dm_path.file_name().unwrap_or("");
+        let uuid_path = Utf8PathBuf::from(format!("/sys/class/block/{dm_name}/dm/uuid"));
+
+        if uuid_path.exists() {
+            let uuid = std::fs::read_to_string(&uuid_path)
+                .with_context(|| format!("Failed to read {uuid_path}"))?;
+            if uuid.trim_start().starts_with("mpath-") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Get the numeric partition index of the ESP (e.g. "1", "2").
+    ///
+    /// We read `/sys/class/block/<name>/partition` rather than parsing device
+    /// names because naming conventions vary across disk types (sd, nvme, dm, etc.).
+    /// On multipath devices the sysfs `partition` attribute doesn't exist, so we
+    /// fall back to the `partn` field reported by lsblk.
+    pub fn get_esp_partition_number(&self) -> Result<String> {
+        let esp_device = self.find_partition_of_esp()?;
+        let devname = &esp_device.name;
+
+        let partition_path = Utf8PathBuf::from(format!("/sys/class/block/{devname}/partition"));
+        if partition_path.exists() {
+            return std::fs::read_to_string(&partition_path)
+                .with_context(|| format!("Failed to read {partition_path}"));
+        }
+
+        // On multipath the partition attribute is not existing
+        if self.is_mpath()? {
+            if let Some(partn) = esp_device.partn {
+                return Ok(partn.to_string());
+            }
+        }
+        anyhow::bail!("Not supported for {devname}")
+    }
+
+    /// Find BIOS boot partition among children.
+    pub fn find_partition_of_bios_boot(&self) -> Option<&Device> {
+        self.find_partition_of_type(BIOS_BOOT)
+    }
+
+    /// Find all ESP partitions across all root devices backing this device.
+    /// Calls find_all_roots() to discover physical disks, then searches each for an ESP.
+    /// Returns None if no ESPs are found.
+    pub fn find_colocated_esps(&self) -> Result<Option<Vec<Device>>> {
+        let esps: Vec<_> = self
+            .find_all_roots()?
+            .iter()
+            .flat_map(|root| root.find_partition_of_esp().ok())
+            .cloned()
+            .collect();
+        Ok((!esps.is_empty()).then_some(esps))
+    }
+
+    /// Find all BIOS boot partitions across all root devices backing this device.
+    /// Calls find_all_roots() to discover physical disks, then searches each for a BIOS boot partition.
+    /// Returns None if no BIOS boot partitions are found.
+    pub fn find_colocated_bios_boot(&self) -> Result<Option<Vec<Device>>> {
+        let bios_boots: Vec<_> = self
+            .find_all_roots()?
+            .iter()
+            .filter_map(|root| root.find_partition_of_bios_boot())
+            .cloned()
+            .collect();
+        Ok((!bios_boots.is_empty()).then_some(bios_boots))
     }
 
     /// Find a child partition by partition type (case-insensitive).
@@ -506,6 +582,10 @@ mod test {
         // Verify find_partition_of_esp works
         let esp = dev.find_partition_of_esp().unwrap();
         assert_eq!(esp.partn, Some(2));
+        // Verify find_partition_of_bios_boot works (vda1 is BIOS-BOOT)
+        let bios = dev.find_partition_of_bios_boot().unwrap();
+        assert_eq!(bios.partn, Some(1));
+        assert_eq!(bios.parttype.as_deref().unwrap(), BIOS_BOOT);
     }
 
     #[test]
