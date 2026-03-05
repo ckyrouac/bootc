@@ -122,21 +122,10 @@ pub(crate) fn install_via_bootupd(
         let mut bwrap_args = vec!["bootupctl"];
         bwrap_args.extend(bootupd_args);
 
-        // Collect partition paths first so they live long enough
-        let partition_paths: Vec<String> =
-            device.children.iter().flatten().map(|p| p.path()).collect();
-
-        let mut cmd = BwrapCmd::new(&target_root)
+        let cmd = BwrapCmd::new(&target_root)
             // Bind mount /boot from the physical target root so bootupctl can find
             // the boot partition and install the bootloader there
-            .bind(&boot_path, &"/boot")
-            // Bind the target block device inside the bwrap container so bootupctl can access it
-            .bind_device(&device_path);
-
-        // Also bind all partitions of the target block device
-        for part_path in &partition_paths {
-            cmd = cmd.bind_device(part_path);
-        }
+            .bind(&boot_path, &"/boot");
 
         // The $PATH in the bwrap env is not complete enough for some images
         // so we inject a reasonnable default.

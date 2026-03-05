@@ -17,8 +17,6 @@ pub struct BwrapCmd<'a> {
     chroot_path: Cow<'a, Utf8Path>,
     /// Bind mounts in format (source, target)
     bind_mounts: Vec<(&'a str, &'a str)>,
-    /// Device nodes to bind into the container
-    devices: Vec<&'a str>,
     /// Environment variables to set
     env_vars: Vec<(&'a str, &'a str)>,
 }
@@ -31,7 +29,6 @@ impl<'a> BwrapCmd<'a> {
         Self {
             chroot_path: Cow::Owned(Utf8PathBuf::from(&fd_path)),
             bind_mounts: Vec::new(),
-            devices: Vec::new(),
             env_vars: Vec::new(),
         }
     }
@@ -41,7 +38,6 @@ impl<'a> BwrapCmd<'a> {
         Self {
             chroot_path: Cow::Borrowed(path),
             bind_mounts: Vec::new(),
-            devices: Vec::new(),
             env_vars: Vec::new(),
         }
     }
@@ -54,12 +50,6 @@ impl<'a> BwrapCmd<'a> {
     ) -> Self {
         self.bind_mounts
             .push((source.as_ref().as_str(), target.as_ref().as_str()));
-        self
-    }
-
-    /// Bind a device node into the container.
-    pub fn bind_device(mut self, device: &'a str) -> Self {
-        self.devices.push(device);
         self
     }
 
@@ -79,17 +69,18 @@ impl<'a> BwrapCmd<'a> {
         // Setup API filesystems
         // See https://systemd.io/API_FILE_SYSTEMS/
         cmd.args(["--proc", "/proc"]);
-        cmd.args(["--dev", "/dev"]);
+        cmd.args(["--dev-bind", "/dev", "/dev"]);
         cmd.args(["--bind", "/sys", "/sys"]);
+
+        // Bind /run primarily for the udev database so that
+        // lsblk/libblkid inside the sandbox can read
+        // partition type GUIDs and other device properties.
+        cmd.args(["--tmpfs", "/run"]);
+        cmd.args(["--bind", "/run", "/run"]);
 
         // Add bind mounts
         for (source, target) in &self.bind_mounts {
             cmd.args(["--bind", source, target]);
-        }
-
-        // Add device bind mounts
-        for device in self.devices {
-            cmd.args(["--dev-bind", device, device]);
         }
 
         // Add environment variables
