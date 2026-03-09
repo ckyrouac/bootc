@@ -90,6 +90,11 @@
   - e2fsprogs
   test: bash booted/test-install-to-filesystem-var-mount.sh
 
+/test-32-multi-device-esp:
+  summary: Test multi-device ESP detection for to-existing-root
+  duration: 45m
+  test: nu booted/test-multi-device-esp.nu
+
 /test-33-bib-build:
   summary: Test building a qcow2 disk image with bootc-image-builder
   duration: 45m
@@ -104,11 +109,11 @@
 
 /test-35-upgrade-preflight-disk-check:
   summary: Verify pre-flight disk space check rejects images with inflated layer sizes
-  duration: 20m
+  duration: 10m
   test: nu booted/test-upgrade-preflight-disk-check.nu
 
 /test-36-rollback:
-  summary: Test bootc rollback functionality through image switch and rollback cycle
+  summary: Test bootc rollback functionality
   duration: 30m
   test: nu booted/test-rollback.nu
 

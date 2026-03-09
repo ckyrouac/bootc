@@ -167,6 +167,13 @@ execute:
     test:
       - /tmt/tests/tests/test-32-install-to-filesystem-var-mount
 
+/plan-32-multi-device-esp:
+  summary: Test multi-device ESP detection for to-existing-root
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/tests/test-32-multi-device-esp
+
 /plan-33-bib-build:
   summary: Test building a qcow2 disk image with bootc-image-builder
   discover:
@@ -182,8 +189,15 @@ execute:
     test:
       - /tmt/tests/tests/test-34-user-agent
 
+/plan-35-upgrade-preflight-disk-check:
+  summary: Verify pre-flight disk space check rejects images with inflated layer sizes
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/tests/test-35-upgrade-preflight-disk-check
+
 /plan-36-rollback:
-  summary: Test bootc rollback functionality through image switch and rollback cycle
+  summary: Test bootc rollback functionality
   discover:
     how: fmf
     test:
@@ -202,11 +216,4 @@ execute:
     how: fmf
     test:
       - /tmt/tests/tests/test-38-install-bootloader-none
-
-/plan-39-multi-device-esp:
-  summary: Test multi-device ESP detection for to-existing-root
-  discover:
-    how: fmf
-    test:
-      - /tmt/tests/test-32-multi-device-esp
 # END GENERATED PLANS
