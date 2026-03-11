@@ -231,4 +231,15 @@ execute:
     how: fmf
     test:
       - /tmt/tests/tests/test-39-upgrade-tag
+
+/plan-40-multi-device-esp:
+  summary: Test multi-device ESP detection for to-existing-root
+  provision+:
+    hardware:
+      boot:
+        method: uefi
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/test-40-multi-device-esp
 # END GENERATED PLANS
