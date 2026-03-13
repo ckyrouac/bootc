@@ -94,6 +94,7 @@ jobs:
 
           # Set internal crate versions to match the bootc release version
           cargo set-version --manifest-path crates/utils/Cargo.toml --package bootc-internal-utils "$VERSION"
+          cargo set-version --manifest-path crates/mount/Cargo.toml --package bootc-internal-mount "$VERSION"
           cargo set-version --manifest-path crates/blockdev/Cargo.toml --package bootc-internal-blockdev "$VERSION"
 
           cargo update --workspace

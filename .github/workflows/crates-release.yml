@@ -16,7 +16,7 @@ jobs:
     - run: |
         # Publish crates if their current version is not already on crates.io.
         # Order matters: dependencies must be published first.
-        CRATES="bootc-internal-utils bootc-internal-blockdev"
+        CRATES="bootc-internal-utils bootc-internal-mount bootc-internal-blockdev"
 
         for crate in $CRATES; do
           VERSION=$(cargo read-manifest -p "$crate" | jq -r '.version')
