@@ -16,10 +16,12 @@ jobs:
     - run: |
         # Publish crates if their current version is not already on crates.io.
         # Order matters: dependencies must be published first.
-        CRATES="bootc-internal-utils bootc-internal-mount bootc-internal-blockdev"
+        CRATES="utils mount blockdev"
 
-        for crate in $CRATES; do
-          VERSION=$(cargo read-manifest -p "$crate" | jq -r '.version')
+        for dir in $CRATES; do
+          manifest="crates/$dir/Cargo.toml"
+          crate=$(cargo read-manifest --manifest-path "$manifest" | jq -r '.name')
+          VERSION=$(cargo read-manifest --manifest-path "$manifest" | jq -r '.version')
           if cargo info "$crate@$VERSION" > /dev/null 2>&1; then
             echo "$crate@$VERSION is already published, skipping"
           else
