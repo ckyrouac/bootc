@@ -22,7 +22,7 @@ jobs:
           manifest="crates/$dir/Cargo.toml"
           crate=$(cargo read-manifest --manifest-path "$manifest" | jq -r '.name')
           VERSION=$(cargo read-manifest --manifest-path "$manifest" | jq -r '.version')
-          if cargo info "$crate@$VERSION" > /dev/null 2>&1; then
+          if cargo info --registry crates-io "$crate@$VERSION" > /dev/null 2>&1; then
             echo "$crate@$VERSION is already published, skipping"
           else
             echo "Publishing $crate@$VERSION..."
