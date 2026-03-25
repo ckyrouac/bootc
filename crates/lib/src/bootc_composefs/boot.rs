@@ -532,8 +532,18 @@ pub(crate) fn setup_composefs_bls_boot(
                 ComposefsCmdline::build(&id_hex, state.composefs_options.allow_missing_verity);
             cmdline_options.extend(&Cmdline::from(&composefs_cmdline.to_string()));
 
-            // Locate ESP partition device
-            let esp_part = root_setup.device_info.find_partition_of_esp()?;
+            // Locate ESP partition device by walking up to the root disk(s)
+            let esp_part = root_setup
+                .device_info
+                .find_colocated_esps()?
+                .and_then(|mut v| {
+                    if v.is_empty() {
+                        None
+                    } else {
+                        Some(v.remove(0))
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("ESP partition not found"))?;
 
             (
                 root_setup.physical_root_path.clone(),
@@ -570,10 +580,18 @@ pub(crate) fn setup_composefs_bls_boot(
                 .context("Failed to create 'composefs=' parameter")?;
             cmdline.add_or_modify(&param);
 
-            // Locate ESP partition device
-            let root_dev =
-                bootc_blockdev::list_dev_by_dir(&storage.physical_root)?.require_single_root()?;
-            let esp_dev = root_dev.find_partition_of_esp()?;
+            // Locate ESP partition device by walking up to the root disk(s)
+            let root_dev = bootc_blockdev::list_dev_by_dir(&storage.physical_root)?;
+            let esp_dev = root_dev
+                .find_colocated_esps()?
+                .and_then(|mut v| {
+                    if v.is_empty() {
+                        None
+                    } else {
+                        Some(v.remove(0))
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("ESP partition not found"))?;
 
             (
                 Utf8PathBuf::from("/sysroot"),
@@ -1081,7 +1099,18 @@ pub(crate) fn setup_composefs_uki_boot(
         BootSetupType::Setup((root_setup, state, postfetch, ..)) => {
             state.require_no_kargs_for_uki()?;
 
-            let esp_part = root_setup.device_info.find_partition_of_esp()?;
+            // Locate ESP partition device by walking up to the root disk(s)
+            let esp_part = root_setup
+                .device_info
+                .find_colocated_esps()?
+                .and_then(|mut v| {
+                    if v.is_empty() {
+                        None
+                    } else {
+                        Some(v.remove(0))
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("ESP partition not found"))?;
 
             (
                 root_setup.physical_root_path.clone(),
@@ -1096,10 +1125,18 @@ pub(crate) fn setup_composefs_uki_boot(
             let sysroot = Utf8PathBuf::from("/sysroot"); // Still needed for root_path
             let bootloader = host.require_composefs_booted()?.bootloader.clone();
 
-            // Locate ESP partition device
-            let root_dev =
-                bootc_blockdev::list_dev_by_dir(&storage.physical_root)?.require_single_root()?;
-            let esp_dev = root_dev.find_partition_of_esp()?;
+            // Locate ESP partition device by walking up to the root disk(s)
+            let root_dev = bootc_blockdev::list_dev_by_dir(&storage.physical_root)?;
+            let esp_dev = root_dev
+                .find_colocated_esps()?
+                .and_then(|mut v| {
+                    if v.is_empty() {
+                        None
+                    } else {
+                        Some(v.remove(0))
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("ESP partition not found"))?;
 
             (
                 sysroot,
