@@ -313,6 +313,25 @@ pub(crate) enum InstallOpts {
     /// will be wiped, but the content of the existing root will otherwise be retained, and will
     /// need to be cleaned up if desired when rebooted into the new root.
     ToExistingRoot(crate::install::InstallToExistingRootOpts),
+    /// Convert this running package-mode system to a bootc (image-mode) system.
+    ///
+    /// This command snapshots the running filesystem as a single-layer OCI container image,
+    /// pushes it to a container registry, and then installs it onto the running system using
+    /// `bootc install to-existing-root`. All filesystem content — including /opt, kernel
+    /// modules, and any out-of-tree (DKMS) drivers — is captured in the snapshot.
+    ///
+    /// This is a DESTRUCTIVE, one-way operation with no automatic rollback:
+    ///
+    ///   - /boot is wiped and the bootloader is replaced
+    ///   - The system is managed by bootc after reboot
+    ///
+    /// After reboot, the previous root content is accessible at /sysroot.
+    ///
+    /// Requires buildah and podman to be installed on the running system.
+    ///
+    /// EXPERIMENTAL: This is a proof-of-concept implementation.
+    #[clap(hide = true)]
+    FromExistingRoot(crate::install::from_existing::InstallFromExistingRootOpts),
     /// Nondestructively create a fresh installation state inside an existing bootc system.
     ///
     /// This is a nondestructive variant of `install to-existing-root` that works only inside
@@ -2046,6 +2065,9 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
             }
             InstallOpts::ToExistingRoot(opts) => {
                 crate::install::install_to_existing_root(opts).await
+            }
+            InstallOpts::FromExistingRoot(opts) => {
+                crate::install::from_existing::install_from_existing_root(opts).await
             }
             InstallOpts::Reset(opts) => crate::install::install_reset(opts).await,
             InstallOpts::PrintConfiguration(opts) => crate::install::print_configuration(opts),
