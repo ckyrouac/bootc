@@ -46,6 +46,18 @@ pub fn skopeo_bin() -> &'static str {
     })
 }
 
+/// Return the buildah binary path, honouring the `BOOTC_EXP_EXTERNAL_BUILDAH_TOOL`
+/// environment variable so callers can substitute an alternative tool without
+/// hard-linking it as `/usr/bin/buildah`. The _EXP prefix indicates this
+/// interface is experimental and subject to change.
+pub fn buildah_bin() -> &'static str {
+    static BIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        std::env::var("BOOTC_EXP_EXTERNAL_BUILDAH_TOOL")
+            .unwrap_or_else(|_| "buildah".to_string())
+    })
+}
+
 /// Intended for use in `main`, calls an inner function and
 /// handles errors by printing them.
 pub fn run_main<F>(f: F)
