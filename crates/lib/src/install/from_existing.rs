@@ -15,9 +15,11 @@
 //! ## What is and is not captured
 //!
 //! **Included:** everything on the root filesystem that is not in the exclusion list
-//! below. The `--one-file-system` tar flag automatically omits separately-mounted
-//! filesystems (e.g. a separately-mounted `/home` or `/var` partition), so content
-//! on the same physical device as `/` is captured while separate mount points are not.
+//! below. Additional mount points that share the same block device as `/` (e.g. btrfs
+//! subvolumes for `/var` and `/home` on a typical Fedora layout) are also captured so
+//! that the resulting image contains functional runtime state (`/var/lib/NetworkManager`,
+//! `/var/lib/systemd`, etc.).  Separate block devices (NFS, extra disks) are not
+//! captured.
 //!
 //! **Always excluded:**
 //! - `/proc`, `/sys`, `/dev` — virtual kernel filesystems
@@ -28,6 +30,8 @@
 //! - `/boot` — wiped and replaced by `bootc install to-existing-root`
 //! - `/sysroot`, `/ostree` — ostree internals (absent on package-mode systems)
 //! - `/var/lib/containers` — container storage (prevents recursive capture)
+//! - `/afs` — AFS placeholder directory; always empty but has a special inode
+//!   that causes btrfs kernel crashes when tar reads it during large archive writes
 //!
 //! The running kernel's initramfs is always copied separately from
 //! `/boot/initramfs-<kver>.img` into `/usr/lib/modules/<kver>/initramfs.img`
@@ -51,7 +55,20 @@ const BOOTC_INITRAMFS_DIR: &str = "/usr/lib/modules";
 const PREPARE_ROOT_CONF_PATH: &str = "/usr/lib/ostree/prepare-root.conf";
 
 /// Minimal `prepare-root.conf` that enables the read-only sysroot required by bootc.
-/// Written into the image only when the running system does not already have this file.
+///
+/// This is always written into the snapshot image, overriding any version from the
+/// running package-mode system.  The running system's `prepare-root.conf` might enable
+/// composefs (e.g. `enabled = yes`) — but `bootc install from-existing-root` uses the
+/// ostree backend, which does *not* create a composefs image.  If the deployed image
+/// retained `composefs.enabled = yes`, `ostree-prepare-root` would try to mount the
+/// composefs image at boot, fail (because it was never created), and fall back to
+/// "legacy bind-mount mode".  Legacy mode skips the pivot-root sequence that writes the
+/// complete `/run/ostree-booted` GVariant, causing `bootc status` to fail with "not
+/// currently booted into an OSTree system".
+///
+/// The minimal config (`sysroot.readonly = true`, no composefs) causes
+/// `ostree-prepare-root` to take the modern pivot-root path, which writes the GVariant
+/// correctly and allows `bootc status` to detect the booted deployment.
 const PREPARE_ROOT_CONF_CONTENT: &[u8] = b"[sysroot]\nreadonly = true\n";
 
 /// Paths excluded from the filesystem snapshot.
@@ -77,10 +94,50 @@ const EXCLUDED_PATHS: &[&str] = &[
     "/sysroot",
     "/ostree",
     "/var/lib/containers",
+    // /afs is an AFS (Andrew File System) placeholder directory present in some
+    // Fedora packages.  Even when AFS is not actually mounted it has a special
+    // inode (device 0, inode 264 on btrfs) that causes the btrfs kernel driver
+    // to crash when tar tries to read its extended attributes while writing a
+    // large archive to disk.  It is always empty, so excluding it loses nothing.
+    "/afs",
+];
+
+/// Essential directories that are excluded from the snapshot (because they are
+/// ephemeral mount points or runtime state) but must exist as empty directories
+/// in a valid Linux filesystem image.
+///
+/// - `/tmp`, `/var/tmp` — tmpfs mount points omitted from the snapshot
+/// - `/boot` — wiped by `to-existing-root`, but the directory must be present
+///   so the image can serve as a valid OS container image
+/// - `/sysroot` — excluded because it's an ostree internal (absent on package-mode
+///   systems), but bootc's bootloader installer (`bootupctl`) needs a `/sysroot`
+///   bind-mount target inside the deployment directory when installing the GRUB
+///   bootloader.  ostree marks the deployment directory immutable after committing
+///   it, so the directory must be pre-created in the image, not written
+///   post-installation.
+const RECREATE_EMPTY_DIRS: &[(&str, u32)] = &[
+    ("/tmp", 0o1777),       // sticky + world-writable tmpfs
+    ("/var/tmp", 0o1777),   // same
+    ("/boot", 0o755),       // ordinary directory, content replaced by installer
+    ("/sysroot", 0o755),    // bind-mount target for bootupctl (grub installer)
 ];
 
 /// Default name given to the intermediate image in local container storage.
 const DEFAULT_LOCAL_IMAGE_NAME: &str = "bootc-snapshot:latest";
+
+/// Buildah storage driver to use for the snapshot container.
+///
+/// The default storage driver (`overlay`) uses overlayfs on top of the host
+/// filesystem.  When the host uses btrfs, the overlay-on-btrfs combination can
+/// trigger kernel panics in some kernel versions when a large tar archive is
+/// unpacked via `buildah add`.  Using `vfs` avoids overlayfs entirely and is
+/// safe on all filesystem types, at the cost of not deduplicating layers (which
+/// does not matter here because we only have one layer).
+const BUILDAH_STORAGE_DRIVER: &str = "vfs";
+
+/// Extra arguments prepended to every `buildah` invocation to select the
+/// storage driver.  Declared as a slice so it can be spread into `.args()`.
+const BUILDAH_STORAGE_ARGS: &[&str] = &["--storage-driver", BUILDAH_STORAGE_DRIVER];
 
 /// SSH authorized_keys mount point inside the install container.
 const SSH_KEY_MOUNT: &str = "/bootc_authorized_ssh_keys/root";
@@ -147,8 +204,6 @@ struct SystemInfo {
     initramfs_src: String,
     /// Whether `/usr/lib/modules/<kver>/initramfs.img` already exists
     initramfs_already_placed: bool,
-    /// Whether `/usr/lib/ostree/prepare-root.conf` already exists
-    has_prepare_root_conf: bool,
 }
 
 impl std::fmt::Debug for SystemInfo {
@@ -157,7 +212,6 @@ impl std::fmt::Debug for SystemInfo {
             .field("kernel_version", &self.kernel_version)
             .field("initramfs_src", &self.initramfs_src)
             .field("initramfs_already_placed", &self.initramfs_already_placed)
-            .field("has_prepare_root_conf", &self.has_prepare_root_conf)
             .finish()
     }
 }
@@ -201,6 +255,7 @@ impl Drop for BuildahContainerGuard {
         if !self.committed.get() {
             // Best-effort cleanup on error paths.
             let _ = std::process::Command::new(bootc_utils::buildah_bin())
+                .args(BUILDAH_STORAGE_ARGS)
                 .args(["rm", &self.container_id])
                 .status();
         }
@@ -356,19 +411,10 @@ fn gather_system_info() -> Result<SystemInfo> {
     let bootc_initramfs = format!("{BOOTC_INITRAMFS_DIR}/{kernel_version}/initramfs.img");
     let initramfs_already_placed = std::path::Path::new(&bootc_initramfs).exists();
 
-    let has_prepare_root_conf = std::path::Path::new(PREPARE_ROOT_CONF_PATH).exists();
-    if !has_prepare_root_conf {
-        println!(
-            "NOTE: {PREPARE_ROOT_CONF_PATH} not found on this system; \
-             a minimal version will be injected into the image."
-        );
-    }
-
     Ok(SystemInfo {
         kernel_version,
         initramfs_src,
         initramfs_already_placed,
-        has_prepare_root_conf,
     })
 }
 
@@ -380,6 +426,7 @@ fn create_snapshot_image(opts: &InstallFromExistingRootOpts, info: &SystemInfo) 
     println!("  [1/4] Creating empty buildah container...");
     let container_id = {
         let out = std::process::Command::new(bootc_utils::buildah_bin())
+            .args(BUILDAH_STORAGE_ARGS)
             .args(["from", "scratch"])
             .output()
             .context("Running `buildah from scratch`")?;
@@ -412,16 +459,175 @@ fn create_snapshot_image(opts: &InstallFromExistingRootOpts, info: &SystemInfo) 
     guard.mark_committed();
     Ok(())
 }
+/// Choose the best directory for the intermediate tar archive.
+///
+/// Prefer `/tmp` (tmpfs) to avoid writing large sequential files to btrfs, which
+/// can trigger kernel crashes on some Fedora kernel versions when tar simultaneously
+/// reads from the same btrfs filesystem.  `/tmp` is typically a tmpfs of 50% of RAM.
+///
+/// Fall back to `/var/tmp` (persistent disk) if `/tmp` is not a tmpfs (e.g. the
+/// admin has mounted a non-tmpfs there) or if the available space there is less than
+/// the minimum threshold.
+fn choose_tar_dir() -> &'static str {
+    // Check if /tmp is a tmpfs by comparing its st_dev to /proc's
+    // well-known tmpfs device, or more simply: check that the fstype
+    // from /proc/mounts for /tmp is "tmpfs".
+    let is_tmp_tmpfs = std::fs::read_to_string("/proc/mounts")
+        .map(|mounts| {
+            mounts.lines().any(|line| {
+                let mut parts = line.split_whitespace();
+                let _dev = parts.next().unwrap_or("");
+                let mp = parts.next().unwrap_or("");
+                let fs = parts.next().unwrap_or("");
+                mp == "/tmp" && fs == "tmpfs"
+            })
+        })
+        .unwrap_or(false);
 
-/// Pipe the running filesystem through `tar` into `buildah add`, excluding
-/// virtual/transient paths.  No temporary tar file is written to disk.
+    if !is_tmp_tmpfs {
+        eprintln!(
+            "  [snapshot] /tmp is not a tmpfs; falling back to /var/tmp for tar archive"
+        );
+        return "/var/tmp";
+    }
+
+    // /tmp is a tmpfs — use it to avoid btrfs kernel crash.
+    "/tmp"
+}
+
+/// Snapshot the running filesystem into the buildah working container.
+///
+/// `tar` archives the live root filesystem (excluding virtual/transient paths) to a
+/// temporary file in `/tmp` (tmpfs), then `buildah add` unpacks it at `/` inside the
+/// container.
+///
+/// Using an intermediate file (rather than piping tar's stdout directly to
+/// `buildah add`) is required because newer versions of buildah (≥ 1.40) no longer
+/// accept `-` as a stand-in for stdin in `buildah add`.  A FIFO (named pipe) would
+/// avoid the disk write but cannot easily be used from the single-threaded tokio
+/// runtime that bootc uses.
+///
+/// The archive is written to `/tmp` (tmpfs backed by RAM) rather than `/var/tmp`
+/// (which is typically on btrfs) because writing large sequential files to btrfs
+/// while simultaneously reading the same btrfs filesystem can trigger kernel
+/// crashes in some kernel versions (observed on Fedora 44 with kernel 6.19).
+/// Writing to tmpfs avoids this btrfs I/O pattern entirely.
+///
+/// `/tmp` default size is 50% of RAM.  For systems where the rootfs snapshot would
+/// exceed that limit, the function falls back to `/var/tmp` (on the persistent
+/// disk) after logging a warning.
 #[context("Snapshotting running filesystem into buildah container")]
 fn snapshot_filesystem(container_id: &str) -> Result<()> {
+    // Choose the best location for the intermediate tar archive.
+    //
+    // Prefer /tmp (tmpfs) because writing large files to btrfs while tar
+    // simultaneously reads from the same btrfs filesystem triggers a kernel
+    // crash on some Fedora kernel versions.  Tmpfs is safe from this bug.
+    //
+    // Fall back to /var/tmp (persistent disk) if /tmp is not a tmpfs or if the
+    // tmpfs is smaller than a configurable threshold.
+    //
+    // We do NOT open the file before tar runs; instead we let tar create it so
+    // that we never hold an fd open on the inode while btrfs is active.
+    let tar_dir = choose_tar_dir();
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let tar_path = format!("{tar_dir}/bootc-snap-{ts:08x}.tar");
+    // Ensure we delete the file when this scope exits (success or error).
+    struct TarFileCleanup(String);
+    impl Drop for TarFileCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _tar_cleanup = TarFileCleanup(tar_path.clone());
+
+    // Determine which additional mount points (btrfs subvolumes, etc.) share the
+    // same underlying block device as `/` and should be included in the snapshot.
+    //
+    // On a typical Fedora/RHEL btrfs layout each subvolume (/, /var, /home,
+    // /boot, …) is a separate mount point.  Each subvolume reports a *different*
+    // st_dev even though they all live on the same physical block device.
+    // Comparing st_dev values would therefore miss all subvolumes, leaving the
+    // snapshot with an empty /var (and a non-functional NetworkManager, systemd-
+    // logind, etc.) after the first ostree boot.
+    //
+    // Instead, we look up the block device string for the root mount in
+    // /proc/mounts and treat all other mounts with the same block device string
+    // as "same-device" mounts that should be captured in pass 2.
+    //
+    // Strategy: two-pass archive.
+    //   Pass 1 – capture everything on the root mount itself
+    //            (--one-file-system so we do not accidentally recurse into
+    //             NFS/overlay/tmpfs that happen to land under / as well).
+    //   Pass 2 – for each additional mount point with the same block device
+    //            that is not already in EXCLUDED_PATHS and is not a virtual/
+    //            network filesystem, append its contents into the same tar
+    //            archive with the correct path prefix.
+
+    // Collect additional same-block-device mount points by reading /proc/mounts.
+    // We skip mounts whose fstype is virtual (proc, sysfs, devtmpfs, tmpfs,
+    // cgroup, overlay, …) and whose mount point is already covered by
+    // EXCLUDED_PATHS or is the root mount itself.
+    let virtual_fstypes: std::collections::HashSet<&str> = [
+        "proc", "sysfs", "devtmpfs", "tmpfs", "devpts", "cgroup", "cgroup2",
+        "hugetlbfs", "mqueue", "securityfs", "pstore", "debugfs", "tracefs",
+        "configfs", "efivarfs", "fusectl", "autofs", "bpf", "fuse.gvfsd-fuse",
+        "overlay", "nsfs", "ramfs",
+    ]
+    .iter()
+    .copied()
+    .collect();
+
+    let mounts_raw = std::fs::read_to_string("/proc/mounts")
+        .context("Reading /proc/mounts")?;
+
+    // Find the block device for the root mount.
+    let root_block_dev: Option<String> = mounts_raw.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let dev = parts.next()?;
+        let mp = parts.next()?;
+        if mp == "/" { Some(dev.to_string()) } else { None }
+    });
+
+    let mut extra_mounts: Vec<String> = Vec::new();
+    for line in mounts_raw.lines() {
+        let mut parts = line.split_whitespace();
+        let dev = parts.next().unwrap_or("");
+        let mountpoint = parts.next().unwrap_or("");
+        let fstype = parts.next().unwrap_or("");
+        if mountpoint == "/" {
+            continue; // root itself is covered by pass 1
+        }
+        // Skip virtual/network filesystems.
+        if virtual_fstypes.contains(fstype) {
+            continue;
+        }
+        // Skip anything already in EXCLUDED_PATHS.
+        if EXCLUDED_PATHS.iter().any(|ex| {
+            mountpoint == *ex || mountpoint.starts_with(&format!("{ex}/"))
+        }) {
+            continue;
+        }
+        // Include if this mount uses the same block device as /.
+        if let Some(ref root_dev) = root_block_dev {
+            if dev == root_dev.as_str() {
+                extra_mounts.push(mountpoint.to_string());
+            }
+        }
+    }
+
+    // ── Pass 1: root filesystem (--one-file-system) ──────────────────────────
     let mut tar_args: Vec<String> = vec![
         "--create".into(),
-        "--file=-".into(), // write to stdout for piping
-        // Do not cross mount-point boundaries.  This naturally excludes tmpfs
-        // mounts (proc, sys, dev, run) and any separately-mounted partitions.
+        format!("--file={tar_path}"),
+        // Do not cross mount-point boundaries for the root pass.  Separately-
+        // mounted filesystems on OTHER devices (NFS, extra disks, overlayfs,
+        // …) are intentionally skipped; same-device btrfs subvolumes are
+        // handled in pass 2 below.
         "--one-file-system".into(),
         "--sparse".into(),
         "--acls".into(),
@@ -429,46 +635,115 @@ fn snapshot_filesystem(container_id: &str) -> Result<()> {
         "--xattrs".into(),
     ];
 
+    // NOTE: GNU tar strips the leading "/" from archive member names
+    // ("Removing leading `/'" from member names"), so exclude patterns
+    // must NOT start with "/" or they will never match.  E.g. use
+    // "--exclude=proc" not "--exclude=/proc".
     for path in EXCLUDED_PATHS {
-        tar_args.push(format!("--exclude={path}"));
+        tar_args.push(format!("--exclude={}", path.trim_start_matches('/')));
+    }
+    // Also exclude extra mount points from the root pass so tar does not
+    // try to archive their (empty) mount-point directories and then fail
+    // when pass 2 re-archives the same path.
+    for mp in &extra_mounts {
+        tar_args.push(format!("--exclude={}", mp.trim_start_matches('/')));
     }
 
     tar_args.push("/".into()); // source: root filesystem
 
-    // Spawn tar and pipe its stdout directly into `buildah add` stdin,
-    // avoiding a large temporary file on disk.
-    let mut tar_child = std::process::Command::new("tar")
+    // Print the full tar command for debugging.
+    eprintln!("  [tar pass 1] tar {:?}", tar_args);
+
+    let tar_status = std::process::Command::new("tar")
         .args(&tar_args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("Spawning tar")?;
-
-    let tar_stdout = tar_child
-        .stdout
-        .take()
-        .expect("tar stdout must be piped");
-
-    // `buildah add <container> - /` reads a tar from stdin and unpacks it
-    // at `/` inside the container.
-    let buildah_status = std::process::Command::new(bootc_utils::buildah_bin())
-        .args(["add", "--quiet", container_id, "-", "/"])
-        .stdin(Stdio::from(tar_stdout))
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .context("Running `buildah add`")?;
-
-    let tar_status = tar_child.wait().context("Waiting for tar")?;
+        .context("Running tar (pass 1: root filesystem)")?;
 
     // GNU tar exits with code 1 for non-fatal warnings ("file changed as we
     // read it") which are expected for a live snapshot; code 2 is fatal.
     let tar_ok = tar_status.code().map(|c| c <= 1).unwrap_or(false);
     ensure!(
         tar_ok,
-        "tar exited with a fatal error (exit code {:?})",
+        "tar exited with a fatal error (pass 1, exit code {:?})",
         tar_status.code()
     );
+
+    // ── Pass 2: same-device additional mount points ───────────────────────────
+    // Append the contents of each extra mount point (e.g. /var, /home on a
+    // btrfs system with separate subvolumes) into the same tar archive.
+    for mp in &extra_mounts {
+        println!("  Snapshotting additional mount point: {mp}");
+        let mut mp_args: Vec<String> = vec![
+            "--append".into(),
+            format!("--file={tar_path}"),
+            "--sparse".into(),
+            "--acls".into(),
+            "--xattrs".into(),
+            // Do not cross further nested mounts.
+            "--one-file-system".into(),
+            // Transform paths: strip the leading "/" so the archive has
+            // entries like "var/lib/..." (relative to /var) which buildah
+            // will correctly place at /var/... inside the container.
+            format!("--transform=s|^\\./|{}/|", mp.trim_start_matches('/')),
+        ];
+        // Exclude sub-paths that fall under this mount point.
+        for ex in EXCLUDED_PATHS {
+            if ex.starts_with(mp.as_str()) {
+                // Make the exclude relative to the mountpoint.
+                let relative = ex.trim_start_matches(mp.as_str()).trim_start_matches('/');
+                if !relative.is_empty() {
+                    mp_args.push(format!("--exclude={relative}"));
+                }
+            }
+        }
+        // Exclude the tar archive file itself if it falls under this mount
+        // point.  Although we prefer /tmp (tmpfs) the archive could in theory
+        // be in /var/tmp if the fallback path was taken.  Without this
+        // exclusion, pass 2 would try to archive the partially-written tar
+        // file while simultaneously appending to it, causing the file to grow
+        // unboundedly.
+        if tar_path.starts_with(mp.as_str()) {
+            let rel = tar_path
+                .trim_start_matches(mp.as_str())
+                .trim_start_matches('/');
+            if !rel.is_empty() {
+                mp_args.push(format!("--exclude={rel}"));
+            }
+        }
+        // Source directory: the mount point itself (tar with -C).
+        mp_args.push("-C".into());
+        mp_args.push(mp.clone());
+        mp_args.push(".".into());
+
+        let status = std::process::Command::new("tar")
+            .args(&mp_args)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .context(format!("Running tar (pass 2: {mp})"))?;
+
+        let ok = status.code().map(|c| c <= 1).unwrap_or(false);
+        if !ok {
+            tracing::warn!(
+                "tar for mount point {mp} exited with {:?}; continuing",
+                status.code()
+            );
+        }
+    }
+
+    // `buildah add <container> <tar_path> /` unpacks the tar at `/` inside the container.
+    let buildah_status = std::process::Command::new(bootc_utils::buildah_bin())
+        .args(BUILDAH_STORAGE_ARGS)
+        .args(["add", "--quiet", container_id, &tar_path, "/"])
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("Running `buildah add`")?;
+
+    // `_tar_cleanup` is dropped here, deleting the temp tar file.
+
     ensure!(
         buildah_status.success(),
         "`buildah add` failed (exit code {:?})",
@@ -476,6 +751,100 @@ fn snapshot_filesystem(container_id: &str) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Attempt to regenerate the initramfs inside the container with dracut.
+///
+/// The package-mode initramfs copied from `/boot/initramfs-<kver>.img` may be missing
+/// the `ostree` dracut module and its shared library dependencies
+/// (`libgio-2.0.so.0`, `libglib-2.0.so.0`, etc.) that `ostree-prepare-root` requires.
+/// This function runs `dracut --force --add ostree` inside the buildah container to
+/// produce a properly-built initramfs.
+///
+/// Failure is non-fatal: if `dracut` is absent or fails (e.g., the snapshot came from
+/// a minimal container image), the function logs a warning and returns, leaving the
+/// previously-copied package-mode initramfs in place.
+fn regenerate_initramfs_with_dracut(container_id: &str, info: &SystemInfo, dest: &str) {
+    // Check if dracut is available inside the container.
+    let dracut_check = std::process::Command::new(bootc_utils::buildah_bin())
+        .args(BUILDAH_STORAGE_ARGS)
+        .args(["run", container_id, "--", "sh", "-c", "command -v dracut"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    let dracut_available = dracut_check.map(|s| s.success()).unwrap_or(false);
+    if !dracut_available {
+        println!(
+            "      WARNING: dracut not found inside container; keeping package-mode initramfs."
+        );
+        println!("               The initramfs may be missing ostree-prepare-root dependencies.");
+        return;
+    }
+
+    println!(
+        "      Regenerating initramfs with dracut --add ostree          (ensures ostree-prepare-root dependencies are present)..."
+    );
+
+    // Ensure /var/tmp exists inside the container; dracut uses it as a scratch space.
+    // /var/tmp is in EXCLUDED_PATHS so the snapshot omits it, but dracut will fail
+    // immediately with "Invalid tmpdir" if it doesn't exist.
+    let mkdir_status = std::process::Command::new(bootc_utils::buildah_bin())
+        .args(BUILDAH_STORAGE_ARGS)
+        .args(["run", container_id, "--", "mkdir", "-p", "/var/tmp"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if let Ok(s) = mkdir_status {
+        if !s.success() {
+            println!(
+                "      WARNING: failed to create /var/tmp in container; dracut may fail."
+            );
+        }
+    }
+
+    // Run dracut inside the container with the ostree module enabled.
+    // --no-hostonly: do not limit to hardware detected on the *host* (which is not the target).
+    // --force: overwrite the destination file (we just placed it above).
+    // --add ostree: include the ostree dracut module, which brings in ostree-prepare-root
+    //              and all of its shared library dependencies.
+    let status = std::process::Command::new(bootc_utils::buildah_bin())
+        .args(BUILDAH_STORAGE_ARGS)
+        .args([
+            "run",
+            container_id,
+            "--",
+            "dracut",
+            "--no-hostonly",
+            "--force",
+            "--add",
+            "ostree",
+            dest,
+            &info.kernel_version,
+        ])
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!("      Initramfs regenerated successfully with ostree module.");
+        }
+        Ok(s) => {
+            println!(
+                "      WARNING: dracut exited with code {:?}; keeping package-mode initramfs.",
+                s.code()
+            );
+            println!(
+                "               The initramfs may be missing ostree-prepare-root dependencies."
+            );
+        }
+        Err(e) => {
+            println!(
+                "      WARNING: failed to run dracut ({e}); keeping package-mode initramfs."
+            );
+        }
+    }
 }
 
 /// Copy the initramfs and (if absent) `prepare-root.conf` into the container,
@@ -492,11 +861,25 @@ fn inject_required_files(container_id: &str, info: &SystemInfo) -> Result<()> {
         println!("      Placing initramfs at {dest}");
         buildah_copy(container_id, &info.initramfs_src, &dest)
             .context("Copying initramfs into container")?;
+        // The package-mode initramfs may be missing the ostree dracut module and
+        // its shared library dependencies (libgio-2.0.so.0, libglib-2.0.so.0, etc.)
+        // required by ostree-prepare-root.  Attempt to regenerate the initramfs
+        // with dracut inside the container so that the ostree module is properly
+        // included with all dependencies.  If dracut is not available or fails
+        // (e.g., on a minimal system), keep the copied initramfs and warn the user.
+        regenerate_initramfs_with_dracut(container_id, info, &dest);
     }
 
-    // /usr/lib/ostree/prepare-root.conf is mandatory for ostree to configure
-    // the mount namespace at boot time.
-    if !info.has_prepare_root_conf {
+    // Always write the minimal prepare-root.conf into the snapshot image, overriding
+    // any version from the running system.  The running system's config might enable
+    // composefs (common on Fedora/RHEL where the ostree package ships
+    // `composefs.enabled = yes`), but `bootc install from-existing-root` uses the
+    // ostree backend without composefs.  If the composefs config were retained,
+    // ostree-prepare-root would attempt to mount a composefs image at boot, fail
+    // (because no composefs image was created), and fall back to legacy bind-mount
+    // mode — which prevents `bootc status` from detecting the booted deployment.
+    {
+        println!("      Writing minimal {PREPARE_ROOT_CONF_PATH} (overrides composefs if present)");
         let tmp =
             tempfile::NamedTempFile::new().context("Creating tempfile for prepare-root.conf")?;
         tmp.as_file()
@@ -506,8 +889,70 @@ fn inject_required_files(container_id: &str, info: &SystemInfo) -> Result<()> {
             .path()
             .to_str()
             .context("Tempfile path is not valid UTF-8")?;
+        // Ensure the parent directory exists before copying.
+        let status = std::process::Command::new(bootc_utils::buildah_bin())
+            .args(BUILDAH_STORAGE_ARGS)
+            .args(["run", container_id, "--", "mkdir", "-p", "/usr/lib/ostree"])
+            .status()
+            .context("Creating /usr/lib/ostree in container")?;
+        ensure!(
+            status.success(),
+            "`buildah run mkdir -p /usr/lib/ostree` failed"
+        );
         buildah_copy(container_id, tmp_path, PREPARE_ROOT_CONF_PATH)
-            .context("Injecting prepare-root.conf into container")?;
+            .context("Writing prepare-root.conf into container")?;
+    }
+
+    // Create the /ostree → sysroot/ostree symlink inside the container image.
+    //
+    // Standard bootc images (e.g. fedora-bootc) include this symlink as committed
+    // content.  After boot, `/` is the deployment root and `/sysroot` is the physical
+    // root; the symlink allows tools like `ostree` and `bootc status` to locate the
+    // ostree repo at `/ostree/repo` (→ `/sysroot/ostree/repo`).
+    //
+    // Package-mode systems do not have `/ostree`, and EXCLUDED_PATHS explicitly
+    // excludes it from the snapshot.  Without this symlink, the ostree sysroot lock
+    // at `/ostree/lock` fails with ENOENT when `bootc status` runs post-boot, because
+    // `/ostree` does not exist in the deployment root.
+    {
+        println!("      Creating /ostree → sysroot/ostree symlink");
+        let status = std::process::Command::new(bootc_utils::buildah_bin())
+            .args(BUILDAH_STORAGE_ARGS)
+            .args(["run", container_id, "--", "ln", "-sf", "sysroot/ostree", "/ostree"])
+            .status()
+            .context("Creating /ostree symlink in container")?;
+        ensure!(
+            status.success(),
+            "`buildah run ln -sf sysroot/ostree /ostree` failed"
+        );
+    }
+
+    // Re-create empty directories that were excluded from the snapshot because they
+    // are ephemeral mount points (tmpfs) or wiped by the installer, but must be
+    // present as directory entries in a valid Linux image.  Without these, tools
+    // such as `bootc install to-existing-root` and `tempfile` crate will fail with
+    // "No such file or directory" when they try to create files inside them.
+    for (path, mode) in RECREATE_EMPTY_DIRS {
+        // Use buildah run so the directory is created inside the container's
+        // filesystem, not on the host.  `mkdir -p` is idempotent if the
+        // directory was somehow preserved in the snapshot.
+        let status = std::process::Command::new(bootc_utils::buildah_bin())
+            .args(BUILDAH_STORAGE_ARGS)
+            .args([
+                "run",
+                container_id,
+                "--",
+                "sh",
+                "-c",
+                &format!("mkdir -p '{path}' && chmod {mode:04o} '{path}'"),
+            ])
+            .status()
+            .context("Running `buildah run` to create directory")?;
+        ensure!(
+            status.success(),
+            "`buildah run mkdir -p {path}` failed (exit code {:?})",
+            status.code()
+        );
     }
 
     set_image_labels(container_id, info).context("Setting OCI image labels")?;
@@ -518,6 +963,7 @@ fn inject_required_files(container_id: &str, info: &SystemInfo) -> Result<()> {
 /// Run `buildah copy <container> <src> <dest>`.
 fn buildah_copy(container_id: &str, src: &str, dest: &str) -> Result<()> {
     let status = std::process::Command::new(bootc_utils::buildah_bin())
+        .args(BUILDAH_STORAGE_ARGS)
         .args(["copy", container_id, src, dest])
         .status()
         .context("Running `buildah copy`")?;
@@ -536,6 +982,7 @@ fn set_image_labels(container_id: &str, info: &SystemInfo) -> Result<()> {
     let hostname = uname.nodename().to_str().unwrap_or("unknown");
 
     let status = std::process::Command::new(bootc_utils::buildah_bin())
+        .args(BUILDAH_STORAGE_ARGS)
         .args([
             "config",
             "--label",
@@ -549,6 +996,12 @@ fn set_image_labels(container_id: &str, info: &SystemInfo) -> Result<()> {
             "bootc.from-existing-root=true",
             "--label",
             &format!("bootc.source-kernel-version={}", info.kernel_version),
+            // Mark the image as a bootc-compatible image so that
+            // `bootc install to-existing-root` (and the ostree-ext importer)
+            // accept it.  Without this label the install fails with
+            // "Target image does not have ostree.bootable label".
+            "--label",
+            "containers.bootc=1",
             container_id,
         ])
         .status()
@@ -564,6 +1017,7 @@ fn set_image_labels(container_id: &str, info: &SystemInfo) -> Result<()> {
 /// Commit the buildah working container as a local OCI image.
 fn commit_image(container_id: &str, local_image_name: &str, _info: &SystemInfo) -> Result<()> {
     let status = std::process::Command::new(bootc_utils::buildah_bin())
+        .args(BUILDAH_STORAGE_ARGS)
         .args(["commit", "--format", "oci", container_id, local_image_name])
         .status()
         .context("Running `buildah commit`")?;
