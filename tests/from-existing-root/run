@@ -1,0 +1,746 @@
+#!/usr/bin/env bash
+# Integration test: bootc install from-existing-root
+#
+# Spins up a "package-mode" Fedora 44 VM (via user/session-mode libvirt using
+# virtqemud), copies the locally-built bootc binary into it, then runs:
+#
+#   bootc install from-existing-root --skip-push \
+#       --image-ref localhost/bootc-snapshot:latest \
+#       --acknowledge-destructive
+#
+# After a reboot the test SSHs back and verifies the system is now bootc-managed
+# (/sysroot/ostree exists and bootc status reports a booted image).
+#
+# Usage: tests/from-existing-root/run [--keep] [--no-build]
+#   --keep      Keep VM running after the test (for debugging)
+#   --no-build  Skip cargo build; use an existing target/thin/bootc binary
+#
+# Restrictions satisfied by this script:
+#   - No root / sudo required on the host
+#   - Works through the sandbox proxy (10.200.0.1:3128) with its MITM CA
+#   - Fedora package mirror URLs are potentially blocked; the VM uses dnf with
+#     the proxy configured so that it can reach real mirrors
+#   - libvirt "portforward" XML is ignored in session mode; SSH forwarding is
+#     added via the QEMU HMP monitor after VM start
+#   - A small LD_PRELOAD shim is compiled to work around two sandbox seccomp
+#     restrictions that would otherwise prevent virtqemud / QEMU from starting
+
+set -uo pipefail
+
+# ─── Paths ───────────────────────────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+# ─── Configuration ───────────────────────────────────────────────────────────
+
+VM_NAME="bootc-from-existing-root"
+VM_MEMORY=4096   # MiB
+VM_VCPUS=2
+SSH_PORT=22231   # host port → VM:22
+
+IMAGE_REF="localhost/bootc-snapshot:latest"
+
+# Containerdisk image; no direct HTTP download of Fedora ISOs is needed.
+CONTAINERDISK="quay.io/containerdisks/fedora:44"
+
+SHIM_SO=/tmp/bootc-test-libvirt-shim.so
+LIBVIRT_RUN=/tmp/bootc-test-virtqemud
+
+WORK_DIR="/tmp/bootc-from-existing-root"
+VM_DISK="${WORK_DIR}/disk.qcow2"
+CLOUD_INIT_ISO="${WORK_DIR}/cloud-init.iso"
+SSH_KEY="${WORK_DIR}/id_ed25519"
+BOOTC_BIN="${REPO_DIR}/target/thin/bootc"
+
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          -o ConnectTimeout=10 -o LogLevel=ERROR -o BatchMode=yes"
+
+TIMEOUT_BOOT=300
+TIMEOUT_INSTALL=1200
+TIMEOUT_REBOOT=300
+
+KEEP_VM=false
+NO_BUILD=false
+
+# ─── Test harness ────────────────────────────────────────────────────────────
+
+PASS=0; FAIL=0; TOTAL=0; CURRENT=""
+
+pass()  { PASS=$((PASS+1));  TOTAL=$((TOTAL+1)); echo "  ✔ ${CURRENT}"; }
+fail()  { FAIL=$((FAIL+1));  TOTAL=$((TOTAL+1)); echo "  ✘ ${CURRENT}${1:+ — $1}"; }
+check() { CURRENT="$1"; echo "▶ ${CURRENT}"; }
+log()   { echo "[$(date +%H:%M:%S)] $*"; }
+die()   { echo "FATAL: $*" >&2; cleanup; exit 1; }
+
+summary() {
+    echo ""
+    echo "══════════════════════════════════════════════"
+    echo " Results: ${PASS}/${TOTAL} passed, ${FAIL} failed"
+    echo "══════════════════════════════════════════════"
+    [[ ${FAIL} -eq 0 ]]
+}
+
+# ─── SSH helpers ─────────────────────────────────────────────────────────────
+
+ssh_vm() {
+    ssh ${SSH_OPTS} -i "${SSH_KEY}" -p "${SSH_PORT}" "fedora@127.0.0.1" "$@"
+}
+
+scp_to_vm() {
+    scp ${SSH_OPTS} -i "${SSH_KEY}" -P "${SSH_PORT}" "$1" "fedora@127.0.0.1:$2"
+}
+
+wait_for_ssh() {
+    local timeout="$1" elapsed=0
+    log "Waiting for SSH on port ${SSH_PORT} (timeout ${timeout}s)…"
+    while [[ ${elapsed} -lt ${timeout} ]]; do
+        if ssh_vm true 2>/dev/null; then
+            log "SSH ready after ${elapsed}s"
+            return 0
+        fi
+        sleep 5
+        elapsed=$((elapsed+5))
+    done
+    log "SSH timed out after ${timeout}s"
+    return 1
+}
+
+# ─── libvirt / QEMU helpers ──────────────────────────────────────────────────
+
+VIRSH_URI="qemu+unix:///session?socket=${LIBVIRT_RUN}/libvirt/virtqemud-sock"
+
+virsh_cmd() { virsh --connect "${VIRSH_URI}" "$@"; }
+
+add_ssh_forward() {
+    virsh_cmd qemu-monitor-command "${VM_NAME}" \
+        --hmp "hostfwd_add tcp::${SSH_PORT}-:22" &>/dev/null || true
+}
+
+# ─── LD_PRELOAD shim (sandbox seccomp workarounds) ───────────────────────────
+#
+# The sandbox's seccomp policy blocks two things that virtqemud / QEMU need:
+#   1. socket(AF_NETLINK, ..., NETLINK_KOBJECT_UEVENT=15) → replace proto with 0
+#   2. setrlimit / prlimit on core file size → silently swallow EPERM
+
+build_shim() {
+    [[ -f "${SHIM_SO}" ]] && { log "Reusing shim: ${SHIM_SO}"; return 0; }
+    local src
+    src="$(mktemp /tmp/bootc-shim-XXXXXX.c)"
+    cat > "${src}" << 'EOF'
+#define _GNU_SOURCE
+#include <sys/socket.h>
+#include <sys/resource.h>
+#include <dlfcn.h>
+#include <linux/netlink.h>
+
+typedef int (*orig_socket_t)(int,int,int);
+typedef int (*orig_setrlimit_t)(__rlimit_resource_t, const struct rlimit *);
+typedef int (*orig_setrlimit64_t)(__rlimit_resource_t, const struct rlimit64 *);
+typedef int (*orig_prlimit_t)(__pid_t, enum __rlimit_resource,
+                               const struct rlimit *, struct rlimit *);
+
+int socket(int domain, int type, int protocol) {
+    orig_socket_t f = dlsym(RTLD_NEXT, "socket");
+    if (domain == AF_NETLINK && protocol == 15) protocol = 0;
+    return f(domain, type, protocol);
+}
+int setrlimit(__rlimit_resource_t r, const struct rlimit *l) {
+    orig_setrlimit_t f = dlsym(RTLD_NEXT, "setrlimit");
+    int rc = f(r, l); return rc ? 0 : rc;
+}
+int setrlimit64(__rlimit_resource_t r, const struct rlimit64 *l) {
+    orig_setrlimit64_t f = dlsym(RTLD_NEXT, "setrlimit64");
+    int rc = f(r, l); return rc ? 0 : rc;
+}
+int prlimit(__pid_t p, enum __rlimit_resource r,
+            const struct rlimit *n, struct rlimit *o) {
+    orig_prlimit_t f = dlsym(RTLD_NEXT, "prlimit");
+    int rc = f(p, r, n, o); return rc ? 0 : rc;
+}
+EOF
+    gcc -shared -fPIC -o "${SHIM_SO}" "${src}" -ldl
+    rm -f "${src}"
+    log "Built shim: ${SHIM_SO}"
+}
+
+# ─── virtqemud ───────────────────────────────────────────────────────────────
+
+start_virtqemud() {
+    if [[ -S "${LIBVIRT_RUN}/libvirt/virtqemud-sock" ]]; then
+        if virsh_cmd list --all &>/dev/null; then
+            log "virtqemud already running"
+            return 0
+        fi
+    fi
+    mkdir -p "${LIBVIRT_RUN}/libvirt"
+    export XDG_RUNTIME_DIR="${LIBVIRT_RUN}"
+    LD_PRELOAD="${SHIM_SO}" virtqemud -d
+    for i in $(seq 1 15); do
+        sleep 1
+        virsh_cmd list --all &>/dev/null && { log "virtqemud started"; return 0; }
+    done
+    die "virtqemud failed to start"
+}
+
+# ─── Build bootc ─────────────────────────────────────────────────────────────
+
+build_bootc() {
+    if [[ "${NO_BUILD}" == true ]]; then
+        [[ -x "${BOOTC_BIN}" ]] || die "--no-build set but ${BOOTC_BIN} not found"
+        log "Using existing binary: ${BOOTC_BIN}"
+        return 0
+    fi
+
+    if [[ -x "${BOOTC_BIN}" ]]; then
+        log "Using existing binary: ${BOOTC_BIN}"
+        return 0
+    fi
+
+    log "Building bootc (profile=thin)…"
+
+    # Ensure cargo trusts the sandbox MITM proxy CA
+    local cargo_cfg="${REPO_DIR}/.cargo/config.toml"
+    grep -q "openshell-tls" "${cargo_cfg}" 2>/dev/null || cat >> "${cargo_cfg}" << 'CARGOCFG'
+
+[http]
+cainfo = "/etc/openshell-tls/ca-bundle.pem"
+
+[net]
+git-fetch-with-cli = true
+CARGOCFG
+
+    # Provide glib-2.0 and ostree-1 pkg-config metadata using libraries
+    # extracted from the quay.io/fedora/fedora-bootc:43 image (which ships the
+    # runtime .so files even though devel packages are absent).
+    local pkgdir="${WORK_DIR}/pkgconfig"
+    local libdir="${WORK_DIR}/glib-libs"
+    if [[ ! -f "${pkgdir}/ostree-1.pc" ]]; then
+        mkdir -p "${pkgdir}" "${libdir}"
+        local cid
+        cid=$(podman create quay.io/fedora/fedora-bootc:43)
+        for lib in libglib-2.0 libgobject-2.0 libgio-2.0 libgmodule-2.0 libgthread-2.0 libostree-1; do
+            local path
+            path=$(podman run --rm --entrypoint /bin/sh quay.io/fedora/fedora-bootc:43 \
+                -c "ls /usr/lib64/${lib}.so.* 2>/dev/null | grep -v hmac | head -1")
+            [[ -n "${path}" ]] && podman cp "${cid}:${path}" "${libdir}/" 2>/dev/null || true
+        done
+        podman rm "${cid}" >/dev/null
+
+        (cd "${libdir}" && for f in *.so.*; do
+            ln -sf "${f}" "${f%%.so.*}.so" 2>/dev/null || true
+            soname=$(objdump -p "${f}" 2>/dev/null | awk '/SONAME/{print $2}')
+            [[ -n "${soname}" ]] && ln -sf "${f}" "${soname}" 2>/dev/null || true
+        done)
+
+        glib_ver=$(podman run --rm --entrypoint /bin/sh quay.io/fedora/fedora-bootc:43 \
+            -c 'rpm -q --qf "%{VERSION}\n" glib2 2>/dev/null || echo "2.86.5"')
+        ostree_ver=$(podman run --rm --entrypoint /bin/sh quay.io/fedora/fedora-bootc:43 \
+            -c 'rpm -q --qf "%{VERSION}\n" ostree 2>/dev/null || echo "2026.1"')
+
+        for name in glib-2.0 gobject-2.0 gio-2.0 gmodule-2.0 gmodule-no-export-2.0; do
+            local libflag="-l${name%%-[0-9]*}-2.0"
+            local req=""
+            case "${name}" in gobject*) req="Requires: glib-2.0" ;;
+                gio*)    req="Requires: glib-2.0 gobject-2.0" ;;
+                gmodule*) req="Requires: glib-2.0" ;; esac
+            printf "prefix=%s\nlibdir=\${prefix}\nName: %s\nVersion: %s\n%s\nLibs: -L\${libdir} %s\nCflags:\n" \
+                "${libdir}" "${name}" "${glib_ver}" "${req}" "${libflag}" > "${pkgdir}/${name}.pc"
+        done
+
+        printf "prefix=%s\nlibdir=\${prefix}\nName: ostree-1\nVersion: %s\nRequires: glib-2.0 gobject-2.0 gio-2.0\nLibs: -L\${libdir} -lostree-1\nCflags:\n" \
+            "${libdir}" "${ostree_ver}" > "${pkgdir}/ostree-1.pc"
+    fi
+
+    # Use bundled zstd (not system pkg-config) so we don't need libzstd-devel
+    sed -i 's/zstd = { version = "[^"]*", features = \["pkg-config"\] }/zstd = { version = "0.13.1" }/' \
+        "${REPO_DIR}/crates/ostree-ext/Cargo.toml" 2>/dev/null || true
+
+    PKG_CONFIG_PATH="${pkgdir}" GOTOOLCHAIN=auto \
+        cargo build --manifest-path "${REPO_DIR}/Cargo.toml" --profile=thin -p bootc
+
+    [[ -x "${BOOTC_BIN}" ]] || die "Build failed — ${BOOTC_BIN} not found"
+    log "Built: ${BOOTC_BIN} ($(du -sh "${BOOTC_BIN}" | cut -f1))"
+}
+
+# ─── VM lifecycle ────────────────────────────────────────────────────────────
+
+create_cloud_init_iso() {
+    local ssh_pub_key
+    ssh_pub_key="$(cat "${SSH_KEY}.pub")"
+    local ci="${WORK_DIR}/ci"
+    mkdir -p "${ci}"
+
+    cat > "${ci}/meta-data" << EOF
+instance-id: ${VM_NAME}
+local-hostname: ${VM_NAME}
+EOF
+
+    cat > "${ci}/user-data" << EOF
+#cloud-config
+users:
+  - name: fedora
+    groups: wheel
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${ssh_pub_key}
+
+ssh_pwauth: false
+hostname: ${VM_NAME}
+
+runcmd:
+  - systemctl enable --now sshd
+EOF
+
+    xorriso -as mkisofs -output "${CLOUD_INIT_ISO}" \
+        -volid cidata -joliet -rock \
+        "${ci}/user-data" "${ci}/meta-data" 2>/dev/null
+    log "Cloud-init ISO: ${CLOUD_INIT_ISO}"
+}
+
+pull_disk() {
+    if [[ -f "${VM_DISK}" ]]; then
+        log "Reusing existing disk: ${VM_DISK}"
+        return 0
+    fi
+    log "Pulling ${CONTAINERDISK}…"
+    podman pull "${CONTAINERDISK}" 2>&1 | tail -3
+    local cid
+    cid=$(podman create "${CONTAINERDISK}")
+    podman export "${cid}" | tar -x -C "${WORK_DIR}/" disk/disk.img 2>/dev/null
+    podman rm "${cid}" >/dev/null
+    mv "${WORK_DIR}/disk/disk.img" "${VM_DISK}"
+    chmod 644 "${VM_DISK}"
+    log "Resizing disk to 20G…"
+    qemu-img resize "${VM_DISK}" 20G
+    # Pre-allocate the qcow2 file on the host filesystem so that QEMU never
+    # needs to call fallocate() to extend it during the conversion.  QEMU runs
+    # under its own seccomp sandbox (-sandbox on) that blocks fallocate; without
+    # pre-allocation, writing more than ~2 GB of new guest data causes QEMU to
+    # be killed by SIGSYS, crashing the VM mid-conversion.
+    log "Pre-allocating disk image to avoid QEMU seccomp fallocate crash…"
+    fallocate -l 20G "${VM_DISK}" 2>/dev/null || true
+}
+
+define_and_start_vm() {
+    virsh_cmd destroy  "${VM_NAME}" 2>/dev/null || true
+    virsh_cmd undefine "${VM_NAME}" 2>/dev/null || true
+
+    cat > "${WORK_DIR}/vm.xml" << EOF
+<domain type="kvm">
+  <name>${VM_NAME}</name>
+  <memory unit="MiB">${VM_MEMORY}</memory>
+  <vcpu>${VM_VCPUS}</vcpu>
+  <os>
+    <type arch="x86_64" machine="q35">hvm</type>
+    <boot dev="hd"/>
+  </os>
+  <features><acpi/><apic/></features>
+  <cpu mode="host-passthrough"/>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <disk type="file" device="disk">
+      <driver name="qemu" type="qcow2"/>
+      <source file="${VM_DISK}"/>
+      <target dev="vda" bus="virtio"/>
+    </disk>
+    <disk type="file" device="cdrom">
+      <driver name="qemu" type="raw"/>
+      <source file="${CLOUD_INIT_ISO}"/>
+      <target dev="sda" bus="sata"/>
+      <readonly/>
+    </disk>
+    <interface type="user">
+      <model type="virtio"/>
+    </interface>
+    <console type="pty">
+      <target type="serial" port="0"/>
+    </console>
+    <memballoon model="virtio"/>
+    <rng model="virtio">
+      <backend model="random">/dev/urandom</backend>
+    </rng>
+    <!-- Disable watchdog reset so heavy I/O during tar/buildah does not
+         trigger the iTCO watchdog that q35 includes by default.  Without
+         this, systemd's watchdog ping is delayed by the I/O burst and the
+         VM reboots mid-conversion. -->
+    <watchdog model='itco' action='none'/>
+  </devices>
+</domain>
+EOF
+
+    virsh_cmd define "${WORK_DIR}/vm.xml"
+    virsh_cmd start  "${VM_NAME}"
+    sleep 2
+    add_ssh_forward
+}
+
+# ─── Cleanup ─────────────────────────────────────────────────────────────────
+
+cleanup() {
+    if [[ "${KEEP_VM}" == true ]]; then
+        log "Keeping VM (--keep):"
+        log "  ssh -i ${SSH_KEY} -p ${SSH_PORT} ${SSH_OPTS} fedora@127.0.0.1"
+        log "  Virsh URI: ${VIRSH_URI}"
+        return
+    fi
+    log "Cleaning up…"
+    virsh_cmd destroy  "${VM_NAME}" 2>/dev/null || true
+    virsh_cmd undefine "${VM_NAME}" 2>/dev/null || true
+    rm -rf "${WORK_DIR}"
+}
+
+# ─── Test phases ─────────────────────────────────────────────────────────────
+
+phase_setup() {
+    log "=== Phase: Setup ==="
+    mkdir -p "${WORK_DIR}"
+
+    for arg in "$@"; do
+        case "${arg}" in
+            --keep)     KEEP_VM=true ;;
+            --no-build) NO_BUILD=true ;;
+        esac
+    done
+
+    for cmd in virsh qemu-img xorriso podman ssh scp; do
+        command -v "${cmd}" >/dev/null || die "${cmd} not found in PATH"
+    done
+
+    build_shim
+    start_virtqemud
+    build_bootc
+
+    rm -f "${SSH_KEY}" "${SSH_KEY}.pub"
+    ssh-keygen -t ed25519 -f "${SSH_KEY}" -N "" -q 2>/dev/null || true
+    pull_disk
+    create_cloud_init_iso
+}
+
+phase_create_vm() {
+    log "=== Phase: Create package-mode Fedora 44 VM ==="
+
+    check "VM definition and boot"
+    define_and_start_vm
+    pass
+
+    check "VM is reachable via SSH"
+    if wait_for_ssh "${TIMEOUT_BOOT}"; then
+        pass
+    else
+        fail "SSH not reachable within ${TIMEOUT_BOOT}s"
+        die "Cannot proceed without SSH"
+    fi
+
+    check "VM is Fedora 44 (package mode)"
+    local rel
+    rel="$(ssh_vm 'cat /etc/fedora-release' 2>/dev/null)"
+    if echo "${rel}" | grep -qE "Fedora release 44"; then
+        log "  ${rel}"
+        pass
+    else
+        fail "Expected 'Fedora release 44', got: ${rel}"
+    fi
+
+    check "VM does not yet have an ostree deployment"
+    if ssh_vm 'test -d /sysroot/ostree || test -d /ostree/deploy' 2>/dev/null; then
+        fail "Ostree dirs already present — not a fresh package-mode system"
+    else
+        pass
+    fi
+}
+
+phase_prepare_vm() {
+    log "=== Phase: Prepare VM ==="
+
+    check "Install buildah, ostree, skopeo, bootupctl in VM"
+    # The sandbox proxy blocks Fedora package mirrors (policy_denied), so we cannot
+    # use dnf to install packages. Instead, extract the binaries directly from
+    # OCI container images (which ARE accessible via the proxy) and copy them
+    # into the VM via SCP.
+    #
+    # Fedora 44 Cloud image comes with: podman, dracut, grub2-tools
+    # We need to add from container images:
+    #   buildah      → quay.io/buildah/stable:latest
+    #   ostree       → quay.io/fedora/fedora-bootc:44
+    #   skopeo       → quay.io/fedora/fedora-bootc:44
+    #   libostree    → quay.io/fedora/fedora-bootc:44
+    #   bootupctl    → quay.io/fedora/fedora-bootc:44  (required by bootc install)
+    #   bootupd data → quay.io/fedora/fedora-bootc:44  (usr/lib/bootupd/updates)
+    #   ostree-prepare-root → quay.io/fedora/fedora-bootc:44
+    #   dracut 50ostree module → quay.io/fedora/fedora-bootc:44
+
+    local tools_dir
+    tools_dir="$(mktemp -d /tmp/bootc-vm-tools-XXXXXX)"
+
+    log "  Extracting buildah from quay.io/buildah/stable…"
+    local buildah_cid
+    buildah_cid=$(podman create quay.io/buildah/stable:latest 2>/dev/null) || \
+        { fail "Cannot create buildah container"; die "buildah extraction failed"; }
+    podman cp "${buildah_cid}:/usr/bin/buildah" "${tools_dir}/buildah" 2>/dev/null
+    podman rm "${buildah_cid}" >/dev/null 2>&1
+
+    log "  Extracting ostree, skopeo, bootupctl and ostree-related files from quay.io/fedora/fedora-bootc:44…"
+    local fedora_cid
+    fedora_cid=$(podman create quay.io/fedora/fedora-bootc:44 2>/dev/null) || \
+        { fail "Cannot create fedora-bootc container"; die "fedora extraction failed"; }
+    # Core binaries
+    podman cp "${fedora_cid}:/usr/sbin/ostree"   "${tools_dir}/ostree"   2>/dev/null || true
+    podman cp "${fedora_cid}:/usr/sbin/skopeo"   "${tools_dir}/skopeo"   2>/dev/null || true
+    podman cp "${fedora_cid}:/usr/sbin/bootupctl" "${tools_dir}/bootupctl" 2>/dev/null || true
+    # libostree shared library
+    podman cp "${fedora_cid}:/usr/lib64/libostree-1.so.1.0.0" \
+              "${tools_dir}/libostree-1.so.1.0.0" 2>/dev/null || true
+    # ostree-prepare-root and prepare-root.conf (needed by dracut ostree module)
+    podman cp "${fedora_cid}:/usr/lib/ostree/ostree-prepare-root" \
+              "${tools_dir}/ostree-prepare-root" 2>/dev/null || true
+    podman cp "${fedora_cid}:/usr/lib/ostree/prepare-root.conf" \
+              "${tools_dir}/prepare-root.conf" 2>/dev/null || true
+    podman cp "${fedora_cid}:/usr/lib/systemd/system/ostree-prepare-root.service" \
+              "${tools_dir}/ostree-prepare-root.service" 2>/dev/null || true
+    # Dracut ostree module (so dracut --add ostree works)
+    mkdir -p "${tools_dir}/dracut-50ostree"
+    podman cp "${fedora_cid}:/usr/lib/dracut/modules.d/50ostree/module-setup.sh" \
+              "${tools_dir}/dracut-50ostree/module-setup.sh" 2>/dev/null || true
+    # bootupd data (bootupd/updates needed by bootupctl backend install)
+    podman cp "${fedora_cid}:/usr/lib/bootupd" "${tools_dir}/bootupd" 2>/dev/null || true
+    podman rm "${fedora_cid}" >/dev/null 2>&1
+
+    # Check we got all the tools
+    local missing=""
+    for t in buildah ostree skopeo libostree-1.so.1.0.0 bootupctl ostree-prepare-root \
+              "dracut-50ostree/module-setup.sh" bootupd; do
+        [[ -e "${tools_dir}/${t}" ]] || missing="${missing} ${t}"
+    done
+    if [[ -n "${missing}" ]]; then
+        rm -rf "${tools_dir}"
+        fail "Missing extracted tools:${missing}"
+        die "Tool extraction failed"
+    fi
+
+    # Copy tools to VM
+    log "  Copying tools to VM…"
+    scp ${SSH_OPTS} -i "${SSH_KEY}" -P "${SSH_PORT}" \
+        "${tools_dir}/buildah" "${tools_dir}/ostree" \
+        "${tools_dir}/skopeo" "${tools_dir}/libostree-1.so.1.0.0" \
+        "${tools_dir}/bootupctl" \
+        "${tools_dir}/ostree-prepare-root" \
+        "${tools_dir}/prepare-root.conf" \
+        "${tools_dir}/ostree-prepare-root.service" \
+        "fedora@127.0.0.1:/tmp/"
+    scp ${SSH_OPTS} -i "${SSH_KEY}" -P "${SSH_PORT}" \
+        "${tools_dir}/dracut-50ostree/module-setup.sh" \
+        "fedora@127.0.0.1:/tmp/dracut-module-setup.sh"
+    tar -czf "${tools_dir}/bootupd.tar.gz" -C "${tools_dir}" bootupd
+    scp ${SSH_OPTS} -i "${SSH_KEY}" -P "${SSH_PORT}" \
+        "${tools_dir}/bootupd.tar.gz" \
+        "fedora@127.0.0.1:/tmp/"
+    rm -rf "${tools_dir}"
+
+    ssh_vm 'sudo bash -s' << 'REMOTE'
+set -eo pipefail
+KVER=$(uname -r)
+
+echo "=== Disabling hardware watchdog (prevents VM reset during heavy I/O) ==="
+# The q35 machine type includes an iTCO hardware watchdog that systemd feeds
+# via systemd-watchdog.  During the tar/buildah phase of bootc conversion,
+# I/O pressure delays systemd's watchdog ping, causing the hardware watchdog
+# to fire and reset the VM.  Disabling it prevents spurious mid-conversion reboots.
+systemctl stop systemd-watchdog 2>/dev/null || true
+systemctl mask systemd-watchdog 2>/dev/null || true
+# Also disable the i6300esb and iTCO watchdog kernel modules if loaded
+modprobe -r iTCO_wdt 2>/dev/null || true
+
+echo "=== Installing binaries ==="
+install -m 0755 /tmp/buildah /usr/local/bin/buildah
+install -m 0755 /tmp/ostree  /usr/sbin/ostree
+install -m 0755 /tmp/skopeo  /usr/sbin/skopeo
+install -m 0755 /tmp/bootupctl /usr/sbin/bootupctl
+install -m 0755 /tmp/libostree-1.so.1.0.0 /usr/lib64/libostree-1.so.1.0.0
+ln -sf libostree-1.so.1.0.0 /usr/lib64/libostree-1.so.1
+ldconfig
+
+echo "=== Installing ostree-prepare-root (required for dracut ostree module) ==="
+mkdir -p /usr/lib/ostree
+install -m 0755 /tmp/ostree-prepare-root /usr/lib/ostree/ostree-prepare-root
+install -m 0644 /tmp/prepare-root.conf /usr/lib/ostree/prepare-root.conf
+install -m 0644 /tmp/ostree-prepare-root.service /usr/lib/systemd/system/ostree-prepare-root.service
+
+echo "=== Installing dracut ostree module ==="
+mkdir -p /usr/lib/dracut/modules.d/50ostree
+install -m 0755 /tmp/dracut-module-setup.sh \
+    /usr/lib/dracut/modules.d/50ostree/module-setup.sh
+
+echo "=== Installing bootupd data ==="
+tar -xzf /tmp/bootupd.tar.gz -C /tmp/
+mkdir -p /usr/lib/bootupd
+cp -r /tmp/bootupd/* /usr/lib/bootupd/
+
+echo "=== Configuring containers storage to use vfs driver ==="
+# On Fedora 44 with btrfs, the default overlay-on-btrfs storage driver
+# triggers a kernel panic when buildah unpacks a large tar archive via
+# buildah add.  The VFS driver avoids overlayfs entirely and is safe on
+# all filesystem types; we accept the extra disk usage (each layer is a
+# full copy rather than a delta) because we only create a single image.
+# Both buildah and podman share this configuration through the common
+# /etc/containers/storage.conf.
+cat > /etc/containers/storage.conf << 'STORAGECFG'
+[storage]
+driver = "vfs"
+graphroot = "/var/lib/containers/storage"
+runroot = "/run/containers/storage"
+STORAGECFG
+
+echo "=== Generating initramfs with ostree module ==="
+# The Fedora 44 cloud image has no initramfs at /boot/ (cloud image optimization).
+# We must generate one before bootc can run (bootc requires it to copy into the snapshot).
+# Using --add ostree ensures ostree-prepare-root and all its deps are included,
+# which is critical for the VM to boot into the ostree deployment after conversion.
+dracut --no-hostonly --add ostree --force \
+    /boot/initramfs-${KVER}.img ${KVER} 2>&1 | (grep -v "^$" || true) | tail -5
+
+echo "=== Updating GRUB core.img with BLS support ==="
+# The original Fedora 44 cloud GRUB (in the BIOS Boot partition) was built without
+# the blscfg module, so it cannot load the Boot Loader Spec entries that ostree/bootc
+# creates during installation. Run grub2-install to embed a new core.img that includes
+# blscfg and can read the ostree BLS entries.
+# /dev/vda is the disk device; the BIOS Boot partition (GPT type 21686148...) is
+# automatically detected by grub2-install.
+grub2-install --target=i386-pc /dev/vda 2>&1 | tail -5
+
+echo "=== Sanity checks ==="
+buildah --version | head -1
+ostree --version | head -1
+skopeo --version | head -1
+bootupctl --version
+ls -lh /boot/initramfs-${KVER}.img
+ls /usr/lib/dracut/modules.d/50ostree/
+ls /usr/lib/bootupd/updates/
+REMOTE
+    local rc=$?
+    if [[ ${rc} -eq 0 ]]; then
+        pass
+    else
+        fail "VM preparation failed (exit ${rc})"
+        die "Required tools/files missing in VM"
+    fi
+
+    check "Copy bootc binary to VM"
+    scp_to_vm "${BOOTC_BIN}" "/tmp/bootc"
+    ssh_vm 'sudo install -m 0755 /tmp/bootc /usr/local/bin/bootc'
+    pass
+
+    check "bootc binary is functional in VM"
+    local ver
+    ver="$(ssh_vm 'bootc --version' 2>/dev/null)"
+    if [[ -n "${ver}" ]]; then
+        log "  ${ver}"
+        pass
+    else
+        fail "bootc --version returned nothing"
+        die "bootc not functional in VM"
+    fi
+
+    check "from-existing-root subcommand is present"
+    if ssh_vm 'bootc install from-existing-root --help' 2>/dev/null | grep -q "skip-push"; then
+        pass
+    else
+        fail "--skip-push flag not found in from-existing-root help"
+    fi
+}
+
+phase_convert() {
+    log "=== Phase: bootc install from-existing-root ==="
+
+    check "from-existing-root converts the system"
+    log "Running bootc install from-existing-root (may take several minutes)…"
+    local out rc
+    out="$(ssh_vm "sudo bootc install from-existing-root \
+        --skip-push \
+        --image-ref '${IMAGE_REF}' \
+        --acknowledge-destructive" 2>&1)" ; rc=$?
+    echo "${out}" | sed 's/^/    /'
+    if [[ ${rc} -eq 0 ]]; then
+        pass
+    else
+        fail "Exit code ${rc}"
+        die "Conversion failed"
+    fi
+}
+
+phase_reboot_and_validate() {
+    log "=== Phase: Reboot and validate bootc system ==="
+
+    check "VM reboots after conversion"
+    ssh_vm 'sudo reboot' 2>/dev/null || true
+    sleep 10
+
+    # Re-add the port forward; QEMU may have dropped it on its side
+    add_ssh_forward 2>/dev/null || true
+
+    if wait_for_ssh "${TIMEOUT_REBOOT}"; then
+        pass
+    else
+        fail "VM did not come back within ${TIMEOUT_REBOOT}s"
+        die "Cannot validate post-reboot state"
+    fi
+
+    add_ssh_forward 2>/dev/null || true
+
+    check "/sysroot/ostree exists (bootc deployment present)"
+    if ssh_vm 'test -d /sysroot/ostree' 2>/dev/null; then
+        pass
+    else
+        fail "/sysroot/ostree not found"
+    fi
+
+    check "bootc status reports a booted image"
+    local status
+    status="$(ssh_vm 'sudo bootc status 2>&1')"
+    log "bootc status:"
+    echo "${status}" | sed 's/^/    /'
+    if echo "${status}" | grep -qE "image:|booted:"; then
+        pass
+    else
+        fail "bootc status missing 'image:' or 'booted:'"
+    fi
+
+    check "bootc status references the snapshot image"
+    if echo "${status}" | grep -q "bootc-snapshot"; then
+        pass
+    else
+        fail "Expected 'bootc-snapshot' in bootc status"
+    fi
+
+    check "System still identifies as Fedora after conversion"
+    local rel
+    rel="$(ssh_vm 'cat /etc/fedora-release' 2>/dev/null)"
+    if echo "${rel}" | grep -q "Fedora"; then
+        log "  ${rel}"
+        pass
+    else
+        fail "Cannot read /etc/fedora-release after reboot"
+    fi
+}
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+main() {
+    echo "══════════════════════════════════════════════════════"
+    echo " bootc install from-existing-root — integration test"
+    echo "══════════════════════════════════════════════════════"
+    echo ""
+
+    trap cleanup EXIT
+
+    phase_setup "$@"
+    phase_create_vm
+    phase_prepare_vm
+    phase_convert
+    phase_reboot_and_validate
+
+    summary
+}
+
+main "$@"
