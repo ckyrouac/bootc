@@ -1,2 +1,8 @@
 [alias]
 xtask = "run --package xtask --"
+
+[http]
+cainfo = "/etc/openshell-tls/ca-bundle.pem"
+
+[net]
+git-fetch-with-cli = true
