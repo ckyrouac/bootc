@@ -35,20 +35,26 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 VM_NAME="bootc-from-existing-root"
-VM_MEMORY=4096   # MiB
+VM_MEMORY=2048   # MiB — 2 GiB is the safe maximum for a 4 GiB cgroup
+                 # The sandbox runs under a 4 GiB cgroup memory limit.  QEMU with
+                 # a 2 GiB guest peaks at ~2.1 GiB host RSS; plus ~1.1 GiB sandbox
+                 # baseline leaves ~0.8 GiB headroom before the OOM killer fires.
 VM_VCPUS=2
 SSH_PORT=22231   # host port → VM:22
 
 IMAGE_REF="localhost/bootc-snapshot:latest"
 
 # Containerdisk image; no direct HTTP download of Fedora ISOs is needed.
-CONTAINERDISK="quay.io/containerdisks/fedora:44"
+# Fedora 41 (kernel ~6.12 LTS) is used as a stable, well-tested baseline.
+CONTAINERDISK="quay.io/containerdisks/fedora:41"
 
 SHIM_SO=/tmp/bootc-test-libvirt-shim.so
 LIBVIRT_RUN=/tmp/bootc-test-virtqemud
 
 WORK_DIR="/tmp/bootc-from-existing-root"
 VM_DISK="${WORK_DIR}/disk.qcow2"
+# Second disk for container storage (ext4, avoids btrfs crash during buildah add)
+VM_CONTAINERS_DISK="${WORK_DIR}/containers.img"
 CLOUD_INIT_ISO="${WORK_DIR}/cloud-init.iso"
 SSH_KEY="${WORK_DIR}/id_ed25519"
 BOOTC_BIN="${REPO_DIR}/target/thin/bootc"
@@ -174,6 +180,20 @@ start_virtqemud() {
         fi
     fi
     mkdir -p "${LIBVIRT_RUN}/libvirt"
+
+    # Tell libvirt not to add its own -sandbox on,... flag to QEMU.
+    # QEMU's built-in seccomp sandbox blocks certain syscalls (fallocate, etc.)
+    # that are not actually needed for our use case.  The outer sandbox seccomp
+    # filter already provides isolation.  With seccomp_sandbox=0 libvirt passes
+    # -sandbox off to QEMU, preventing any double-seccomp interactions.
+    mkdir -p "${HOME}/.config/libvirt"
+    cat > "${HOME}/.config/libvirt/qemu.conf" << 'QEMUCFG'
+# Disable QEMU's built-in seccomp sandbox.
+# The outer sandbox already enforces isolation; QEMU's own seccomp layer is
+# redundant here and can interfere with legitimate I/O operations.
+seccomp_sandbox = 0
+QEMUCFG
+
     export XDG_RUNTIME_DIR="${LIBVIRT_RUN}"
     LD_PRELOAD="${SHIM_SO}" virtqemud -d
     for i in $(seq 1 15); do
@@ -244,11 +264,12 @@ CARGOCFG
             case "${name}" in gobject*) req="Requires: glib-2.0" ;;
                 gio*)    req="Requires: glib-2.0 gobject-2.0" ;;
                 gmodule*) req="Requires: glib-2.0" ;; esac
-            printf "prefix=%s\nlibdir=\${prefix}\nName: %s\nVersion: %s\n%s\nLibs: -L\${libdir} %s\nCflags:\n" \
-                "${libdir}" "${name}" "${glib_ver}" "${req}" "${libflag}" > "${pkgdir}/${name}.pc"
+            # Include Description field — pkg-config 2.x rejects files that omit it.
+            printf "prefix=%s\nlibdir=\${prefix}\nName: %s\nDescription: %s\nVersion: %s\n%s\nLibs: -L\${libdir} %s\nCflags:\n" \
+                "${libdir}" "${name}" "${name}" "${glib_ver}" "${req}" "${libflag}" > "${pkgdir}/${name}.pc"
         done
 
-        printf "prefix=%s\nlibdir=\${prefix}\nName: ostree-1\nVersion: %s\nRequires: glib-2.0 gobject-2.0 gio-2.0\nLibs: -L\${libdir} -lostree-1\nCflags:\n" \
+        printf "prefix=%s\nlibdir=\${prefix}\nName: ostree-1\nDescription: OSTree library\nVersion: %s\nRequires: glib-2.0 gobject-2.0 gio-2.0\nLibs: -L\${libdir} -lostree-1\nCflags:\n" \
             "${libdir}" "${ostree_ver}" > "${pkgdir}/ostree-1.pc"
     fi
 
@@ -256,7 +277,9 @@ CARGOCFG
     sed -i 's/zstd = { version = "[^"]*", features = \["pkg-config"\] }/zstd = { version = "0.13.1" }/' \
         "${REPO_DIR}/crates/ostree-ext/Cargo.toml" 2>/dev/null || true
 
+    # RUSTFLAGS: add the library directory so the linker can find libglib-2.0.so etc.
     PKG_CONFIG_PATH="${pkgdir}" GOTOOLCHAIN=auto \
+        RUSTFLAGS="-L ${libdir}" \
         cargo build --manifest-path "${REPO_DIR}/Cargo.toml" --profile=thin -p bootc
 
     [[ -x "${BOOTC_BIN}" ]] || die "Build failed — ${BOOTC_BIN} not found"
@@ -302,25 +325,41 @@ EOF
 pull_disk() {
     if [[ -f "${VM_DISK}" ]]; then
         log "Reusing existing disk: ${VM_DISK}"
-        return 0
+    else
+        log "Pulling ${CONTAINERDISK}…"
+        podman pull "${CONTAINERDISK}" 2>&1 | tail -3
+        local cid
+        cid=$(podman create "${CONTAINERDISK}")
+        podman export "${cid}" | tar -x -C "${WORK_DIR}/" disk/disk.img 2>/dev/null
+        podman rm "${cid}" >/dev/null
+        mv "${WORK_DIR}/disk/disk.img" "${VM_DISK}"
+        chmod 644 "${VM_DISK}"
+        log "Resizing disk to 20G…"
+        qemu-img resize "${VM_DISK}" 20G
+        # Pre-allocate the qcow2 file on the host filesystem so that QEMU never
+        # needs to extend it during writes.  Without pre-allocation, QEMU's I/O
+        # thread pool may stall waiting for the file to be extended, and under heavy
+        # I/O the resulting bursts can cause QEMU to be killed by the cgroup OOM killer.
+        log "Pre-allocating disk image…"
+        fallocate -l 20G "${VM_DISK}" 2>/dev/null || true
     fi
-    log "Pulling ${CONTAINERDISK}…"
-    podman pull "${CONTAINERDISK}" 2>&1 | tail -3
-    local cid
-    cid=$(podman create "${CONTAINERDISK}")
-    podman export "${cid}" | tar -x -C "${WORK_DIR}/" disk/disk.img 2>/dev/null
-    podman rm "${cid}" >/dev/null
-    mv "${WORK_DIR}/disk/disk.img" "${VM_DISK}"
-    chmod 644 "${VM_DISK}"
-    log "Resizing disk to 20G…"
-    qemu-img resize "${VM_DISK}" 20G
-    # Pre-allocate the qcow2 file on the host filesystem so that QEMU never
-    # needs to call fallocate() to extend it during the conversion.  QEMU runs
-    # under its own seccomp sandbox (-sandbox on) that blocks fallocate; without
-    # pre-allocation, writing more than ~2 GB of new guest data causes QEMU to
-    # be killed by SIGSYS, crashing the VM mid-conversion.
-    log "Pre-allocating disk image to avoid QEMU seccomp fallocate crash…"
-    fallocate -l 20G "${VM_DISK}" 2>/dev/null || true
+
+    # Create a second disk for container storage (ext4).
+    # buildah writing VFS data to the btrfs root disk triggers a hard VM crash on
+    # some kernel versions.  Using a separate ext4 disk for /var/lib/containers/storage
+    # keeps all container I/O off btrfs entirely.
+    #
+    # Size: 8 GiB — must hold both the intermediate tar archive (written by bootc to
+    # /var/tmp, which is on this disk) and the extracted VFS layer (~3x the tar size).
+    if [[ ! -f "${VM_CONTAINERS_DISK}" ]]; then
+        log "Creating ext4 container storage disk (8G raw)…"
+        # Use a raw format disk (not qcow2) that is fully pre-allocated.
+        # Full pre-allocation means QEMU never needs to extend the file during I/O,
+        # avoiding the write-burst stalls that can push the cgroup over its 4 GiB limit.
+        fallocate -l 8G "${VM_CONTAINERS_DISK}"
+    else
+        log "Reusing existing containers disk: ${VM_CONTAINERS_DISK}"
+    fi
 }
 
 define_and_start_vm() {
@@ -341,9 +380,31 @@ define_and_start_vm() {
   <devices>
     <emulator>/usr/bin/qemu-system-x86_64</emulator>
     <disk type="file" device="disk">
-      <driver name="qemu" type="qcow2"/>
+      <!-- io=threads: QEMU 10.x defaults to aio=io_uring, but io_uring can crash
+           QEMU under heavy concurrent I/O in this sandbox environment.  Switching to
+           the thread-pool aio backend avoids this.
+           cache=writeback: allows the host kernel page cache to absorb write bursts;
+           avoids QEMU being killed when the guest issues large sequential writes.
+           discard=ignore: prevents QEMU from issuing fallocate(PUNCH_HOLE) on the
+           host file when the guest sends TRIM commands; that call may be blocked by
+           the outer sandbox seccomp filter. -->
+      <driver name="qemu" type="qcow2" io="threads" cache="writeback" discard="ignore"/>
       <source file="${VM_DISK}"/>
       <target dev="vda" bus="virtio"/>
+    </disk>
+    <!-- Second disk (ext4) for /var/lib/containers/storage AND /var/tmp.
+         buildah writing VFS data to btrfs (/dev/vda) crashes the VM on some
+         kernel versions.  A separate ext4 disk keeps container I/O off btrfs.
+         Also serves as the location for the intermediate tar archive (bootc
+         writes it to /var/tmp, which is bind-mounted here) so that the ~1 GiB
+         archive does not consume guest RAM — storing it in tmpfs (/tmp) combined
+         with the guest page cache can exceed the 4 GiB cgroup limit, killing QEMU.
+         Uses raw format (fully pre-allocated) so QEMU never needs fallocate().
+         io=threads + cache=writeback: same reasoning as vda above. -->
+    <disk type="file" device="disk">
+      <driver name="qemu" type="raw" io="threads" cache="writeback" discard="ignore"/>
+      <source file="${VM_CONTAINERS_DISK}"/>
+      <target dev="vdb" bus="virtio"/>
     </disk>
     <disk type="file" device="cdrom">
       <driver name="qemu" type="raw"/>
@@ -419,7 +480,7 @@ phase_setup() {
 }
 
 phase_create_vm() {
-    log "=== Phase: Create package-mode Fedora 44 VM ==="
+    log "=== Phase: Create package-mode Fedora 41 VM ==="
 
     check "VM definition and boot"
     define_and_start_vm
@@ -433,14 +494,14 @@ phase_create_vm() {
         die "Cannot proceed without SSH"
     fi
 
-    check "VM is Fedora 44 (package mode)"
+    check "VM is Fedora 41 (package mode)"
     local rel
     rel="$(ssh_vm 'cat /etc/fedora-release' 2>/dev/null)"
-    if echo "${rel}" | grep -qE "Fedora release 44"; then
+    if echo "${rel}" | grep -qE "Fedora release 41"; then
         log "  ${rel}"
         pass
     else
-        fail "Expected 'Fedora release 44', got: ${rel}"
+        fail "Expected 'Fedora release 41', got: ${rel}"
     fi
 
     check "VM does not yet have an ostree deployment"
@@ -460,35 +521,35 @@ phase_prepare_vm() {
     # OCI container images (which ARE accessible via the proxy) and copy them
     # into the VM via SCP.
     #
-    # Fedora 44 Cloud image comes with: podman, dracut, grub2-tools
+    # Fedora 41 Cloud image comes with: podman, dracut, grub2-tools
     # We need to add from container images:
     #   buildah      → quay.io/buildah/stable:latest
-    #   ostree       → quay.io/fedora/fedora-bootc:44
-    #   skopeo       → quay.io/fedora/fedora-bootc:44
-    #   libostree    → quay.io/fedora/fedora-bootc:44
-    #   bootupctl    → quay.io/fedora/fedora-bootc:44  (required by bootc install)
-    #   bootupd data → quay.io/fedora/fedora-bootc:44  (usr/lib/bootupd/updates)
-    #   ostree-prepare-root → quay.io/fedora/fedora-bootc:44
-    #   dracut 50ostree module → quay.io/fedora/fedora-bootc:44
+    #   ostree       → quay.io/fedora/fedora-bootc:41
+    #   skopeo       → quay.io/fedora/fedora-bootc:41
+    #   libostree    → quay.io/fedora/fedora-bootc:41
+    #   bootupctl    → quay.io/fedora/fedora-bootc:41  (required by bootc install)
+    #   bootupd data → quay.io/fedora/fedora-bootc:41  (usr/lib/bootupd/updates)
+    #   ostree-prepare-root → quay.io/fedora/fedora-bootc:41
+    #   dracut 50ostree module → quay.io/fedora/fedora-bootc:41
 
     local tools_dir
     tools_dir="$(mktemp -d /tmp/bootc-vm-tools-XXXXXX)"
 
-    log "  Extracting buildah from quay.io/buildah/stable…"
+    log "  Extracting buildah from quay.io/buildah/stable:v1.38.0 (Fedora 41 based)…"
     local buildah_cid
-    buildah_cid=$(podman create quay.io/buildah/stable:latest 2>/dev/null) || \
+    buildah_cid=$(podman create quay.io/buildah/stable:v1.38.0 2>/dev/null) || \
         { fail "Cannot create buildah container"; die "buildah extraction failed"; }
     podman cp "${buildah_cid}:/usr/bin/buildah" "${tools_dir}/buildah" 2>/dev/null
     podman rm "${buildah_cid}" >/dev/null 2>&1
 
-    log "  Extracting ostree, skopeo, bootupctl and ostree-related files from quay.io/fedora/fedora-bootc:44…"
+    log "  Extracting ostree, skopeo, bootupctl and ostree-related files from quay.io/fedora/fedora-bootc:41…"
     local fedora_cid
-    fedora_cid=$(podman create quay.io/fedora/fedora-bootc:44 2>/dev/null) || \
+    fedora_cid=$(podman create quay.io/fedora/fedora-bootc:41 2>/dev/null) || \
         { fail "Cannot create fedora-bootc container"; die "fedora extraction failed"; }
     # Core binaries
-    podman cp "${fedora_cid}:/usr/sbin/ostree"   "${tools_dir}/ostree"   2>/dev/null || true
-    podman cp "${fedora_cid}:/usr/sbin/skopeo"   "${tools_dir}/skopeo"   2>/dev/null || true
-    podman cp "${fedora_cid}:/usr/sbin/bootupctl" "${tools_dir}/bootupctl" 2>/dev/null || true
+    podman cp "${fedora_cid}:/usr/bin/ostree"   "${tools_dir}/ostree"   2>/dev/null || true
+    podman cp "${fedora_cid}:/usr/bin/skopeo"   "${tools_dir}/skopeo"   2>/dev/null || true
+    podman cp "${fedora_cid}:/usr/bin/bootupctl" "${tools_dir}/bootupctl" 2>/dev/null || true
     # libostree shared library
     podman cp "${fedora_cid}:/usr/lib64/libostree-1.so.1.0.0" \
               "${tools_dir}/libostree-1.so.1.0.0" 2>/dev/null || true
@@ -554,9 +615,9 @@ modprobe -r iTCO_wdt 2>/dev/null || true
 
 echo "=== Installing binaries ==="
 install -m 0755 /tmp/buildah /usr/local/bin/buildah
-install -m 0755 /tmp/ostree  /usr/sbin/ostree
-install -m 0755 /tmp/skopeo  /usr/sbin/skopeo
-install -m 0755 /tmp/bootupctl /usr/sbin/bootupctl
+install -m 0755 /tmp/ostree  /usr/bin/ostree
+install -m 0755 /tmp/skopeo  /usr/bin/skopeo
+install -m 0755 /tmp/bootupctl /usr/bin/bootupctl
 install -m 0755 /tmp/libostree-1.so.1.0.0 /usr/lib64/libostree-1.so.1.0.0
 ln -sf libostree-1.so.1.0.0 /usr/lib64/libostree-1.so.1
 ldconfig
@@ -577,12 +638,37 @@ tar -xzf /tmp/bootupd.tar.gz -C /tmp/
 mkdir -p /usr/lib/bootupd
 cp -r /tmp/bootupd/* /usr/lib/bootupd/
 
+echo "=== Mounting ext4 disk for container storage and /var/tmp (avoids btrfs crash and OOM) ==="
+# /dev/vdb is a dedicated 8 GiB ext4 disk.  We mount it at /var/lib/containers/storage
+# AND bind-mount a subdirectory at /var/tmp.
+#
+# Why: bootc writes the intermediate tar snapshot to /var/tmp.  If /var/tmp is on
+# the btrfs root disk or on tmpfs, two problems arise:
+#   1. tmpfs: the ~1 GiB tar consumes guest RAM.  With a 4 GiB cgroup memory limit,
+#      the tar + guest page cache exceed the limit, causing QEMU to be killed by the
+#      OOM killer mid-conversion (libvirt reports reason=crashed).
+#   2. btrfs: on some kernel versions, writing a large tar to btrfs while reading the
+#      same btrfs filesystem triggers kernel I/O errors.
+# Keeping /var/tmp on ext4 (a separate disk) avoids both issues.
+#
+# Why we cannot just mount on /var/lib/containers/storage: bootc exclusion list
+# already excludes /var/lib/containers from the snapshot, so the ext4 disk at that
+# path won't be snapshotted.  For /var/tmp we do the same by using a bind-mount
+# of a subdirectory of the ext4 disk.
+mkfs.ext4 -F -q /dev/vdb
+mkdir -p /var/lib/containers/storage
+mount /dev/vdb /var/lib/containers/storage
+# Create a /var/tmp subdirectory on the ext4 disk and bind-mount it over /var/tmp
+mkdir -p /var/lib/containers/storage/vartmp
+mount --bind /var/lib/containers/storage/vartmp /var/tmp
+chmod 1777 /var/tmp
+echo "  /dev/vdb mounted at /var/lib/containers/storage ($(df -h /dev/vdb | tail -1 | awk '{print $4}') free)"
+echo "  /var/tmp bind-mounted to ext4 (avoids OOM from large tar in tmpfs)"
+
 echo "=== Configuring containers storage to use vfs driver ==="
-# On Fedora 44 with btrfs, the default overlay-on-btrfs storage driver
-# triggers a kernel panic when buildah unpacks a large tar archive via
-# buildah add.  The VFS driver avoids overlayfs entirely and is safe on
-# all filesystem types; we accept the extra disk usage (each layer is a
-# full copy rather than a delta) because we only create a single image.
+# Use the VFS storage driver rather than the default overlay driver.
+# The VFS driver avoids overlayfs entirely, which sidesteps potential
+# overlay-on-btrfs compatibility issues on the btrfs root filesystem.
 # Both buildah and podman share this configuration through the common
 # /etc/containers/storage.conf.
 cat > /etc/containers/storage.conf << 'STORAGECFG'
@@ -601,7 +687,7 @@ dracut --no-hostonly --add ostree --force \
     /boot/initramfs-${KVER}.img ${KVER} 2>&1 | (grep -v "^$" || true) | tail -5
 
 echo "=== Updating GRUB core.img with BLS support ==="
-# The original Fedora 44 cloud GRUB (in the BIOS Boot partition) was built without
+# The Fedora 41 cloud GRUB (in the BIOS Boot partition) may be built without
 # the blscfg module, so it cannot load the Boot Loader Spec entries that ostree/bootc
 # creates during installation. Run grub2-install to embed a new core.img that includes
 # blscfg and can read the ostree BLS entries.

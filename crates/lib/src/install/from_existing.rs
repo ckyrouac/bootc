@@ -125,22 +125,22 @@ const RECREATE_EMPTY_DIRS: &[(&str, u32)] = &[
 /// Default name given to the intermediate image in local container storage.
 const DEFAULT_LOCAL_IMAGE_NAME: &str = "bootc-snapshot:latest";
 
-/// Buildah storage driver to use for the snapshot container.
+/// Buildah global arguments for the snapshot container's storage.
 ///
-/// The default storage driver (`overlay`) uses overlayfs on top of the host
-/// filesystem.  When the host uses btrfs, the overlay-on-btrfs combination can
-/// trigger kernel panics in some kernel versions when a large tar archive is
-/// unpacked via `buildah add`.  Using `vfs` avoids overlayfs entirely and is
-/// safe on all filesystem types, at the cost of not deduplicating layers (which
-/// does not matter here because we only have one layer).
-const BUILDAH_STORAGE_DRIVER: &str = "vfs";
-
-/// Extra arguments prepended to every `buildah` invocation to select the
-/// storage driver.  Declared as a slice so it can be spread into `.args()`.
-const BUILDAH_STORAGE_ARGS: &[&str] = &["--storage-driver", BUILDAH_STORAGE_DRIVER];
+/// We explicitly request the `vfs` storage driver because the default
+/// (`overlay`) uses overlayfs on top of the host filesystem.  On systems that
+/// use btrfs as their root filesystem, overlay-on-btrfs can trigger kernel
+/// panics on some kernel versions (notably Fedora 44, kernel 6.19) when a
+/// large tar archive is unpacked via `buildah add`.  Using `vfs` avoids
+/// overlayfs entirely and is safe on all filesystem types, at the cost of not
+/// deduplicating layers (which does not matter here because we only have one
+/// layer).
+const BUILDAH_STORAGE_ARGS: &[&str] = &["--storage-driver", "vfs"];
 
 /// SSH authorized_keys mount point inside the install container.
 const SSH_KEY_MOUNT: &str = "/bootc_authorized_ssh_keys/root";
+
+
 
 // ── Options struct ────────────────────────────────────────────────────────────
 
@@ -221,6 +221,8 @@ impl std::fmt::Debug for SystemInfo {
 struct BuildahContainerGuard {
     container_id: String,
     committed: Cell<bool>,
+    /// Storage args to use when removing the container.
+    storage_args: Vec<String>,
 }
 
 impl std::fmt::Debug for BuildahContainerGuard {
@@ -233,10 +235,11 @@ impl std::fmt::Debug for BuildahContainerGuard {
 }
 
 impl BuildahContainerGuard {
-    fn new(container_id: impl Into<String>) -> Self {
+    fn new(container_id: impl Into<String>, storage_args: Vec<String>) -> Self {
         Self {
             container_id: container_id.into(),
             committed: Cell::new(false),
+            storage_args,
         }
     }
 
@@ -255,7 +258,7 @@ impl Drop for BuildahContainerGuard {
         if !self.committed.get() {
             // Best-effort cleanup on error paths.
             let _ = std::process::Command::new(bootc_utils::buildah_bin())
-                .args(BUILDAH_STORAGE_ARGS)
+                .args(&self.storage_args)
                 .args(["rm", &self.container_id])
                 .status();
         }
@@ -286,14 +289,16 @@ pub(crate) async fn install_from_existing_root(opts: InstallFromExistingRootOpts
     }
 
     // The image that `podman run` actually executes.  In the normal (push) case
-    // this is the registry reference; in --skip-push it is the local image.
-    let install_source = if opts.skip_push {
+    // this is the registry reference; in --skip-push it is the local image in
+    // the system container storage (containers-storage transport).
+    let source_imgref = if opts.skip_push {
         format!("containers-storage:localhost/{}", opts.local_image_name)
     } else {
         opts.image_ref.clone()
     };
 
-    run_install(&opts, &install_source).context("Running bootc install to-existing-root")?;
+    run_install(&opts, &source_imgref)
+        .context("Running bootc install to-existing-root")?;
 
     if opts.reboot {
         println!("Installation complete. Rebooting now...");
@@ -421,12 +426,16 @@ fn gather_system_info() -> Result<SystemInfo> {
 // ── Phase 3: Create OCI image ─────────────────────────────────────────────────
 
 #[context("Creating OCI snapshot image")]
-fn create_snapshot_image(opts: &InstallFromExistingRootOpts, info: &SystemInfo) -> Result<()> {
+fn create_snapshot_image(
+    opts: &InstallFromExistingRootOpts,
+    info: &SystemInfo,
+) -> Result<()> {
+    let sargs: Vec<String> = BUILDAH_STORAGE_ARGS.iter().map(|s| s.to_string()).collect();
     // Step 1: create an empty working container from scratch.
     println!("  [1/4] Creating empty buildah container...");
     let container_id = {
         let out = std::process::Command::new(bootc_utils::buildah_bin())
-            .args(BUILDAH_STORAGE_ARGS)
+            .args(&sargs)
             .args(["from", "scratch"])
             .output()
             .context("Running `buildah from scratch`")?;
@@ -441,19 +450,19 @@ fn create_snapshot_image(opts: &InstallFromExistingRootOpts, info: &SystemInfo) 
             .to_string()
     };
     // RAII guard removes the container if we bail out before committing.
-    let guard = BuildahContainerGuard::new(&container_id);
+    let guard = BuildahContainerGuard::new(&container_id, sargs.clone());
 
     // Step 2: snapshot the running filesystem into the container.
     println!("  [2/4] Snapshotting running filesystem (this may take several minutes)...");
-    snapshot_filesystem(guard.id())?;
+    snapshot_filesystem(guard.id(), &sargs)?;
 
     // Step 3: inject files that require special handling.
     println!("  [3/4] Injecting bootc-required files...");
-    inject_required_files(guard.id(), info)?;
+    inject_required_files(guard.id(), info, &sargs)?;
 
     // Step 4: commit the container as a local OCI image.
     println!("  [4/4] Committing image as {}...", opts.local_image_name);
-    commit_image(guard.id(), &opts.local_image_name, info)?;
+    commit_image(guard.id(), &opts.local_image_name, info, &sargs)?;
 
     // Prevent Drop from trying to remove the container (it no longer exists).
     guard.mark_committed();
@@ -461,45 +470,33 @@ fn create_snapshot_image(opts: &InstallFromExistingRootOpts, info: &SystemInfo) 
 }
 /// Choose the best directory for the intermediate tar archive.
 ///
-/// Prefer `/tmp` (tmpfs) to avoid writing large sequential files to btrfs, which
-/// can trigger kernel crashes on some Fedora kernel versions when tar simultaneously
-/// reads from the same btrfs filesystem.  `/tmp` is typically a tmpfs of 50% of RAM.
+/// Always prefers `/var/tmp` (persistent disk) over `/tmp` (tmpfs/RAM).
 ///
-/// Fall back to `/var/tmp` (persistent disk) if `/tmp` is not a tmpfs (e.g. the
-/// admin has mounted a non-tmpfs there) or if the available space there is less than
-/// the minimum threshold.
+/// Using `/tmp` (tmpfs) is tempting because it avoids disk writes, but in
+/// memory-constrained environments — for example a KVM VM running under a cgroup
+/// with a 4 GiB memory limit — a 500 MB–1 GiB tar archive stored in tmpfs
+/// consumes guest RAM.  When the guest's page cache for disk I/O is added on top,
+/// the total easily exceeds the cgroup limit, causing the QEMU process itself to
+/// be killed by the OOM killer.  This manifests as an unexplained mid-conversion
+/// VM crash with libvirt reporting `reason=crashed`.
+///
+/// `/var/tmp` is on persistent storage (typically the same filesystem as `/`),
+/// so the archive does not consume RAM.  The sequential read → sequential write
+/// pattern for a plain tar archive is efficient on any filesystem and does not
+/// trigger the btrfs concurrent-read/write pathologies that were once thought to
+/// be the cause of these crashes.
+///
+/// The function exists as a hook so that future logic (e.g. choosing based on
+/// available free space) can be added without touching callers.
 fn choose_tar_dir() -> &'static str {
-    // Check if /tmp is a tmpfs by comparing its st_dev to /proc's
-    // well-known tmpfs device, or more simply: check that the fstype
-    // from /proc/mounts for /tmp is "tmpfs".
-    let is_tmp_tmpfs = std::fs::read_to_string("/proc/mounts")
-        .map(|mounts| {
-            mounts.lines().any(|line| {
-                let mut parts = line.split_whitespace();
-                let _dev = parts.next().unwrap_or("");
-                let mp = parts.next().unwrap_or("");
-                let fs = parts.next().unwrap_or("");
-                mp == "/tmp" && fs == "tmpfs"
-            })
-        })
-        .unwrap_or(false);
-
-    if !is_tmp_tmpfs {
-        eprintln!(
-            "  [snapshot] /tmp is not a tmpfs; falling back to /var/tmp for tar archive"
-        );
-        return "/var/tmp";
-    }
-
-    // /tmp is a tmpfs — use it to avoid btrfs kernel crash.
-    "/tmp"
+    "/var/tmp"
 }
 
 /// Snapshot the running filesystem into the buildah working container.
 ///
 /// `tar` archives the live root filesystem (excluding virtual/transient paths) to a
-/// temporary file in `/tmp` (tmpfs), then `buildah add` unpacks it at `/` inside the
-/// container.
+/// temporary file in `/var/tmp` (persistent disk), then `buildah add` unpacks it
+/// at `/` inside the container.
 ///
 /// Using an intermediate file (rather than piping tar's stdout directly to
 /// `buildah add`) is required because newer versions of buildah (≥ 1.40) no longer
@@ -507,17 +504,13 @@ fn choose_tar_dir() -> &'static str {
 /// avoid the disk write but cannot easily be used from the single-threaded tokio
 /// runtime that bootc uses.
 ///
-/// The archive is written to `/tmp` (tmpfs backed by RAM) rather than `/var/tmp`
-/// (which is typically on btrfs) because writing large sequential files to btrfs
-/// while simultaneously reading the same btrfs filesystem can trigger kernel
-/// crashes in some kernel versions (observed on Fedora 44 with kernel 6.19).
-/// Writing to tmpfs avoids this btrfs I/O pattern entirely.
-///
-/// `/tmp` default size is 50% of RAM.  For systems where the rootfs snapshot would
-/// exceed that limit, the function falls back to `/var/tmp` (on the persistent
-/// disk) after logging a warning.
+/// The archive is written to `/var/tmp` (persistent disk) rather than `/tmp`
+/// (tmpfs) because storing a large archive in tmpfs consumes guest RAM.  In
+/// memory-constrained environments (e.g. a KVM VM under a 4 GiB cgroup limit)
+/// the RAM consumed by the archive plus the guest page cache can exceed the cgroup
+/// limit, causing QEMU to be killed by the OOM killer mid-conversion.
 #[context("Snapshotting running filesystem into buildah container")]
-fn snapshot_filesystem(container_id: &str) -> Result<()> {
+fn snapshot_filesystem(container_id: &str, sargs: &[String]) -> Result<()> {
     // Choose the best location for the intermediate tar archive.
     //
     // Prefer /tmp (tmpfs) because writing large files to btrfs while tar
@@ -635,21 +628,29 @@ fn snapshot_filesystem(container_id: &str) -> Result<()> {
         "--xattrs".into(),
     ];
 
-    // NOTE: GNU tar strips the leading "/" from archive member names
-    // ("Removing leading `/'" from member names"), so exclude patterns
-    // must NOT start with "/" or they will never match.  E.g. use
-    // "--exclude=proc" not "--exclude=/proc".
+    // GNU tar's --exclude patterns match any path component by default.
+    // For example, "--exclude=ostree" would accidentally exclude
+    // /usr/bin/ostree (not just /ostree).  Anchoring with a "./" prefix
+    // (e.g. "--exclude=./ostree") restricts the match to the archive root,
+    // because we use "-C / ." so all archive member names begin with "./".
+    // This requires the source to be specified as "-C / ." rather than "/"
+    // so that member names carry the "./" prefix that anchors the exclusion.
     for path in EXCLUDED_PATHS {
-        tar_args.push(format!("--exclude={}", path.trim_start_matches('/')));
+        tar_args.push(format!("--exclude=./{}", path.trim_start_matches('/')));
     }
     // Also exclude extra mount points from the root pass so tar does not
     // try to archive their (empty) mount-point directories and then fail
     // when pass 2 re-archives the same path.
     for mp in &extra_mounts {
-        tar_args.push(format!("--exclude={}", mp.trim_start_matches('/')));
+        tar_args.push(format!("--exclude=./{}", mp.trim_start_matches('/')));
     }
 
-    tar_args.push("/".into()); // source: root filesystem
+    // Use "-C / ." rather than "/" as the source so that archive member names
+    // begin with "./" — this is required for the anchored exclude patterns above
+    // to work correctly (see the NOTE above).
+    tar_args.push("-C".into());
+    tar_args.push("/".into());
+    tar_args.push(".".into()); // source: root filesystem
 
     // Print the full tar command for debugging.
     eprintln!("  [tar pass 1] tar {:?}", tar_args);
@@ -735,7 +736,7 @@ fn snapshot_filesystem(container_id: &str) -> Result<()> {
 
     // `buildah add <container> <tar_path> /` unpacks the tar at `/` inside the container.
     let buildah_status = std::process::Command::new(bootc_utils::buildah_bin())
-        .args(BUILDAH_STORAGE_ARGS)
+        .args(sargs)
         .args(["add", "--quiet", container_id, &tar_path, "/"])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -764,10 +765,15 @@ fn snapshot_filesystem(container_id: &str) -> Result<()> {
 /// Failure is non-fatal: if `dracut` is absent or fails (e.g., the snapshot came from
 /// a minimal container image), the function logs a warning and returns, leaving the
 /// previously-copied package-mode initramfs in place.
-fn regenerate_initramfs_with_dracut(container_id: &str, info: &SystemInfo, dest: &str) {
+fn regenerate_initramfs_with_dracut(
+    container_id: &str,
+    info: &SystemInfo,
+    dest: &str,
+    sargs: &[String],
+) {
     // Check if dracut is available inside the container.
     let dracut_check = std::process::Command::new(bootc_utils::buildah_bin())
-        .args(BUILDAH_STORAGE_ARGS)
+        .args(sargs)
         .args(["run", container_id, "--", "sh", "-c", "command -v dracut"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -790,7 +796,7 @@ fn regenerate_initramfs_with_dracut(container_id: &str, info: &SystemInfo, dest:
     // /var/tmp is in EXCLUDED_PATHS so the snapshot omits it, but dracut will fail
     // immediately with "Invalid tmpdir" if it doesn't exist.
     let mkdir_status = std::process::Command::new(bootc_utils::buildah_bin())
-        .args(BUILDAH_STORAGE_ARGS)
+        .args(sargs)
         .args(["run", container_id, "--", "mkdir", "-p", "/var/tmp"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -809,7 +815,7 @@ fn regenerate_initramfs_with_dracut(container_id: &str, info: &SystemInfo, dest:
     // --add ostree: include the ostree dracut module, which brings in ostree-prepare-root
     //              and all of its shared library dependencies.
     let status = std::process::Command::new(bootc_utils::buildah_bin())
-        .args(BUILDAH_STORAGE_ARGS)
+        .args(sargs)
         .args([
             "run",
             container_id,
@@ -850,7 +856,11 @@ fn regenerate_initramfs_with_dracut(container_id: &str, info: &SystemInfo, dest:
 /// Copy the initramfs and (if absent) `prepare-root.conf` into the container,
 /// then stamp the image config with descriptive OCI labels.
 #[context("Injecting bootc-required files into buildah container")]
-fn inject_required_files(container_id: &str, info: &SystemInfo) -> Result<()> {
+fn inject_required_files(
+    container_id: &str,
+    info: &SystemInfo,
+    sargs: &[String],
+) -> Result<()> {
     // Package-mode RHEL keeps the initramfs in /boot; bootc expects it at
     // /usr/lib/modules/<kver>/initramfs.img.
     if !info.initramfs_already_placed {
@@ -859,25 +869,11 @@ fn inject_required_files(container_id: &str, info: &SystemInfo) -> Result<()> {
             info.kernel_version
         );
         println!("      Placing initramfs at {dest}");
-        buildah_copy(container_id, &info.initramfs_src, &dest)
+        buildah_copy(container_id, &info.initramfs_src, &dest, sargs)
             .context("Copying initramfs into container")?;
-        // The package-mode initramfs may be missing the ostree dracut module and
-        // its shared library dependencies (libgio-2.0.so.0, libglib-2.0.so.0, etc.)
-        // required by ostree-prepare-root.  Attempt to regenerate the initramfs
-        // with dracut inside the container so that the ostree module is properly
-        // included with all dependencies.  If dracut is not available or fails
-        // (e.g., on a minimal system), keep the copied initramfs and warn the user.
-        regenerate_initramfs_with_dracut(container_id, info, &dest);
+        regenerate_initramfs_with_dracut(container_id, info, &dest, sargs);
     }
 
-    // Always write the minimal prepare-root.conf into the snapshot image, overriding
-    // any version from the running system.  The running system's config might enable
-    // composefs (common on Fedora/RHEL where the ostree package ships
-    // `composefs.enabled = yes`), but `bootc install from-existing-root` uses the
-    // ostree backend without composefs.  If the composefs config were retained,
-    // ostree-prepare-root would attempt to mount a composefs image at boot, fail
-    // (because no composefs image was created), and fall back to legacy bind-mount
-    // mode — which prevents `bootc status` from detecting the booted deployment.
     {
         println!("      Writing minimal {PREPARE_ROOT_CONF_PATH} (overrides composefs if present)");
         let tmp =
@@ -891,7 +887,7 @@ fn inject_required_files(container_id: &str, info: &SystemInfo) -> Result<()> {
             .context("Tempfile path is not valid UTF-8")?;
         // Ensure the parent directory exists before copying.
         let status = std::process::Command::new(bootc_utils::buildah_bin())
-            .args(BUILDAH_STORAGE_ARGS)
+            .args(sargs)
             .args(["run", container_id, "--", "mkdir", "-p", "/usr/lib/ostree"])
             .status()
             .context("Creating /usr/lib/ostree in container")?;
@@ -899,25 +895,14 @@ fn inject_required_files(container_id: &str, info: &SystemInfo) -> Result<()> {
             status.success(),
             "`buildah run mkdir -p /usr/lib/ostree` failed"
         );
-        buildah_copy(container_id, tmp_path, PREPARE_ROOT_CONF_PATH)
+        buildah_copy(container_id, tmp_path, PREPARE_ROOT_CONF_PATH, sargs)
             .context("Writing prepare-root.conf into container")?;
     }
 
-    // Create the /ostree → sysroot/ostree symlink inside the container image.
-    //
-    // Standard bootc images (e.g. fedora-bootc) include this symlink as committed
-    // content.  After boot, `/` is the deployment root and `/sysroot` is the physical
-    // root; the symlink allows tools like `ostree` and `bootc status` to locate the
-    // ostree repo at `/ostree/repo` (→ `/sysroot/ostree/repo`).
-    //
-    // Package-mode systems do not have `/ostree`, and EXCLUDED_PATHS explicitly
-    // excludes it from the snapshot.  Without this symlink, the ostree sysroot lock
-    // at `/ostree/lock` fails with ENOENT when `bootc status` runs post-boot, because
-    // `/ostree` does not exist in the deployment root.
     {
         println!("      Creating /ostree → sysroot/ostree symlink");
         let status = std::process::Command::new(bootc_utils::buildah_bin())
-            .args(BUILDAH_STORAGE_ARGS)
+            .args(sargs)
             .args(["run", container_id, "--", "ln", "-sf", "sysroot/ostree", "/ostree"])
             .status()
             .context("Creating /ostree symlink in container")?;
@@ -927,17 +912,9 @@ fn inject_required_files(container_id: &str, info: &SystemInfo) -> Result<()> {
         );
     }
 
-    // Re-create empty directories that were excluded from the snapshot because they
-    // are ephemeral mount points (tmpfs) or wiped by the installer, but must be
-    // present as directory entries in a valid Linux image.  Without these, tools
-    // such as `bootc install to-existing-root` and `tempfile` crate will fail with
-    // "No such file or directory" when they try to create files inside them.
     for (path, mode) in RECREATE_EMPTY_DIRS {
-        // Use buildah run so the directory is created inside the container's
-        // filesystem, not on the host.  `mkdir -p` is idempotent if the
-        // directory was somehow preserved in the snapshot.
         let status = std::process::Command::new(bootc_utils::buildah_bin())
-            .args(BUILDAH_STORAGE_ARGS)
+            .args(sargs)
             .args([
                 "run",
                 container_id,
@@ -955,15 +932,15 @@ fn inject_required_files(container_id: &str, info: &SystemInfo) -> Result<()> {
         );
     }
 
-    set_image_labels(container_id, info).context("Setting OCI image labels")?;
+    set_image_labels(container_id, info, sargs).context("Setting OCI image labels")?;
 
     Ok(())
 }
 
 /// Run `buildah copy <container> <src> <dest>`.
-fn buildah_copy(container_id: &str, src: &str, dest: &str) -> Result<()> {
+fn buildah_copy(container_id: &str, src: &str, dest: &str, sargs: &[String]) -> Result<()> {
     let status = std::process::Command::new(bootc_utils::buildah_bin())
-        .args(BUILDAH_STORAGE_ARGS)
+        .args(sargs)
         .args(["copy", container_id, src, dest])
         .status()
         .context("Running `buildah copy`")?;
@@ -976,13 +953,13 @@ fn buildah_copy(container_id: &str, src: &str, dest: &str) -> Result<()> {
 }
 
 /// Stamp the OCI image config with informational labels.
-fn set_image_labels(container_id: &str, info: &SystemInfo) -> Result<()> {
+fn set_image_labels(container_id: &str, info: &SystemInfo, sargs: &[String]) -> Result<()> {
     let created = current_rfc3339();
     let uname = rustix::system::uname();
     let hostname = uname.nodename().to_str().unwrap_or("unknown");
 
     let status = std::process::Command::new(bootc_utils::buildah_bin())
-        .args(BUILDAH_STORAGE_ARGS)
+        .args(sargs)
         .args([
             "config",
             "--label",
@@ -1015,9 +992,14 @@ fn set_image_labels(container_id: &str, info: &SystemInfo) -> Result<()> {
 }
 
 /// Commit the buildah working container as a local OCI image.
-fn commit_image(container_id: &str, local_image_name: &str, _info: &SystemInfo) -> Result<()> {
+fn commit_image(
+    container_id: &str,
+    local_image_name: &str,
+    _info: &SystemInfo,
+    sargs: &[String],
+) -> Result<()> {
     let status = std::process::Command::new(bootc_utils::buildah_bin())
-        .args(BUILDAH_STORAGE_ARGS)
+        .args(sargs)
         .args(["commit", "--format", "oci", container_id, local_image_name])
         .status()
         .context("Running `buildah commit`")?;
@@ -1080,22 +1062,24 @@ fn push_image(local_image_name: &str, image_ref: &str) -> Result<()> {
 // ── Phase 5: Install via to-existing-root ────────────────────────────────────
 
 /// Run `bootc install to-existing-root` inside a privileged podman container.
+/// Run `bootc install to-existing-root` inside a privileged podman container.
 ///
-/// `install_source` is what podman actually runs (either a registry reference
-/// or a `containers-storage:` URI for the `--skip-push` case).  The stored
-/// upgrade target is always `opts.image_ref`.
+/// `source_imgref` is the image reference for `podman run` (what to execute)
+/// and also passed as `--source-imgref` to bootc inside the container.
+/// In the `--skip-push` case this is a `containers-storage:` URI pointing to
+/// the locally-committed snapshot image; otherwise it is the registry reference.
+/// The stored upgrade target is always `opts.image_ref`.
 #[context("Running bootc install to-existing-root")]
-fn run_install(opts: &InstallFromExistingRootOpts, install_source: &str) -> Result<()> {
+fn run_install(
+    opts: &InstallFromExistingRootOpts,
+    source_imgref: &str,
+) -> Result<()> {
     let mut args: Vec<String> = vec![
         "run".into(),
         "--rm".into(),
         "--privileged".into(),
         "--pid=host".into(),
         "--user=root:root".into(),
-        // Mount host container storage so bootc inside the container can access
-        // the snapshot image (--skip-push path) and write the new deployment.
-        "-v".into(),
-        "/var/lib/containers:/var/lib/containers".into(),
         "-v".into(),
         "/dev:/dev".into(),
         "--security-opt".into(),
@@ -1103,6 +1087,10 @@ fn run_install(opts: &InstallFromExistingRootOpts, install_source: &str) -> Resu
         // Mount the host root so `to-existing-root` can see and modify it.
         "-v".into(),
         "/:/target".into(),
+        // Mount the system container storage so bootc inside the container can
+        // find the locally-committed snapshot image.
+        "-v".into(),
+        "/var/lib/containers:/var/lib/containers".into(),
     ];
 
     // Forward RUST_LOG so callers can enable verbose bootc output.
@@ -1117,23 +1105,20 @@ fn run_install(opts: &InstallFromExistingRootOpts, install_source: &str) -> Resu
     }
 
     // The image that podman runs (contains the bootc binary from the snapshot).
-    args.push(install_source.to_string());
+    args.push(source_imgref.to_string());
 
     // ── bootc install to-existing-root arguments ──────────────────────────────
 
     args.extend(["bootc", "install", "to-existing-root"].map(String::from));
 
-    // --source-imgref: where bootc pulls the image content from.
-    // Matches install_source in both the push and skip-push cases.
+    // --source-imgref: where bootc pulls the image content from inside the container.
     args.push("--source-imgref".into());
-    args.push(install_source.to_string());
+    args.push(source_imgref.to_string());
 
     // --target-imgref: the registry reference stored for future `bootc upgrade`.
-    // Only differs from --source-imgref in the --skip-push case.
-    if opts.skip_push {
-        args.push("--target-imgref".into());
-        args.push(opts.image_ref.clone());
-    }
+    // Always set to opts.image_ref so future upgrades contact the registry.
+    args.push("--target-imgref".into());
+    args.push(opts.image_ref.clone());
 
     args.push("--acknowledge-destructive".into());
 
