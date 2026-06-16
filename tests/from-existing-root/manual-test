@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Manual interactive test: bootc install from-existing-root
 #
-# Downloads a Fedora 44 cloud image, boots a VM, copies the local bootc binary,
-# runs bootc install from-existing-root, then reboots to verify the result.
+# Pulls a Fedora 44 cloud image via quay.io/containerdisks/fedora:44, boots a VM,
+# copies the local bootc binary, runs bootc install from-existing-root, then
+# reboots to verify the result.
 #
 # Each command is printed before it runs. Press Enter to continue or Ctrl-C to stop.
 #
@@ -21,6 +22,7 @@ VM_DISK="${WORK_DIR}/disk.qcow2"
 SSH_KEY="${WORK_DIR}/id_ed25519"
 SSH_PORT=22241
 IMAGE_REF="localhost/bootc-snapshot:latest"
+CONTAINERDISK="quay.io/containerdisks/fedora:44"
 NO_CLEANUP=false
 BOOTC_BIN="${REPO_DIR}/target/thin/bootc"
 
@@ -99,10 +101,15 @@ SSH_PUB="$(cat "${SSH_KEY}.pub")"
 # ── Download Fedora 44 cloud image ────────────────────────────────────────────
 
 if [[ ! -f "${VM_DISK}" ]]; then
-    FEDORA_URL="https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.1.x86_64.qcow2"
     RAW_DISK="${WORK_DIR}/fedora44.qcow2"
 
-    step curl -L --progress-bar -o "${RAW_DISK}" "${FEDORA_URL}"
+    echo "  Pulling ${CONTAINERDISK} via podman…"
+    podman pull "${CONTAINERDISK}"
+    cid=$(podman create "${CONTAINERDISK}")
+    podman export "${cid}" | tar -x -C "${WORK_DIR}/" disk/disk.img
+    podman rm "${cid}" >/dev/null
+    mv "${WORK_DIR}/disk/disk.img" "${RAW_DISK}"
+    chmod 644 "${RAW_DISK}"
     step qemu-img create -f qcow2 -b "${RAW_DISK}" -F qcow2 "${VM_DISK}" 20G
 fi
 
