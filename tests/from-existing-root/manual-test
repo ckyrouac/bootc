@@ -137,21 +137,62 @@ step xorriso -as mkisofs -output "${CLOUD_INIT_ISO}" -volid cidata -joliet -rock
     "${WORK_DIR}/ci/user-data" "${WORK_DIR}/ci/meta-data"
 
 # ── Define and start VM ───────────────────────────────────────────────────────
+#
+# virt-install does not support hostfwd as a --network option; port-forwarding
+# into SLIRP/user-mode networking must be applied after VM start via the QEMU
+# monitor.  We therefore define the VM from raw XML and add the SSH forward
+# with "virsh qemu-monitor-command --hmp hostfwd_add".
 
 virsh destroy  "${VM_NAME}" 2>/dev/null || true
 virsh undefine "${VM_NAME}" 2>/dev/null || true
 
-step virt-install \
-    --name "${VM_NAME}" \
-    --memory 2048 \
-    --vcpus 2 \
-    --disk "path=${VM_DISK},format=qcow2,bus=virtio,cache=writeback" \
-    --disk "path=${CLOUD_INIT_ISO},device=cdrom" \
-    --os-variant fedora41 \
-    --network "user,hostfwd=tcp::${SSH_PORT}-:22" \
-    --graphics none \
-    --noautoconsole \
-    --import
+cat > "${WORK_DIR}/vm.xml" <<EOF
+<domain type="kvm">
+  <name>${VM_NAME}</name>
+  <memory unit="MiB">2048</memory>
+  <vcpu>2</vcpu>
+  <os>
+    <type arch="x86_64" machine="q35">hvm</type>
+    <boot dev="hd"/>
+  </os>
+  <features><acpi/><apic/></features>
+  <cpu mode="host-passthrough"/>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <disk type="file" device="disk">
+      <driver name="qemu" type="qcow2" cache="writeback"/>
+      <source file="${VM_DISK}"/>
+      <target dev="vda" bus="virtio"/>
+    </disk>
+    <disk type="file" device="cdrom">
+      <driver name="qemu" type="raw"/>
+      <source file="${CLOUD_INIT_ISO}"/>
+      <target dev="sda" bus="sata"/>
+      <readonly/>
+    </disk>
+    <interface type="user">
+      <model type="virtio"/>
+    </interface>
+    <console type="pty">
+      <target type="serial" port="0"/>
+    </console>
+    <memballoon model="virtio"/>
+    <rng model="virtio">
+      <backend model="random">/dev/urandom</backend>
+    </rng>
+  </devices>
+</domain>
+EOF
+
+echo ""
+echo "  Defining and starting VM from ${WORK_DIR}/vm.xml"
+read -rp "  [Enter to run] "
+virsh define "${WORK_DIR}/vm.xml"
+virsh start  "${VM_NAME}"
+sleep 2
+# Add SSH port-forward via QEMU monitor (hostfwd is not a virsh/libvirt concept)
+virsh qemu-monitor-command "${VM_NAME}" \
+    --hmp "hostfwd_add tcp::${SSH_PORT}-:22" 2>/dev/null || true
 
 wait_ssh
 
