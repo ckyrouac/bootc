@@ -814,10 +814,19 @@ fn regenerate_initramfs_with_dracut(
     // --force: overwrite the destination file (we just placed it above).
     // --add ostree: include the ostree dracut module, which brings in ostree-prepare-root
     //              and all of its shared library dependencies.
+    //
+    // DRACUT_NO_XATTR=1: the buildah container does not have CAP_MAC_ADMIN, so
+    // dracut-install cannot write security.selinux xattrs onto initramfs files.
+    // Setting this env var tells dracut-install to skip all xattr copying
+    // (see dracut-install.c: `getenv("DRACUT_NO_XATTR")`).  The resulting
+    // initramfs boots fine without SELinux labels on its files; the labels are
+    // applied by the kernel policy on first boot.
     let status = std::process::Command::new(bootc_utils::buildah_bin())
         .args(sargs)
         .args([
             "run",
+            "--env",
+            "DRACUT_NO_XATTR=1",
             container_id,
             "--",
             "dracut",
