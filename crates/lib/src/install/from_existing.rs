@@ -377,7 +377,7 @@ fn check_binary(bin: &str) -> Result<()> {
         Ok(s) if s.success() => Ok(()),
         _ => anyhow::bail!(
             "`{bin}` was not found in PATH or returned an error.\n\
-             Install it with: dnf install {bin}"
+             Please install it using your distribution's package manager."
         ),
     }
 }
@@ -470,7 +470,7 @@ fn create_snapshot_image(
 }
 /// Choose the best directory for the intermediate tar archive.
 ///
-/// Always prefers `/var/tmp` (persistent disk) over `/tmp` (tmpfs/RAM).
+/// Always uses `/var/tmp` (persistent disk) rather than `/tmp` (tmpfs/RAM).
 ///
 /// Using `/tmp` (tmpfs) is tempting because it avoids disk writes, but in
 /// memory-constrained environments — for example a KVM VM running under a cgroup
@@ -511,24 +511,15 @@ fn choose_tar_dir() -> &'static str {
 /// limit, causing QEMU to be killed by the OOM killer mid-conversion.
 #[context("Snapshotting running filesystem into buildah container")]
 fn snapshot_filesystem(container_id: &str, sargs: &[String]) -> Result<()> {
-    // Choose the best location for the intermediate tar archive.
-    //
-    // Prefer /tmp (tmpfs) because writing large files to btrfs while tar
-    // simultaneously reads from the same btrfs filesystem triggers a kernel
-    // crash on some Fedora kernel versions.  Tmpfs is safe from this bug.
-    //
-    // Fall back to /var/tmp (persistent disk) if /tmp is not a tmpfs or if the
-    // tmpfs is smaller than a configurable threshold.
-    //
-    // We do NOT open the file before tar runs; instead we let tar create it so
-    // that we never hold an fd open on the inode while btrfs is active.
+    // Use /var/tmp (persistent disk) for the intermediate tar archive.
+    // See choose_tar_dir() for rationale.
     let tar_dir = choose_tar_dir();
     use std::time::{SystemTime, UNIX_EPOCH};
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .subsec_nanos();
-    let tar_path = format!("{tar_dir}/bootc-snap-{ts:08x}.tar");
+        .as_nanos();
+    let tar_path = format!("{tar_dir}/bootc-snap-{ts:016x}.tar");
     // Ensure we delete the file when this scope exits (success or error).
     struct TarFileCleanup(String);
     impl Drop for TarFileCleanup {
@@ -690,27 +681,28 @@ fn snapshot_filesystem(container_id: &str, sargs: &[String]) -> Result<()> {
             format!("--transform=s|^\\./|{}/|", mp.trim_start_matches('/')),
         ];
         // Exclude sub-paths that fall under this mount point.
+        // Anchor the patterns with "./" so they only match at the archive
+        // root (same technique used in pass 1).  We archive with "-C <mp> ."
+        // so member names begin with "./".
         for ex in EXCLUDED_PATHS {
             if ex.starts_with(mp.as_str()) {
                 // Make the exclude relative to the mountpoint.
                 let relative = ex.trim_start_matches(mp.as_str()).trim_start_matches('/');
                 if !relative.is_empty() {
-                    mp_args.push(format!("--exclude={relative}"));
+                    mp_args.push(format!("--exclude=./{relative}"));
                 }
             }
         }
         // Exclude the tar archive file itself if it falls under this mount
-        // point.  Although we prefer /tmp (tmpfs) the archive could in theory
-        // be in /var/tmp if the fallback path was taken.  Without this
-        // exclusion, pass 2 would try to archive the partially-written tar
-        // file while simultaneously appending to it, causing the file to grow
-        // unboundedly.
+        // point.  Without this exclusion, pass 2 would try to archive the
+        // partially-written tar file while simultaneously appending to it,
+        // causing the file to grow unboundedly.
         if tar_path.starts_with(mp.as_str()) {
             let rel = tar_path
                 .trim_start_matches(mp.as_str())
                 .trim_start_matches('/');
             if !rel.is_empty() {
-                mp_args.push(format!("--exclude={rel}"));
+                mp_args.push(format!("--exclude=./{rel}"));
             }
         }
         // Source directory: the mount point itself (tar with -C).
@@ -727,6 +719,14 @@ fn snapshot_filesystem(container_id: &str, sargs: &[String]) -> Result<()> {
 
         let ok = status.code().map(|c| c <= 1).unwrap_or(false);
         if !ok {
+            // A fatal tar error on a major mount like /var produces a broken image
+            // (e.g., empty /var/lib/NetworkManager).  Print a visible warning and
+            // continue — the conversion may still be salvageable on some systems.
+            eprintln!(
+                "WARNING: tar for mount point {mp} exited with code {:?}; \
+                 the snapshot may be incomplete.",
+                status.code()
+            );
             tracing::warn!(
                 "tar for mount point {mp} exited with {:?}; continuing",
                 status.code()
@@ -1062,7 +1062,6 @@ fn push_image(local_image_name: &str, image_ref: &str) -> Result<()> {
 // ── Phase 5: Install via to-existing-root ────────────────────────────────────
 
 /// Run `bootc install to-existing-root` inside a privileged podman container.
-/// Run `bootc install to-existing-root` inside a privileged podman container.
 ///
 /// `source_imgref` is the image reference for `podman run` (what to execute)
 /// and also passed as `--source-imgref` to bootc inside the container.
@@ -1098,10 +1097,11 @@ fn run_install(
         args.push(format!("--env=RUST_LOG={rust_log}"));
     }
 
-    // Mount the authorized_keys file if provided.
+    // Mount the authorized_keys file if provided (read-only; the install
+    // container has no reason to modify the host's authorized_keys file).
     if let Some(keys_path) = &opts.root_ssh_authorized_keys {
         args.push("-v".into());
-        args.push(format!("{keys_path}:{SSH_KEY_MOUNT}"));
+        args.push(format!("{keys_path}:{SSH_KEY_MOUNT}:ro"));
     }
 
     // The image that podman runs (contains the bootc binary from the snapshot).

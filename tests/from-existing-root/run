@@ -135,6 +135,7 @@ build_shim() {
     src="$(mktemp /tmp/bootc-shim-XXXXXX.c)"
     cat > "${src}" << 'EOF'
 #define _GNU_SOURCE
+#include <errno.h>
 #include <sys/socket.h>
 #include <sys/resource.h>
 #include <dlfcn.h>
@@ -153,16 +154,22 @@ int socket(int domain, int type, int protocol) {
 }
 int setrlimit(__rlimit_resource_t r, const struct rlimit *l) {
     orig_setrlimit_t f = dlsym(RTLD_NEXT, "setrlimit");
-    int rc = f(r, l); return rc ? 0 : rc;
+    int rc = f(r, l);
+    if (rc != 0 && errno == EPERM) return 0;
+    return rc;
 }
 int setrlimit64(__rlimit_resource_t r, const struct rlimit64 *l) {
     orig_setrlimit64_t f = dlsym(RTLD_NEXT, "setrlimit64");
-    int rc = f(r, l); return rc ? 0 : rc;
+    int rc = f(r, l);
+    if (rc != 0 && errno == EPERM) return 0;
+    return rc;
 }
 int prlimit(__pid_t p, enum __rlimit_resource r,
             const struct rlimit *n, struct rlimit *o) {
     orig_prlimit_t f = dlsym(RTLD_NEXT, "prlimit");
-    int rc = f(p, r, n, o); return rc ? 0 : rc;
+    int rc = f(p, r, n, o);
+    if (rc != 0 && errno == EPERM) return 0;
+    return rc;
 }
 EOF
     gcc -shared -fPIC -o "${SHIM_SO}" "${src}" -ldl
@@ -273,9 +280,12 @@ CARGOCFG
             "${libdir}" "${ostree_ver}" > "${pkgdir}/ostree-1.pc"
     fi
 
-    # Use bundled zstd (not system pkg-config) so we don't need libzstd-devel
-    sed -i 's/zstd = { version = "[^"]*", features = \["pkg-config"\] }/zstd = { version = "0.13.1" }/' \
-        "${REPO_DIR}/crates/ostree-ext/Cargo.toml" 2>/dev/null || true
+    # Use bundled zstd (not system pkg-config) so we don't need libzstd-devel.
+    # The Cargo.toml already has zstd without the pkg-config feature; this is
+    # kept as a no-op safety net in case a future upstream change re-adds it.
+    # Do NOT sed-patch the committed Cargo.toml — that would dirty the working
+    # tree and potentially break future builds.  The bundled zstd is already
+    # selected via the Cargo.toml in this branch.
 
     # RUSTFLAGS: add the library directory so the linker can find libglib-2.0.so etc.
     PKG_CONFIG_PATH="${pkgdir}" GOTOOLCHAIN=auto \
@@ -473,8 +483,18 @@ phase_setup() {
     start_virtqemud
     build_bootc
 
-    rm -f "${SSH_KEY}" "${SSH_KEY}.pub"
-    ssh-keygen -t ed25519 -f "${SSH_KEY}" -N "" -q 2>/dev/null || true
+    # Generate SSH key.  If the disk already exists we reuse the same SSH key
+    # (the cloud-init user-data was already applied to that disk; a different
+    # key would fail to authenticate).  If no key exists yet, create one and
+    # ensure no stale disk is reused with it.
+    if [[ -f "${VM_DISK}" && -f "${SSH_KEY}" ]]; then
+        log "Reusing existing SSH key (disk already provisioned): ${SSH_KEY}"
+    else
+        rm -f "${SSH_KEY}" "${SSH_KEY}.pub"
+        ssh-keygen -t ed25519 -f "${SSH_KEY}" -N "" -q 2>/dev/null || true
+        # Remove any stale disk — it was provisioned with the old key.
+        rm -f "${VM_DISK}"
+    fi
     pull_disk
     create_cloud_init_iso
 }
@@ -742,13 +762,22 @@ phase_convert() {
     check "from-existing-root converts the system"
     log "Running bootc install from-existing-root (may take several minutes)…"
     local out rc
-    out="$(ssh_vm "sudo bootc install from-existing-root \
-        --skip-push \
-        --image-ref '${IMAGE_REF}' \
-        --acknowledge-destructive" 2>&1)" ; rc=$?
+    # timeout cannot call shell functions; use ssh directly with -o ServerAliveInterval
+    # and wrap the ssh command itself with timeout.
+    out="$(timeout "${TIMEOUT_INSTALL}" \
+        ssh ${SSH_OPTS} -i "${SSH_KEY}" -p "${SSH_PORT}" \
+            -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" \
+            "fedora@127.0.0.1" \
+            "sudo bootc install from-existing-root \
+                --skip-push \
+                --image-ref '${IMAGE_REF}' \
+                --acknowledge-destructive" 2>&1)" ; rc=$?
     echo "${out}" | sed 's/^/    /'
     if [[ ${rc} -eq 0 ]]; then
         pass
+    elif [[ ${rc} -eq 124 ]]; then
+        fail "Timed out after ${TIMEOUT_INSTALL}s"
+        die "Conversion timed out"
     else
         fail "Exit code ${rc}"
         die "Conversion failed"
