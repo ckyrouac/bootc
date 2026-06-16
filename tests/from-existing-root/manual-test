@@ -198,6 +198,24 @@ wait_ssh
 
 # ── Install tools and bootc ───────────────────────────────────────────────────
 
+# Configure containers storage to use the vfs driver.
+# bootc from-existing-root uses buildah (with --storage-driver vfs) to create
+# the snapshot, then launches podman to run bootc install to-existing-root.
+# Both must share the same store; the default overlay driver is a different store
+# from the vfs one, so podman cannot find the image buildah just committed.
+# Writing /etc/containers/storage.conf before anything touches storage ensures
+# both tools operate on the same vfs-backed store.
+cat > "${WORK_DIR}/storage.conf" <<'STORAGECFG'
+[storage]
+driver = "vfs"
+graphroot = "/var/lib/containers/storage"
+runroot = "/run/containers/storage"
+STORAGECFG
+step scp ${SSH_OPTS} -i "${SSH_KEY}" -P "${SSH_PORT}" \
+    "${WORK_DIR}/storage.conf" fedora@127.0.0.1:/tmp/storage.conf
+step ssh ${SSH_OPTS} -i "${SSH_KEY}" -p "${SSH_PORT}" fedora@127.0.0.1 \
+    sudo install -m 0644 /tmp/storage.conf /etc/containers/storage.conf
+
 step ssh ${SSH_OPTS} -i "${SSH_KEY}" -p "${SSH_PORT}" fedora@127.0.0.1 \
     sudo dnf install -y buildah ostree skopeo dracut
 
