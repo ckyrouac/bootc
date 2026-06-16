@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# Manual interactive test: bootc install from-existing-root
+#
+# Downloads a Fedora 44 cloud image, boots a VM, copies the local bootc binary,
+# runs bootc install from-existing-root, then reboots to verify the result.
+#
+# Each command is printed before it runs. Press Enter to continue or Ctrl-C to stop.
+#
+# Usage: tests/from-existing-root/manual-test [--no-cleanup] [--bootc PATH]
+#   --no-cleanup   Leave the VM running after the test
+#   --bootc PATH   Path to bootc binary (default: target/thin/bootc)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+WORK_DIR="/tmp/bootc-manual-test"
+VM_NAME="bootc-manual-test"
+VM_DISK="${WORK_DIR}/disk.qcow2"
+SSH_KEY="${WORK_DIR}/id_ed25519"
+SSH_PORT=22241
+IMAGE_REF="localhost/bootc-snapshot:latest"
+NO_CLEANUP=false
+BOOTC_BIN="${REPO_DIR}/target/thin/bootc"
+
+for arg in "$@"; do
+    case "${arg}" in
+        --no-cleanup) NO_CLEANUP=true ;;
+        --bootc)      shift; BOOTC_BIN="$1" ;;
+    esac
+done
+
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o LogLevel=ERROR -o BatchMode=yes"
+
+# Print command, wait for Enter, then run it.
+step() {
+    echo ""
+    echo "  \$ $*"
+    read -rp "  [Enter to run] "
+    "$@"
+}
+
+# Run a command on the VM over SSH.
+vm() {
+    ssh ${SSH_OPTS} -i "${SSH_KEY}" -p "${SSH_PORT}" fedora@127.0.0.1 "$@"
+}
+
+wait_ssh() {
+    echo "  Waiting for SSH..."
+    for _ in $(seq 1 60); do
+        sleep 5
+        vm true 2>/dev/null && return 0
+    done
+    echo "ERROR: SSH did not become available" >&2; exit 1
+}
+
+cleanup() {
+    if [[ "${NO_CLEANUP}" == true ]]; then
+        echo ""
+        echo "VM left running. To connect:"
+        echo "  ssh -i ${SSH_KEY} -p ${SSH_PORT} fedora@127.0.0.1"
+        echo "To clean up:"
+        echo "  virsh destroy ${VM_NAME} && virsh undefine ${VM_NAME} --remove-all-storage"
+        return
+    fi
+    echo "Cleaning up..."
+    virsh destroy  "${VM_NAME}" 2>/dev/null || true
+    virsh undefine "${VM_NAME}" --remove-all-storage 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# ── Preflight ─────────────────────────────────────────────────────────────────
+
+echo ""
+echo "bootc install from-existing-root — manual test"
+echo "==============================================="
+echo ""
+echo "Each command is shown before it runs. Press Enter to execute, Ctrl-C to stop."
+echo ""
+echo "Work dir:  ${WORK_DIR}"
+echo "VM name:   ${VM_NAME}"
+echo "SSH port:  ${SSH_PORT} (host) → 22 (VM)"
+echo "Image ref: ${IMAGE_REF}"
+echo ""
+
+[[ -x "${BOOTC_BIN}" ]] || { echo "ERROR: bootc binary not found at ${BOOTC_BIN}"; echo "Build it with: cargo build --profile=thin -p bootc"; exit 1; }
+echo "bootc binary: ${BOOTC_BIN} ($(du -sh "${BOOTC_BIN}" | cut -f1))"
+
+mkdir -p "${WORK_DIR}"
+
+# ── SSH key ───────────────────────────────────────────────────────────────────
+
+if [[ ! -f "${SSH_KEY}" ]]; then
+    step ssh-keygen -t ed25519 -f "${SSH_KEY}" -N "" -q
+fi
+SSH_PUB="$(cat "${SSH_KEY}.pub")"
+
+# ── Download Fedora 44 cloud image ────────────────────────────────────────────
+
+if [[ ! -f "${VM_DISK}" ]]; then
+    FEDORA_URL="https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.1.x86_64.qcow2"
+    RAW_DISK="${WORK_DIR}/fedora44.qcow2"
+
+    step curl -L --progress-bar -o "${RAW_DISK}" "${FEDORA_URL}"
+    step qemu-img create -f qcow2 -b "${RAW_DISK}" -F qcow2 "${VM_DISK}" 20G
+fi
+
+# ── Cloud-init ISO (injects SSH key) ─────────────────────────────────────────
+
+CLOUD_INIT_ISO="${WORK_DIR}/cloud-init.iso"
+mkdir -p "${WORK_DIR}/ci"
+cat > "${WORK_DIR}/ci/meta-data" <<EOF
+instance-id: ${VM_NAME}
+local-hostname: ${VM_NAME}
+EOF
+cat > "${WORK_DIR}/ci/user-data" <<EOF
+#cloud-config
+users:
+  - name: fedora
+    groups: wheel
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - ${SSH_PUB}
+ssh_pwauth: false
+runcmd:
+  - systemctl enable --now sshd
+EOF
+step xorriso -as mkisofs -output "${CLOUD_INIT_ISO}" -volid cidata -joliet -rock \
+    "${WORK_DIR}/ci/user-data" "${WORK_DIR}/ci/meta-data"
+
+# ── Define and start VM ───────────────────────────────────────────────────────
+
+virsh destroy  "${VM_NAME}" 2>/dev/null || true
+virsh undefine "${VM_NAME}" 2>/dev/null || true
+
+step virt-install \
+    --name "${VM_NAME}" \
+    --memory 2048 \
+    --vcpus 2 \
+    --disk "path=${VM_DISK},format=qcow2,bus=virtio,cache=writeback" \
+    --disk "path=${CLOUD_INIT_ISO},device=cdrom" \
+    --os-variant fedora41 \
+    --network "user,hostfwd=tcp::${SSH_PORT}-:22" \
+    --graphics none \
+    --noautoconsole \
+    --import
+
+wait_ssh
+
+# ── Install tools and bootc ───────────────────────────────────────────────────
+
+step ssh ${SSH_OPTS} -i "${SSH_KEY}" -p "${SSH_PORT}" fedora@127.0.0.1 \
+    sudo dnf install -y buildah ostree skopeo dracut
+
+step scp ${SSH_OPTS} -i "${SSH_KEY}" -P "${SSH_PORT}" \
+    "${BOOTC_BIN}" fedora@127.0.0.1:/tmp/bootc
+
+step ssh ${SSH_OPTS} -i "${SSH_KEY}" -p "${SSH_PORT}" fedora@127.0.0.1 \
+    sudo install -m 0755 /tmp/bootc /usr/local/bin/bootc
+
+step ssh ${SSH_OPTS} -i "${SSH_KEY}" -p "${SSH_PORT}" fedora@127.0.0.1 \
+    bootc --version
+
+# ── Convert ───────────────────────────────────────────────────────────────────
+
+echo ""
+echo "  Next: run bootc install from-existing-root (takes several minutes)"
+echo ""
+step ssh ${SSH_OPTS} -i "${SSH_KEY}" -p "${SSH_PORT}" \
+    -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
+    fedora@127.0.0.1 \
+    "sudo bootc install from-existing-root --skip-push --image-ref '${IMAGE_REF}' --acknowledge-destructive"
+
+# ── Reboot and verify ─────────────────────────────────────────────────────────
+
+step ssh ${SSH_OPTS} -i "${SSH_KEY}" -p "${SSH_PORT}" fedora@127.0.0.1 \
+    sudo reboot
+
+sleep 10
+wait_ssh
+
+step ssh ${SSH_OPTS} -i "${SSH_KEY}" -p "${SSH_PORT}" fedora@127.0.0.1 \
+    sudo bootc status
+
+echo ""
+echo "Done. The VM is now running as a bootc-managed system."
