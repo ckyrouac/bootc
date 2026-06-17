@@ -140,6 +140,40 @@ const BUILDAH_STORAGE_ARGS: &[&str] = &["--storage-driver", "vfs"];
 /// SSH authorized_keys mount point inside the install container.
 const SSH_KEY_MOUNT: &str = "/bootc_authorized_ssh_keys/root";
 
+/// Symlinks that must exist at the root of a bootc image but are plain
+/// directories in a package-mode (RPM) system.
+///
+/// In a proper bootc base image (e.g. `quay.io/fedora/fedora-bootc:44`) these
+/// symlinks are set up by the rpm-ostree compose postprocessing code
+/// (`compose_init_rootfs_strict` / `OSTREE_HOME_SYMLINKS` in
+/// `composepost.rs`).  A package-mode system ships real directories in these
+/// locations because the standard `filesystem` RPM does not create the
+/// ostree-layout symlinks — only the rpm-ostree compose path does.
+///
+/// `from-existing-root` snapshots the running package-mode system verbatim, so
+/// the resulting OCI image ends up with real directories instead of symlinks.
+/// This table is used by `inject_required_files` to fix up the image after the
+/// snapshot is taken, replicating the same layout that a compose would produce.
+///
+/// Each entry is `(link_path, link_target, var_subdir)`:
+/// - `link_path`   — absolute path inside the container that becomes a symlink
+/// - `link_target` — the symlink target (relative, as rpm-ostree uses)
+/// - `var_subdir`  — subdirectory under `/var` to create as the backing store,
+///                   or `""` if the target is not under `/var` (e.g. `/media`)
+///
+/// Any content already present at `link_path` on the source system is moved
+/// into `var_subdir` first so that user data (home directories, service state,
+/// etc.) is not lost.
+const VAR_SYMLINKS: &[(&str, &str, &str)] = &[
+    // From rpm-ostree OSTREE_HOME_SYMLINKS:
+    ("/home",  "var/home",    "home"),
+    ("/root",  "var/roothome","roothome"),
+    // From rpm-ostree ostree_strict_mode_symlinks:
+    ("/srv",   "var/srv",     "srv"),
+    ("/mnt",   "var/mnt",     "mnt"),
+    ("/media", "run/media",   ""),    // points into /run, no /var backing dir needed
+];
+
 
 
 // ── Options struct ────────────────────────────────────────────────────────────
@@ -921,6 +955,63 @@ fn inject_required_files(
         );
     }
 
+    // Replace package-mode real directories with the ostree-layout symlinks.
+    //
+    // A package-mode system has real directories at /home, /root, /srv, /mnt,
+    // and /media.  A bootc image requires these to be symlinks into /var (or
+    // /run for /media) — the same layout that rpm-ostree's compose
+    // postprocessing (`compose_init_rootfs_strict`) produces.
+    //
+    // For each path we:
+    //   1. Skip if it is already a symlink (idempotent / already-converted image).
+    //   2. If a /var backing directory is configured and the source path is a
+    //      non-empty real directory, move its contents there so no user data is
+    //      lost (important for /home and /root).
+    //   3. Remove the now-empty real directory.
+    //   4. Create the symlink.
+    println!("      Replacing package-mode directories with ostree /var symlinks");
+    for (link_path, link_target, var_subdir) in VAR_SYMLINKS {
+        // Build a single shell snippet that is safe and idempotent:
+        //
+        //   • If the path is already a symlink, do nothing.
+        //   • If a /var backing dir is requested, ensure it exists and move any
+        //     existing content into it before removing the source directory.
+        //   • Remove the (now empty, or never-existed) source path.
+        //   • Create the symlink.
+        let script = if var_subdir.is_empty() {
+            // No /var backing dir (e.g. /media → run/media). Just replace
+            // whatever is there with the symlink; /media is always empty on a
+            // package-mode system.
+            format!(
+                "test -L '{link_path}' && exit 0; \
+                 rm -rf '{link_path}'; \
+                 ln -s '{link_target}' '{link_path}'"
+            )
+        } else {
+            format!(
+                "test -L '{link_path}' && exit 0; \
+                 mkdir -p '/var/{var_subdir}'; \
+                 if [ -d '{link_path}' ]; then \
+                   cp -a '{link_path}/.' '/var/{var_subdir}/'; \
+                 fi; \
+                 rm -rf '{link_path}'; \
+                 ln -s '{link_target}' '{link_path}'"
+            )
+        };
+
+        let status = std::process::Command::new(bootc_utils::buildah_bin())
+            .args(sargs)
+            .args(["run", container_id, "--", "sh", "-c", &script])
+            .status()
+            .context(format!("Creating {link_path} → {link_target} symlink in container"))?;
+        ensure!(
+            status.success(),
+            "`buildah run` failed while creating {link_path} → {link_target} symlink (exit code {:?})",
+            status.code()
+        );
+        println!("        {link_path} → {link_target}");
+    }
+
     for (path, mode) in RECREATE_EMPTY_DIRS {
         let status = std::process::Command::new(bootc_utils::buildah_bin())
             .args(sargs)
@@ -1247,6 +1338,37 @@ mod tests {
             !EXCLUDED_PATHS.iter().any(|p| p.starts_with("/usr")),
             "/usr (including DKMS modules) should be included in the snapshot"
         );
+    }
+
+    #[test]
+    fn test_var_symlinks_cover_required_paths() {
+        // Verify the ostree-layout symlinks that must be present in the image.
+        let required: &[(&str, &str)] = &[
+            ("/home",  "var/home"),
+            ("/root",  "var/roothome"),
+            ("/srv",   "var/srv"),
+            ("/mnt",   "var/mnt"),
+            ("/media", "run/media"),
+        ];
+        for (path, target) in required {
+            assert!(
+                VAR_SYMLINKS.iter().any(|(p, t, _)| p == path && t == target),
+                "VAR_SYMLINKS is missing entry for {path} → {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_var_symlinks_not_in_excluded_paths() {
+        // The link paths themselves must NOT be in EXCLUDED_PATHS — we need
+        // their content to be captured by the tar snapshot so we can migrate it
+        // into /var before replacing them with symlinks.
+        for (link_path, _, _) in VAR_SYMLINKS {
+            assert!(
+                !EXCLUDED_PATHS.contains(link_path),
+                "{link_path} must not be in EXCLUDED_PATHS (content needs to be snapshotted)"
+            );
+        }
     }
 
     #[test]
