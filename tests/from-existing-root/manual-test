@@ -253,7 +253,6 @@ ssh_pwauth: false
 hostname: ${VM_NAME}
 runcmd:
   - systemctl enable --now sshd
-  - loginctl enable-linger fedora
 EOF
 xorriso -as mkisofs -output "${CLOUD_INIT_ISO}" -volid cidata -joliet -rock \
     "${WORK_DIR}/ci/user-data" "${WORK_DIR}/ci/meta-data" 2>/dev/null
@@ -472,10 +471,14 @@ echo "  VM configured."
 
 # ── Install and seed PostgreSQL ───────────────────────────────────────────────
 #
-# Run PostgreSQL as a rootless podman container under the fedora user.
-# Data lives in /var/lib/pgsql/data so it survives into the bootc deployment
-# (the bootc install preserves /var in-place).
-# A systemd user unit (via quadlet) starts the container automatically.
+# Install PostgreSQL via dnf in the VM.  The VM's QEMU user-mode NAT cannot
+# reach Fedora mirrors directly, so dnf is pointed at the sandbox proxy
+# (10.200.0.1:3128) with the sandbox MITM CA cert trusted.
+#
+# PostgreSQL runs as a native systemd service (postgresql.service).
+# Data lives in /var/lib/pgsql/data, which is captured in the bootc snapshot
+# and preserved in-place across the conversion (bootc install leaves /var
+# intact on the physical disk).
 #
 # Test data inserted:
 #   database: testdb
@@ -488,41 +491,52 @@ if [[ "${YES}" != true ]]; then
     read -rp "  [Enter to run] "
 fi
 
-vm bash -s << 'PGSETUP'
+# Copy the sandbox proxy CA cert into the VM so dnf can verify the proxy's TLS.
+PROXY_CA=/etc/openshell-tls/ca-bundle.pem
+if [[ -f "${PROXY_CA}" ]]; then
+    scp ${SSH_OPTS} -i "${SSH_KEY}" -P "${SSH_PORT}" \
+        "${PROXY_CA}" fedora@127.0.0.1:/tmp/sandbox-ca.pem
+else
+    # No proxy CA on this host — create an empty placeholder so the remote
+    # script can detect it is absent and skip proxy configuration.
+    ssh ${SSH_OPTS} -i "${SSH_KEY}" -p "${SSH_PORT}" fedora@127.0.0.1 \
+        "touch /tmp/sandbox-ca.pem"
+fi
+
+vm sudo bash -s << 'PGSETUP'
 set -eo pipefail
 
-PG_IMAGE="docker.io/library/postgres:16"
-PG_DATA="/var/lib/pgsql/data"
-PG_PASSWORD="testpassword"
-QUADLET_DIR="${HOME}/.config/containers/systemd"
+PROXY_URL="http://10.200.0.1:3128"
+PROXY_CA=/tmp/sandbox-ca.pem
 
-echo "--- Pulling postgres image ---"
-podman pull "${PG_IMAGE}"
+echo "--- Configuring dnf to use sandbox proxy ---"
+# Trust the sandbox MITM CA system-wide so dnf (and psql TLS) can verify it.
+if [[ -s "${PROXY_CA}" ]]; then
+    cp "${PROXY_CA}" /etc/pki/ca-trust/source/anchors/sandbox-ca.pem
+    update-ca-trust
+fi
+# Point dnf at the proxy.
+echo "proxy=${PROXY_URL}" >> /etc/dnf/dnf.conf
 
-echo "--- Creating data directory (owned by fedora for rootless podman) ---"
-sudo mkdir -p "${PG_DATA}"
-sudo chown fedora:fedora "${PG_DATA}"
+echo "--- Installing postgresql-server ---"
+dnf install -y postgresql-server
 
-echo "--- Starting postgres container ---"
-podman run -d \
-    --name postgres \
-    --restart=always \
-    -e POSTGRES_PASSWORD="${PG_PASSWORD}" \
-    -e PGDATA="${PG_DATA}" \
-    -v "${PG_DATA}:${PG_DATA}:z" \
-    -p 127.0.0.1:5432:5432 \
-    "${PG_IMAGE}"
+echo "--- Initialising the database cluster ---"
+postgresql-setup --initdb
 
-echo "--- Waiting for postgres to be ready ---"
+echo "--- Enabling and starting postgresql.service ---"
+systemctl enable --now postgresql
+
+echo "--- Waiting for PostgreSQL to accept connections ---"
 for i in $(seq 1 30); do
     sleep 2
-    podman exec postgres pg_isready -U postgres 2>/dev/null && break
+    pg_isready -U postgres 2>/dev/null && break
     echo "  waiting... (${i}/30)"
 done
-podman exec postgres pg_isready -U postgres
+pg_isready -U postgres
 
 echo "--- Creating test database and seeding data ---"
-podman exec postgres psql -U postgres <<'SQL'
+sudo -u postgres psql <<'SQL'
 CREATE DATABASE testdb;
 \c testdb
 CREATE TABLE bootc_test (
@@ -536,34 +550,7 @@ SELECT * FROM bootc_test;
 SQL
 
 echo "--- Verifying seeded data ---"
-podman exec postgres psql -U postgres -d testdb \
-    -c "SELECT count(*) FROM bootc_test;"
-
-echo "--- Installing quadlet unit for auto-start after reboot ---"
-mkdir -p "${QUADLET_DIR}"
-cat > "${QUADLET_DIR}/postgres.container" << QUADLET
-[Unit]
-Description=PostgreSQL (bootc conversion test)
-After=network.target
-
-[Container]
-Image=${PG_IMAGE}
-ContainerName=postgres
-Environment=POSTGRES_PASSWORD=${PG_PASSWORD}
-Environment=PGDATA=${PG_DATA}
-Volume=${PG_DATA}:${PG_DATA}:z
-PublishPort=127.0.0.1:5432:5432
-
-[Service]
-Restart=always
-
-[Install]
-WantedBy=default.target
-QUADLET
-
-# Force systemd to pick up the new quadlet unit
-systemctl --user daemon-reload
-systemctl --user enable postgres.service 2>/dev/null || true
+sudo -u postgres psql -d testdb -c "SELECT count(*) FROM bootc_test;"
 
 echo "--- PostgreSQL setup complete ---"
 PGSETUP
@@ -606,21 +593,19 @@ if [[ "${YES}" != true ]]; then
     read -rp "  [Enter to run] "
 fi
 
-vm bash -s << 'PGVALIDATE'
+vm sudo bash -s << 'PGVALIDATE'
 set -eo pipefail
 
-PG_PASSWORD="testpassword"
-
-echo "--- Waiting for postgres container to be running ---"
+echo "--- Waiting for postgresql.service to be active ---"
 for i in $(seq 1 30); do
     sleep 3
-    podman exec postgres pg_isready -U postgres 2>/dev/null && break
+    pg_isready -U postgres 2>/dev/null && break
     echo "  waiting... (${i}/30)"
 done
-podman exec postgres pg_isready -U postgres
+pg_isready -U postgres
 
 echo "--- Querying test data ---"
-result=$(podman exec postgres psql -U postgres -d testdb -t -A \
+result=$(sudo -u postgres psql -d testdb -t -A \
     -c "SELECT payload FROM bootc_test ORDER BY id;")
 echo "${result}"
 
@@ -635,7 +620,7 @@ for row in "${expected_rows[@]}"; do
     fi
 done
 
-row_count=$(podman exec postgres psql -U postgres -d testdb -t -A \
+row_count=$(sudo -u postgres psql -d testdb -t -A \
     -c "SELECT count(*) FROM bootc_test;")
 if [[ "${row_count}" == "2" ]]; then
     echo "  PASS: row count is ${row_count}"
