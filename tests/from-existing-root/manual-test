@@ -253,6 +253,7 @@ ssh_pwauth: false
 hostname: ${VM_NAME}
 runcmd:
   - systemctl enable --now sshd
+  - loginctl enable-linger fedora
 EOF
 xorriso -as mkisofs -output "${CLOUD_INIT_ISO}" -volid cidata -joliet -rock \
     "${WORK_DIR}/ci/user-data" "${WORK_DIR}/ci/meta-data" 2>/dev/null
@@ -469,7 +470,105 @@ REMOTE
 
 echo "  VM configured."
 
-# ── Convert ───────────────────────────────────────────────────────────────────
+# ── Install and seed PostgreSQL ───────────────────────────────────────────────
+#
+# Run PostgreSQL as a rootless podman container under the fedora user.
+# Data lives in /var/lib/pgsql/data so it survives into the bootc deployment
+# (the bootc install preserves /var in-place).
+# A systemd user unit (via quadlet) starts the container automatically.
+#
+# Test data inserted:
+#   database: testdb
+#   table:    bootc_test(id SERIAL PRIMARY KEY, payload TEXT)
+#   rows:     ('hello from package mode'), ('conversion test row')
+
+echo ""
+echo "  Installing and seeding PostgreSQL…"
+if [[ "${YES}" != true ]]; then
+    read -rp "  [Enter to run] "
+fi
+
+vm bash -s << 'PGSETUP'
+set -eo pipefail
+
+PG_IMAGE="docker.io/library/postgres:16"
+PG_DATA="/var/lib/pgsql/data"
+PG_PASSWORD="testpassword"
+QUADLET_DIR="${HOME}/.config/containers/systemd"
+
+echo "--- Pulling postgres image ---"
+podman pull "${PG_IMAGE}"
+
+echo "--- Creating data directory (owned by fedora for rootless podman) ---"
+sudo mkdir -p "${PG_DATA}"
+sudo chown fedora:fedora "${PG_DATA}"
+
+echo "--- Starting postgres container ---"
+podman run -d \
+    --name postgres \
+    --restart=always \
+    -e POSTGRES_PASSWORD="${PG_PASSWORD}" \
+    -e PGDATA="${PG_DATA}" \
+    -v "${PG_DATA}:${PG_DATA}:z" \
+    -p 127.0.0.1:5432:5432 \
+    "${PG_IMAGE}"
+
+echo "--- Waiting for postgres to be ready ---"
+for i in $(seq 1 30); do
+    sleep 2
+    podman exec postgres pg_isready -U postgres 2>/dev/null && break
+    echo "  waiting... (${i}/30)"
+done
+podman exec postgres pg_isready -U postgres
+
+echo "--- Creating test database and seeding data ---"
+podman exec postgres psql -U postgres <<'SQL'
+CREATE DATABASE testdb;
+\c testdb
+CREATE TABLE bootc_test (
+    id      SERIAL PRIMARY KEY,
+    payload TEXT NOT NULL
+);
+INSERT INTO bootc_test (payload) VALUES
+    ('hello from package mode'),
+    ('conversion test row');
+SELECT * FROM bootc_test;
+SQL
+
+echo "--- Verifying seeded data ---"
+podman exec postgres psql -U postgres -d testdb \
+    -c "SELECT count(*) FROM bootc_test;"
+
+echo "--- Installing quadlet unit for auto-start after reboot ---"
+mkdir -p "${QUADLET_DIR}"
+cat > "${QUADLET_DIR}/postgres.container" << QUADLET
+[Unit]
+Description=PostgreSQL (bootc conversion test)
+After=network.target
+
+[Container]
+Image=${PG_IMAGE}
+ContainerName=postgres
+Environment=POSTGRES_PASSWORD=${PG_PASSWORD}
+Environment=PGDATA=${PG_DATA}
+Volume=${PG_DATA}:${PG_DATA}:z
+PublishPort=127.0.0.1:5432:5432
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target
+QUADLET
+
+# Force systemd to pick up the new quadlet unit
+systemctl --user daemon-reload
+systemctl --user enable postgres.service 2>/dev/null || true
+
+echo "--- PostgreSQL setup complete ---"
+PGSETUP
+
+echo "  PostgreSQL installed and seeded."
 
 echo ""
 echo "  Next: run bootc install from-existing-root (takes several minutes)"
@@ -496,5 +595,58 @@ wait_ssh
 
 step vm sudo bootc status
 
+# ── Validate PostgreSQL ───────────────────────────────────────────────────────
+#
+# After conversion, the bootc system should have the postgres container
+# running (via the quadlet unit) with the test data intact.
+
+echo ""
+echo "  Validating PostgreSQL data after conversion…"
+if [[ "${YES}" != true ]]; then
+    read -rp "  [Enter to run] "
+fi
+
+vm bash -s << 'PGVALIDATE'
+set -eo pipefail
+
+PG_PASSWORD="testpassword"
+
+echo "--- Waiting for postgres container to be running ---"
+for i in $(seq 1 30); do
+    sleep 3
+    podman exec postgres pg_isready -U postgres 2>/dev/null && break
+    echo "  waiting... (${i}/30)"
+done
+podman exec postgres pg_isready -U postgres
+
+echo "--- Querying test data ---"
+result=$(podman exec postgres psql -U postgres -d testdb -t -A \
+    -c "SELECT payload FROM bootc_test ORDER BY id;")
+echo "${result}"
+
+echo "--- Validating expected rows ---"
+expected_rows=("hello from package mode" "conversion test row")
+for row in "${expected_rows[@]}"; do
+    if echo "${result}" | grep -qF "${row}"; then
+        echo "  PASS: found '${row}'"
+    else
+        echo "  FAIL: missing '${row}'" >&2
+        exit 1
+    fi
+done
+
+row_count=$(podman exec postgres psql -U postgres -d testdb -t -A \
+    -c "SELECT count(*) FROM bootc_test;")
+if [[ "${row_count}" == "2" ]]; then
+    echo "  PASS: row count is ${row_count}"
+else
+    echo "  FAIL: expected 2 rows, got ${row_count}" >&2
+    exit 1
+fi
+
+echo "--- PostgreSQL validation passed ---"
+PGVALIDATE
+
 echo ""
 echo "Done. The VM is now running as a bootc-managed system."
+echo "PostgreSQL data survived the conversion."
