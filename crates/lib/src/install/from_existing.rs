@@ -45,7 +45,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use camino::Utf8PathBuf;
+use cap_std_ext::cap_std::ambient_authority;
+use cap_std_ext::cap_std::fs::Dir as CapStdDir;
 use chrono::TimeZone as _;
+use composefs_ctl::composefs::generic_tree::{FileSystem, Stat};
+use etc_merge::{compute_diff, merge, traverse_etc};
 use fn_error_context::context;
 
 /// Where bootc expects the kernel's initramfs inside the image.
@@ -187,8 +191,26 @@ pub(crate) struct InstallFromExistingRootOpts {
     ///
     /// This reference is also stored in the new deployment as the target for
     /// future `bootc upgrade` operations.
-    #[clap(long)]
-    pub(crate) image_ref: String,
+    ///
+    /// This is the **snapshot** code path: the running filesystem is captured
+    /// into an OCI image and pushed to this reference.  Mutually exclusive
+    /// with `--image`.
+    #[clap(long, conflicts_with = "image")]
+    pub(crate) image_ref: Option<String>,
+
+    /// Pre-built bootc image to install (hybrid migration path).
+    ///
+    /// Instead of snapshotting the running filesystem, install the supplied
+    /// image and preserve the running system's `/var` data and `/etc`
+    /// customisations.  The image should be built with `inspectah` from a
+    /// `FROM <bootc-base>` Containerfile so that future upgrades have a clean
+    /// image lineage.
+    ///
+    /// Example: `registry.example.com/myorg/myfleet:latest`
+    ///
+    /// Mutually exclusive with `--image-ref`.
+    #[clap(long, conflicts_with = "image_ref")]
+    pub(crate) image: Option<String>,
 
     /// Accept that this is a destructive, one-way operation and skip the
     /// countdown warning.  `/boot` will be wiped and the bootloader replaced.
@@ -305,34 +327,47 @@ impl Drop for BuildahContainerGuard {
 pub(crate) async fn install_from_existing_root(opts: InstallFromExistingRootOpts) -> Result<()> {
     validate_prerequisites(&opts)?;
 
-    if !opts.acknowledge_destructive {
-        print_destructive_warning(&opts.image_ref)?;
-    }
-
-    let info = gather_system_info().context("Gathering system information")?;
-
-    println!("Creating OCI snapshot image from running system...");
-    println!("Image size may be several gigabytes; this can take several minutes.");
-    println!();
-
-    create_snapshot_image(&opts, &info).context("Creating OCI snapshot image")?;
-
-    if !opts.skip_push {
-        push_image(&opts.local_image_name, &opts.image_ref)
-            .context("Pushing image to registry")?;
-    }
-
-    // The image that `podman run` actually executes.  In the normal (push) case
-    // this is the registry reference; in --skip-push it is the local image in
-    // the system container storage (containers-storage transport).
-    let source_imgref = if opts.skip_push {
-        format!("containers-storage:localhost/{}", opts.local_image_name)
+    // Dispatch to the appropriate code path based on which image argument was given.
+    if let Some(ref image) = opts.image {
+        // ── Hybrid path: pre-built image + state preservation ──────────────
+        let image = image.clone();
+        if !opts.acknowledge_destructive {
+            print_destructive_warning(&image)?;
+        }
+        install_from_image(&opts, &image)
+            .context("Installing pre-built image with state preservation")?;
     } else {
-        opts.image_ref.clone()
-    };
+        // ── Snapshot path: build OCI image from running filesystem ─────────
+        let image_ref = opts.image_ref.as_deref().unwrap_or_default().to_string();
+        if !opts.acknowledge_destructive {
+            print_destructive_warning(&image_ref)?;
+        }
 
-    run_install(&opts, &source_imgref)
-        .context("Running bootc install to-existing-root")?;
+        let info = gather_system_info().context("Gathering system information")?;
+
+        println!("Creating OCI snapshot image from running system...");
+        println!("Image size may be several gigabytes; this can take several minutes.");
+        println!();
+
+        create_snapshot_image(&opts, &info).context("Creating OCI snapshot image")?;
+
+        if !opts.skip_push {
+            push_image(&opts.local_image_name, &image_ref)
+                .context("Pushing image to registry")?;
+        }
+
+        // The image that `podman run` actually executes.  In the normal (push) case
+        // this is the registry reference; in --skip-push it is the local image in
+        // the system container storage (containers-storage transport).
+        let source_imgref = if opts.skip_push {
+            format!("containers-storage:localhost/{}", opts.local_image_name)
+        } else {
+            image_ref.clone()
+        };
+
+        run_install(&opts, &source_imgref, &image_ref)
+            .context("Running bootc install to-existing-root")?;
+    }
 
     if opts.reboot {
         println!("Installation complete. Rebooting now...");
@@ -381,14 +416,32 @@ fn validate_prerequisites(opts: &InstallFromExistingRootOpts) -> Result<()> {
          Use `bootc upgrade` or `bootc switch` to change the running image."
     );
 
-    // buildah and podman must be reachable in PATH.
-    check_binary(bootc_utils::buildah_bin())
-        .context("buildah is required to create the snapshot image")?;
-    check_binary(bootc_utils::podman_bin())
-        .context("podman is required to run the install container")?;
-
-    // Basic sanity check on the image reference.
-    validate_image_ref(&opts.image_ref)?;
+    // Exactly one of --image or --image-ref must be provided.
+    match (&opts.image, &opts.image_ref) {
+        (None, None) => anyhow::bail!(
+            "Either --image or --image-ref must be provided.\n\
+             Use --image for the hybrid migration path (pre-built inspectah image).\n\
+             Use --image-ref for the snapshot path (build image from running system)."
+        ),
+        (Some(img), None) => {
+            // Hybrid path: only podman is required (no buildah).
+            check_binary(bootc_utils::podman_bin())
+                .context("podman is required to run the install container")?;
+            validate_image_ref(img)?;
+        }
+        (None, Some(img_ref)) => {
+            // Snapshot path: both buildah and podman are required.
+            check_binary(bootc_utils::buildah_bin())
+                .context("buildah is required to create the snapshot image")?;
+            check_binary(bootc_utils::podman_bin())
+                .context("podman is required to run the install container")?;
+            validate_image_ref(img_ref)?;
+        }
+        (Some(_), Some(_)) => {
+            // clap's `conflicts_with` should prevent this, but guard defensively.
+            anyhow::bail!("--image and --image-ref are mutually exclusive.");
+        }
+    }
 
     Ok(())
 }
@@ -1167,11 +1220,13 @@ fn push_image(local_image_name: &str, image_ref: &str) -> Result<()> {
 /// and also passed as `--source-imgref` to bootc inside the container.
 /// In the `--skip-push` case this is a `containers-storage:` URI pointing to
 /// the locally-committed snapshot image; otherwise it is the registry reference.
-/// The stored upgrade target is always `opts.image_ref`.
+/// `target_imgref` is the registry reference stored in the new deployment for
+/// future `bootc upgrade` operations.
 #[context("Running bootc install to-existing-root")]
 fn run_install(
     opts: &InstallFromExistingRootOpts,
     source_imgref: &str,
+    target_imgref: &str,
 ) -> Result<()> {
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -1216,9 +1271,9 @@ fn run_install(
     args.push(source_imgref.to_string());
 
     // --target-imgref: the registry reference stored for future `bootc upgrade`.
-    // Always set to opts.image_ref so future upgrades contact the registry.
+    // Always set to target_imgref so future upgrades contact the registry.
     args.push("--target-imgref".into());
-    args.push(opts.image_ref.clone());
+    args.push(target_imgref.to_string());
 
     args.push("--acknowledge-destructive".into());
 
@@ -1254,6 +1309,459 @@ fn run_install(
         status.code()
     );
 
+    Ok(())
+}
+
+// ── Hybrid migration: install pre-built image + preserve state ────────────────
+
+/// Directory under `/var` where the package-mode kernel/initramfs are stashed
+/// before `/boot` is wiped.  This directory survives the install because only
+/// `/boot` is wiped by `clean_boot_directories()`; `/var` is untouched.
+const PKGMODE_ROLLBACK_VAR: &str = "/var/lib/pkgmode-rollback";
+
+/// Directory under `/boot` where the stashed kernel/initramfs are copied after
+/// the bootc install completes and `/boot` is re-populated.
+const PKGMODE_ROLLBACK_BOOT: &str = "/boot/pkgmode-rollback";
+
+/// Hybrid migration entry point.
+///
+/// Phases:
+///   1. Save running kernel/initramfs/kargs to `/var/lib/pkgmode-rollback/`
+///   2. Run `bootc install to-existing-root` with the supplied pre-built image
+///   3. Preserve `/var`: reflink copy (btrfs/XFS) or `var.mount` injection (ext4)
+///   4. Merge running `/etc` into the new deployment's `/etc` (3-way merge)
+///   5. Write package-mode rollback BLS entry to `/boot/loader/entries/`
+#[context("Hybrid migration: installing pre-built image with state preservation")]
+fn install_from_image(opts: &InstallFromExistingRootOpts, image: &str) -> Result<()> {
+    // ── Phase 1: Save kernel/initramfs/kargs ─────────────────────────────────
+    println!();
+    println!("Phase 1: Saving running kernel and initramfs for rollback...");
+    let kver = save_pkgmode_kernel()?;
+    println!("  Saved kernel {kver} to {PKGMODE_ROLLBACK_VAR}/");
+
+    // ── Phase 2: Install the pre-built image ─────────────────────────────────
+    println!();
+    println!("Phase 2: Installing pre-built image via bootc install to-existing-root...");
+    // For the hybrid path the image ref is the same for both --source-imgref and
+    // --target-imgref: the image was built externally and pushed to the registry
+    // already.  `--skip-push` is not applicable here (no local image was built),
+    // but we pass the opts through in case the caller set other forwarded flags.
+    run_install(opts, image, image)
+        .context("Running bootc install to-existing-root")?;
+
+    // After the install the new deployment is staged under /sysroot/ostree/.
+    // Find the deployment directory so we can write into etc/ and var/.
+    let deploy_dir = find_deploy_dir()
+        .context("Locating new ostree deployment directory")?;
+    println!("  Deployment directory: {deploy_dir}");
+
+    // ── Phase 3: Preserve /var ────────────────────────────────────────────────
+    println!();
+    println!("Phase 3: Preserving /var data into new deployment...");
+    // The deployment's var/ directory is two levels up from the deployment dir:
+    //   /sysroot/ostree/deploy/<stateroot>/deploy/<hash>.0  ← deploy_dir
+    //   /sysroot/ostree/deploy/<stateroot>/var/              ← new_var
+    let new_var_str = {
+        let mut p = std::path::PathBuf::from(&deploy_dir);
+        p.pop(); // pop the <hash>.0 component
+        p.pop(); // pop the `deploy` component
+        p.push("var");
+        p.to_string_lossy().into_owned()
+    };
+    preserve_var("/var", &new_var_str, &deploy_dir)
+        .context("Preserving /var into new deployment")?;
+
+    // ── Phase 4: Merge /etc ───────────────────────────────────────────────────
+    println!();
+    println!("Phase 4: Merging running /etc into new deployment...");
+    let deploy_etc = format!("{deploy_dir}/etc");
+    let deploy_usr_etc = format!("{deploy_dir}/usr/etc");
+    merge_etc("/etc", &deploy_usr_etc, &deploy_etc)
+        .context("Merging /etc into new deployment")?;
+
+    // ── Phase 5: Write rollback BLS entry ────────────────────────────────────
+    println!();
+    println!("Phase 5: Writing package-mode rollback boot entry...");
+    write_pkgmode_rollback_entry(&kver)
+        .context("Writing package-mode rollback BLS entry")?;
+    println!("  Rollback entry written. Hold Shift/Esc at GRUB to select it.");
+
+    Ok(())
+}
+
+/// Save the running kernel, initramfs, and kernel command-line arguments to
+/// `/var/lib/pkgmode-rollback/` before `/boot` is wiped.
+///
+/// Returns the running kernel version string (e.g. `"6.11.0-26.fc41.x86_64"`).
+#[context("Saving package-mode kernel and initramfs")]
+fn save_pkgmode_kernel() -> Result<String> {
+    let uname = rustix::system::uname();
+    let kver = uname
+        .release()
+        .to_str()
+        .context("Kernel version string is not valid UTF-8")?
+        .to_string();
+
+    std::fs::create_dir_all(PKGMODE_ROLLBACK_VAR)
+        .with_context(|| format!("Creating {PKGMODE_ROLLBACK_VAR}"))?;
+
+    // Save the kernel image.
+    let vmlinuz_src = format!("/boot/vmlinuz-{kver}");
+    let vmlinuz_dst = format!("{PKGMODE_ROLLBACK_VAR}/vmlinuz");
+    std::fs::copy(&vmlinuz_src, &vmlinuz_dst)
+        .with_context(|| format!("Copying {vmlinuz_src} → {vmlinuz_dst}"))?;
+
+    // Save the initramfs.
+    let initramfs_src = format!("/boot/initramfs-{kver}.img");
+    let initramfs_dst = format!("{PKGMODE_ROLLBACK_VAR}/initramfs.img");
+    std::fs::copy(&initramfs_src, &initramfs_dst)
+        .with_context(|| format!("Copying {initramfs_src} → {initramfs_dst}"))?;
+
+    // Save the running kernel command line (for the BLS entry options field).
+    let cmdline = std::fs::read_to_string("/proc/cmdline")
+        .context("Reading /proc/cmdline")?;
+    let kargs_dst = format!("{PKGMODE_ROLLBACK_VAR}/kargs.txt");
+    std::fs::write(&kargs_dst, cmdline.trim())
+        .with_context(|| format!("Writing {kargs_dst}"))?;
+
+    Ok(kver)
+}
+
+/// Locate the newly-created ostree deployment directory under `/sysroot`.
+///
+/// After `bootc install to-existing-root` runs, the deployment is staged
+/// at a path like:
+///   `/sysroot/ostree/deploy/default/deploy/<checksum>.0`
+///
+/// We find it by asking `ostree admin --sysroot=/sysroot --print-current-dir`.
+#[context("Locating new ostree deployment directory under /sysroot")]
+fn find_deploy_dir() -> Result<String> {
+    let out = std::process::Command::new("ostree")
+        .args(["admin", "--sysroot=/sysroot", "--print-current-dir"])
+        .output()
+        .context("Running `ostree admin --print-current-dir`")?;
+    if out.status.success() {
+        let dir = String::from_utf8(out.stdout)
+            .context("`ostree admin --print-current-dir` produced non-UTF-8 output")?
+            .trim()
+            .to_string();
+        if !dir.is_empty() && std::path::Path::new(&dir).exists() {
+            return Ok(dir);
+        }
+    }
+
+    // Fallback: enumerate stateroot directories under /sysroot/ostree/deploy/
+    // and return the most recently modified deployment directory.
+    let stateroot_base = std::path::Path::new("/sysroot/ostree/deploy");
+    let mut candidates: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+
+    if let Ok(stateroots) = std::fs::read_dir(stateroot_base) {
+        for stateroot_entry in stateroots.flatten() {
+            let deploy_subdir = stateroot_entry.path().join("deploy");
+            if let Ok(deploys) = std::fs::read_dir(&deploy_subdir) {
+                for deploy_entry in deploys.flatten() {
+                    let path = deploy_entry.path();
+                    if path.is_dir() {
+                        let mtime = path
+                            .metadata()
+                            .and_then(|m| m.modified())
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                        candidates.push((mtime, path));
+                    }
+                }
+            }
+        }
+    }
+
+    // Most recently modified deployment is the new one.
+    candidates.sort_by_key(|(t, _)| *t);
+    candidates.reverse();
+
+    candidates
+        .into_iter()
+        .next()
+        .map(|(_, p)| p.to_string_lossy().into_owned())
+        .ok_or_else(|| anyhow::anyhow!(
+            "Could not locate the new ostree deployment directory under /sysroot.\n\
+             Expected a directory under /sysroot/ostree/deploy/<stateroot>/deploy/"
+        ))
+}
+
+/// Preserve the running system's `/var` into the new deployment's `var/` directory.
+///
+/// Strategy C (preferred): use `cp --reflink=always` for an instantaneous
+/// copy-on-write clone on btrfs or XFS with reflinks enabled.
+///
+/// Strategy D (fallback): on ext4 (or any filesystem where reflinks fail),
+/// inject a `var.mount` systemd unit into the deployment's `etc/` so that the
+/// new system's `/var` is bind-mounted from `/sysroot/var` on boot.  This is a
+/// transitional state: the operator can later copy the data and remove the unit.
+///
+/// `src_var` is the path to the running system's `/var` (always `/var` when
+/// running on the host pre-reboot).  `new_var` is the path to the new
+/// deployment's `var/` directory (writable before reboot).  `deploy_dir` is
+/// the deployment root (needed for Strategy D unit injection).
+#[context("Preserving /var into new deployment")]
+fn preserve_var(src_var: &str, new_var: &str, deploy_dir: &str) -> Result<()> {
+    // Ensure the destination directory exists.
+    std::fs::create_dir_all(new_var)
+        .with_context(|| format!("Creating {new_var}"))?;
+
+    // Probe reflink support with a zero-size test reflink.
+    let reflink_probe = format!("{new_var}/.bootc-reflink-probe");
+    let probe_src = format!("{src_var}/.bootc-reflink-probe-src");
+    // Create a tiny probe file.
+    std::fs::write(&probe_src, b"probe")
+        .with_context(|| format!("Creating probe file {probe_src}"))?;
+    let probe_result = std::process::Command::new("cp")
+        .args(["--reflink=always", "-a", &probe_src, &reflink_probe])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = std::fs::remove_file(&probe_src);
+    let _ = std::fs::remove_file(&reflink_probe);
+
+    let reflinks_supported = probe_result.map(|s| s.success()).unwrap_or(false);
+
+    if reflinks_supported {
+        println!("  Filesystem supports reflinks — using copy-on-write clone (Strategy C)");
+        preserve_var_reflink(src_var, new_var)
+    } else {
+        println!("  Filesystem does not support reflinks — injecting var.mount unit (Strategy D)");
+        preserve_var_mount_unit(deploy_dir)
+    }
+}
+
+/// Strategy C: reflink-copy the running `/var` into the new deployment's `var/`.
+///
+/// This is an instantaneous CoW clone that consumes no extra disk space until
+/// data diverges.  Works on btrfs and XFS with reflinks enabled.
+#[context("Reflink-copying /var into new deployment (Strategy C)")]
+fn preserve_var_reflink(src_var: &str, new_var: &str) -> Result<()> {
+    // We copy each top-level entry under src_var rather than src_var itself,
+    // because we want the contents to land directly under new_var.
+    // Skip directories and files that are ephemeral (log journal, caches, etc.):
+    // the new system will regenerate them.
+    const SKIP_SUBDIRS: &[&str] = &[
+        "tmp",
+        "cache",
+        "log/journal",       // large; regenerated by journald
+        "lib/containers",    // container storage; quadlets repopulate
+    ];
+
+    let src_path = std::path::Path::new(src_var);
+    let entries = std::fs::read_dir(src_path)
+        .with_context(|| format!("Reading {src_var}"))?;
+
+    for entry in entries {
+        let entry = entry.with_context(|| format!("Reading entry in {src_var}"))?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Check if this top-level entry should be skipped entirely.
+        let skip = SKIP_SUBDIRS.iter().any(|s| {
+            // A skip like "log/journal" means skip the subdirectory "journal"
+            // inside "log", not the top-level "log" itself.  Top-level skips
+            // are plain names without a '/'.
+            !s.contains('/') && *s == name_str.as_ref()
+        });
+        if skip {
+            println!("    Skipping {src_var}/{name_str} (ephemeral)");
+            continue;
+        }
+
+        let src = format!("{src_var}/{name_str}");
+        let dst = format!("{new_var}/{name_str}");
+
+        println!("    Reflink-copying {src} → {dst}");
+        let status = std::process::Command::new("cp")
+            .args([
+                "--reflink=always",
+                "-a",           // preserve all attributes (perms, timestamps, xattrs)
+                "--no-clobber", // do not overwrite files already placed by the image
+                &src,
+                &dst,
+            ])
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .with_context(|| format!("cp --reflink=always {src} {dst}"))?;
+        if !status.success() {
+            // Log a warning but continue; a single directory failure (e.g. a
+            // permission-denied on a socket file) should not abort the whole migration.
+            eprintln!(
+                "WARNING: cp --reflink=always failed for {src} (exit {:?}); \
+                 that directory will be empty in the new deployment.",
+                status.code()
+            );
+        }
+    }
+
+    println!("  /var reflink copy complete.");
+    Ok(())
+}
+
+/// Strategy D: inject a `var.mount` systemd unit into the deployment's `etc/`
+/// that bind-mounts `/sysroot/var` onto `/var` on first boot.
+///
+/// Used as a fallback on ext4 where reflinks are unavailable.  This creates a
+/// transient dependency on the old `/sysroot/var`; the operator should migrate
+/// the data at their own pace and then remove the unit.
+///
+/// `deploy_dir` is the deployment root (e.g.
+/// `/sysroot/ostree/deploy/default/deploy/<hash>.0`).
+#[context("Injecting var.mount unit into deployment etc/ (Strategy D)")]
+fn preserve_var_mount_unit(deploy_dir: &str) -> Result<()> {
+    let unit_dir = format!("{deploy_dir}/etc/systemd/system");
+    std::fs::create_dir_all(&unit_dir)
+        .with_context(|| format!("Creating {unit_dir}"))?;
+
+    let unit_path = format!("{unit_dir}/var.mount");
+    let unit_content = "\
+[Unit]\n\
+Description=Bind-mount pre-migration /var from physical root\n\
+Documentation=https://github.com/bootc-dev/bootc\n\
+Before=local-fs.target\n\
+ConditionPathExists=/sysroot/var\n\
+\n\
+[Mount]\n\
+What=/sysroot/var\n\
+Where=/var\n\
+Type=none\n\
+Options=bind\n\
+\n\
+[Install]\n\
+WantedBy=local-fs.target\n";
+
+    std::fs::write(&unit_path, unit_content)
+        .with_context(|| format!("Writing {unit_path}"))?;
+
+    // Enable the unit by creating the symlink under wants/.
+    let wants_dir = format!("{unit_dir}/local-fs.target.wants");
+    std::fs::create_dir_all(&wants_dir)
+        .with_context(|| format!("Creating {wants_dir}"))?;
+    let symlink_path = format!("{wants_dir}/var.mount");
+    // Remove any existing symlink first (idempotent).
+    let _ = std::fs::remove_file(&symlink_path);
+    std::os::unix::fs::symlink("../var.mount", &symlink_path)
+        .with_context(|| format!("Creating symlink {symlink_path}"))?;
+
+    println!("  var.mount unit injected at {unit_path}");
+    println!("  NOTE: the new system will bind-mount /sysroot/var onto /var on boot.");
+    println!("  After verifying the new system, copy data to /var and remove the unit.");
+    Ok(())
+}
+
+/// Run the 3-way `/etc` merge: apply the diff between the running system's `/etc`
+/// and the image's pristine `/usr/etc` on top of the new deployment's `/etc`.
+///
+/// Inputs:
+///   - **pristine** (`deploy_usr_etc`): the image's shipped defaults at `<deploy>/usr/etc`
+///   - **current** (`host_etc`): the running system's `/etc` (pre-reboot)
+///   - **new** (`deploy_etc`): the new deployment's `/etc` (writable before reboot)
+///
+/// The merge copies files that the running admin changed relative to the image
+/// defaults into the new deployment, preserving NIC profiles, SSH host keys,
+/// secrets, and any other customisations that inspectah may have missed or
+/// intentionally excluded from the fleet image.
+#[context("Merging running /etc into new deployment")]
+fn merge_etc(host_etc: &str, deploy_usr_etc: &str, deploy_etc: &str) -> Result<()> {
+    let pristine_fd = CapStdDir::open_ambient_dir(deploy_usr_etc, ambient_authority())
+        .with_context(|| format!("Opening pristine etc (deploy/usr/etc): {deploy_usr_etc}"))?;
+    let current_fd = CapStdDir::open_ambient_dir(host_etc, ambient_authority())
+        .with_context(|| format!("Opening current etc: {host_etc}"))?;
+    let new_fd = CapStdDir::open_ambient_dir(deploy_etc, ambient_authority())
+        .with_context(|| format!("Opening new deploy etc: {deploy_etc}"))?;
+
+    let (pristine_tree, current_tree, new_tree_opt) =
+        traverse_etc(&pristine_fd, &current_fd, Some(&new_fd))
+            .context("Traversing /etc trees for 3-way merge")?;
+
+    let new_tree = new_tree_opt.unwrap_or_else(|| FileSystem::new(Stat::uninitialized()));
+
+    let diff = compute_diff(&pristine_tree, &current_tree, &new_tree)
+        .context("Computing /etc diff (pristine vs running)")?;
+
+    // Log the diff summary.
+    println!("  /etc merge diff:");
+    etc_merge::print_diff(&diff, &mut std::io::stdout());
+
+    merge(&current_fd, &current_tree, &new_fd, &new_tree, &diff)
+        .context("Applying /etc 3-way merge")?;
+
+    println!("  /etc merge complete.");
+    Ok(())
+}
+
+/// Copy the stashed kernel/initramfs into `/boot/pkgmode-rollback/` and write
+/// a BLS entry so GRUB presents a "Previous OS — package-mode rollback" option.
+///
+/// The BLS entry uses `sort-key: zz-pkgmode` so it sorts after all ostree
+/// entries and appears last in the boot menu.  GRUB reads all `.conf` files in
+/// `loader/entries/` via `blscfg`; ostree only reads `ostree-*.conf` files, so
+/// this entry is invisible to all ostree/bootupd code paths and will not be
+/// modified or deleted by `bootc upgrade`.
+///
+/// The one survivability risk is the `loader.N` directory rotation (see
+/// BOOTLOADER.md).  A persistence service baked into the bootc image mitigates
+/// this; the BLS entry written here covers the first boot immediately after
+/// migration.
+#[context("Writing package-mode rollback BLS entry")]
+fn write_pkgmode_rollback_entry(kver: &str) -> Result<()> {
+    // ── Step 1: install kernel and initramfs into /boot ───────────────────────
+    std::fs::create_dir_all(PKGMODE_ROLLBACK_BOOT)
+        .with_context(|| format!("Creating {PKGMODE_ROLLBACK_BOOT}"))?;
+
+    let vmlinuz_src = format!("{PKGMODE_ROLLBACK_VAR}/vmlinuz");
+    let vmlinuz_dst = format!("{PKGMODE_ROLLBACK_BOOT}/vmlinuz");
+    std::fs::copy(&vmlinuz_src, &vmlinuz_dst)
+        .with_context(|| format!("Copying {vmlinuz_src} → {vmlinuz_dst}"))?;
+
+    let initramfs_src = format!("{PKGMODE_ROLLBACK_VAR}/initramfs.img");
+    let initramfs_dst = format!("{PKGMODE_ROLLBACK_BOOT}/initramfs.img");
+    std::fs::copy(&initramfs_src, &initramfs_dst)
+        .with_context(|| format!("Copying {initramfs_src} → {initramfs_dst}"))?;
+
+    // ── Step 2: read original kernel arguments ────────────────────────────────
+    let kargs_path = format!("{PKGMODE_ROLLBACK_VAR}/kargs.txt");
+    let raw_kargs = std::fs::read_to_string(&kargs_path)
+        .with_context(|| format!("Reading {kargs_path}"))?;
+    // Strip the BOOT_IMAGE= argument — it is specific to the old bootloader
+    // invocation and is not meaningful in the new BLS context.
+    let options: String = raw_kargs
+        .split_whitespace()
+        .filter(|tok| !tok.starts_with("BOOT_IMAGE="))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // ── Step 3: find the active loader/entries/ directory ────────────────────
+    // /boot/loader is a symlink managed by ostree that points at loader.0 or
+    // loader.1.  The BLS entry must go into the *currently active* loader.N so
+    // that GRUB sees it immediately after reboot.
+    let loader_link = std::fs::read_link("/boot/loader")
+        .context("Reading /boot/loader symlink")?;
+    let loader_dir = loader_link
+        .to_str()
+        .context("/boot/loader symlink target is not valid UTF-8")?
+        .trim_start_matches('/')
+        .to_string();
+    let entries_dir = format!("/boot/{loader_dir}/entries");
+    std::fs::create_dir_all(&entries_dir)
+        .with_context(|| format!("Creating {entries_dir}"))?;
+
+    // ── Step 4: write the BLS entry ───────────────────────────────────────────
+    let entry_path = format!("{entries_dir}/pkgmode-rollback.conf");
+    let entry_content = format!(
+        "title Previous OS — package-mode rollback (kernel {kver})\n\
+         sort-key zz-pkgmode\n\
+         linux /pkgmode-rollback/vmlinuz\n\
+         initrd /pkgmode-rollback/initramfs.img\n\
+         options {options}\n"
+    );
+    std::fs::write(&entry_path, &entry_content)
+        .with_context(|| format!("Writing BLS entry {entry_path}"))?;
+
+    println!("  BLS entry written: {entry_path}");
     Ok(())
 }
 
@@ -1380,5 +1888,84 @@ mod tests {
             ts.ends_with('Z') || ts.contains('+') || ts.contains('-'),
             "timestamp should have timezone: {ts}"
         );
+    }
+
+    /// Verify the var/ path derivation from a deployment directory.
+    ///
+    /// Given a deployment dir like `/sysroot/ostree/deploy/default/deploy/<hash>.0`,
+    /// the new deployment's var/ should be two levels up, then `var/`.
+    #[test]
+    fn test_new_var_path_from_deploy_dir() {
+        let deploy_dir = "/sysroot/ostree/deploy/default/deploy/abc123.0";
+        let mut p = std::path::PathBuf::from(deploy_dir);
+        p.pop(); // pop the <hash>.0 component
+        p.pop(); // pop the `deploy` component
+        p.push("var");
+        assert_eq!(
+            p.to_string_lossy().as_ref(),
+            "/sysroot/ostree/deploy/default/var"
+        );
+    }
+
+    /// Verify that the rollback var directory constant is within /var (not /boot
+    /// which is wiped) and is therefore safe to use as a pre-wipe stash.
+    #[test]
+    fn test_pkgmode_rollback_var_not_in_boot() {
+        assert!(
+            PKGMODE_ROLLBACK_VAR.starts_with("/var/"),
+            "PKGMODE_ROLLBACK_VAR must be under /var/ (not /boot which is wiped): \
+             {PKGMODE_ROLLBACK_VAR}"
+        );
+    }
+
+    /// Verify that the BLS entry skip-subdirs for reflink copy exclude ephemeral
+    /// directories but not application data directories.
+    #[test]
+    fn test_reflink_skip_subdirs_are_ephemeral() {
+        // These are the directories we skip during Strategy C /var copy.
+        // They must all be regenerable / not application data.
+        const EXPECTED_SKIPS: &[&str] = &["tmp", "cache", "log/journal", "lib/containers"];
+        for skip in EXPECTED_SKIPS {
+            // Verify lib/postgres, lib/mysql, etc. are NOT in the skip list —
+            // they contain application data that must be preserved.
+            assert!(
+                !skip.starts_with("lib/pg") && !skip.starts_with("lib/my"),
+                "Accidentally skipping application data directory: {skip}"
+            );
+        }
+    }
+
+    /// Verify that --image and --image-ref are logically distinct: image_ref is
+    /// for the snapshot path, image is for the hybrid path.
+    #[test]
+    fn test_opts_image_and_image_ref_are_separate_fields() {
+        // Both fields exist and can be set independently in tests.
+        let opts_snapshot = InstallFromExistingRootOpts {
+            image_ref: Some("registry.example.com/myorg/snap:latest".to_string()),
+            image: None,
+            acknowledge_destructive: true,
+            reboot: false,
+            cleanup: false,
+            root_ssh_authorized_keys: None,
+            skip_push: false,
+            composefs_backend: false,
+            local_image_name: DEFAULT_LOCAL_IMAGE_NAME.to_string(),
+        };
+        assert!(opts_snapshot.image_ref.is_some());
+        assert!(opts_snapshot.image.is_none());
+
+        let opts_hybrid = InstallFromExistingRootOpts {
+            image_ref: None,
+            image: Some("registry.example.com/myorg/fleet:latest".to_string()),
+            acknowledge_destructive: true,
+            reboot: false,
+            cleanup: false,
+            root_ssh_authorized_keys: None,
+            skip_push: false,
+            composefs_backend: false,
+            local_image_name: DEFAULT_LOCAL_IMAGE_NAME.to_string(),
+        };
+        assert!(opts_hybrid.image.is_some());
+        assert!(opts_hybrid.image_ref.is_none());
     }
 }

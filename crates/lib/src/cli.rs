@@ -316,19 +316,20 @@ pub(crate) enum InstallOpts {
     ToExistingRoot(crate::install::InstallToExistingRootOpts),
     /// Convert this running package-mode system to a bootc (image-mode) system.
     ///
-    /// This command snapshots the running filesystem as a single-layer OCI container image,
-    /// pushes it to a container registry, and then installs it onto the running system using
-    /// `bootc install to-existing-root`. All filesystem content — including /opt, kernel
-    /// modules, and any out-of-tree (DKMS) drivers — is captured in the snapshot.
+    /// Two modes of operation are supported:
     ///
-    /// This is a DESTRUCTIVE, one-way operation with no automatic rollback:
+    /// **Snapshot mode** (`--image-ref <registry-ref>`): Snapshots the running filesystem
+    /// as a single-layer OCI container image, pushes it to a container registry, then
+    /// installs it onto the running system using `bootc install to-existing-root`.
+    /// Requires buildah and podman.
     ///
-    ///   - /boot is wiped and the bootloader is replaced
-    ///   - The system is managed by bootc after reboot
+    /// **Hybrid mode** (`--image <registry-ref>`): Installs a pre-built bootc image
+    /// (e.g. built from an inspectah-generated Containerfile) while preserving the
+    /// running system's `/var` data and `/etc` customisations.  Produces a generic
+    /// fleet image with a real upgrade path.  Requires only podman.
     ///
-    /// After reboot, the previous root content is accessible at /sysroot.
-    ///
-    /// Requires buildah and podman to be installed on the running system.
+    /// Both modes are DESTRUCTIVE and one-way: /boot is wiped and replaced.
+    /// After reboot the previous root content is accessible at /sysroot.
     ///
     /// EXPERIMENTAL: This is a proof-of-concept implementation.
     #[clap(hide = true)]
