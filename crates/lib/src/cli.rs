@@ -313,27 +313,11 @@ pub(crate) enum InstallOpts {
     /// the running host root filesystem. Currently, the host root filesystem's `/boot` partition
     /// will be wiped, but the content of the existing root will otherwise be retained, and will
     /// need to be cleaned up if desired when rebooted into the new root.
+    ///
+    /// When migrating from a package-mode system, use `--preserve-var` to copy `/var` data
+    /// into the new deployment and write a GRUB rollback entry, and `--merge-etc` to carry
+    /// forward `/etc` customisations via a 3-way merge.
     ToExistingRoot(crate::install::InstallToExistingRootOpts),
-    /// Convert this running package-mode system to a bootc (image-mode) system.
-    ///
-    /// Two modes of operation are supported:
-    ///
-    /// **Snapshot mode** (`--image-ref <registry-ref>`): Snapshots the running filesystem
-    /// as a single-layer OCI container image, pushes it to a container registry, then
-    /// installs it onto the running system using `bootc install to-existing-root`.
-    /// Requires buildah and podman.
-    ///
-    /// **Hybrid mode** (`--image <registry-ref>`): Installs a pre-built bootc image
-    /// (e.g. built from an inspectah-generated Containerfile) while preserving the
-    /// running system's `/var` data and `/etc` customisations.  Produces a generic
-    /// fleet image with a real upgrade path.  Requires only podman.
-    ///
-    /// Both modes are DESTRUCTIVE and one-way: /boot is wiped and replaced.
-    /// After reboot the previous root content is accessible at /sysroot.
-    ///
-    /// EXPERIMENTAL: This is a proof-of-concept implementation.
-    #[clap(hide = true)]
-    FromExistingRoot(crate::install::from_existing::InstallFromExistingRootOpts),
     /// Nondestructively create a fresh installation state inside an existing bootc system.
     ///
     /// This is a nondestructive variant of `install to-existing-root` that works only inside
@@ -2135,9 +2119,6 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
             }
             InstallOpts::ToExistingRoot(opts) => {
                 crate::install::install_to_existing_root(opts).await
-            }
-            InstallOpts::FromExistingRoot(opts) => {
-                crate::install::from_existing::install_from_existing_root(opts).await
             }
             InstallOpts::Reset(opts) => crate::install::install_reset(opts).await,
             InstallOpts::PrintConfiguration(opts) => crate::install::print_configuration(opts),
