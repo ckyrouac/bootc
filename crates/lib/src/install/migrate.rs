@@ -22,13 +22,14 @@
 //!   performs an instantaneous copy-on-write clone.  No extra disk space is used
 //!   until data diverges.
 //!
-//! - **Strategy D — bind-mount unit** (ext4 fallback): a `var.mount` systemd unit
-//!   is injected into the new deployment's `etc/` that bind-mounts
-//!   `<root_path>/var` onto `/var` on first boot.  This is a transitional state;
-//!   the operator migrates data at their own pace and then removes the unit.
+//! - **Strategy D — plain copy** (ext4 and other non-reflink filesystems):
+//!   `cp -a` copies each non-ephemeral subdirectory of `/var` into the new
+//!   deployment's stateroot `var/`.  This is correct but slow for large `/var`
+//!   trees, and **unsafe for live databases** (see the known-limitation comment
+//!   on `preserve_var_copy`).
 //!
 //! Well-known ephemeral subdirectories (`tmp`, `cache`, `log/journal`,
-//! `lib/containers`) are skipped in Strategy C.
+//! `lib/containers`) are skipped in both strategies.
 //!
 //! ## `/etc` merge (`--merge-etc`)
 //!
@@ -114,8 +115,18 @@ pub(crate) fn save_pkgmode_kernel(root_path: &Path) -> Result<String> {
         .with_context(|| format!("Copying {} → {}", initramfs_src.display(), initramfs_dst.display()))?;
 
     // Kernel command line — used verbatim (minus BOOT_IMAGE=) in the BLS entry.
-    let cmdline = std::fs::read_to_string("/proc/cmdline")
-        .context("Reading /proc/cmdline")?;
+    //
+    // Read from <root_path>/proc/cmdline rather than /proc/cmdline.  The install
+    // runs inside a container that has the host root bind-mounted at root_path
+    // (typically /target), so /target/proc is the host's /proc — with the correct
+    // host kernel cmdline.  The container's own /proc/cmdline would be the same
+    // value when --pid=host is used, but reading via root_path is more explicit
+    // and remains correct if the container is re-exec'd into a private mount
+    // namespace (ensure_self_unshared_mount_namespace), which does not affect
+    // the bind-mounted /target/proc.
+    let proc_cmdline_path = root_path.join("proc/cmdline");
+    let cmdline = std::fs::read_to_string(&proc_cmdline_path)
+        .with_context(|| format!("Reading {}", proc_cmdline_path.display()))?;
     let kargs_dst = stash.join("kargs.txt");
     std::fs::write(&kargs_dst, cmdline.trim())
         .with_context(|| format!("Writing {}", kargs_dst.display()))?;
@@ -151,7 +162,7 @@ pub(crate) fn preserve_var_and_write_rollback(root_path: &Path, kver: &str) -> R
 
     println!();
     println!("Preserving /var into new deployment...");
-    preserve_var(&root_path.join("var"), &new_var, &deploy_dir)
+    preserve_var(&root_path.join("var"), &new_var)
         .context("Preserving /var")?;
 
     println!();
@@ -235,8 +246,7 @@ fn find_deploy_dir(root_path: &Path) -> Result<PathBuf> {
 ///
 /// `src_var` is the running system's `/var` (at `<root_path>/var`).
 /// `new_var` is the new deployment's empty `var/` directory.
-/// `deploy_dir` is the deployment root (for Strategy D unit injection).
-fn preserve_var(src_var: &Path, new_var: &Path, deploy_dir: &Path) -> Result<()> {
+fn preserve_var(src_var: &Path, new_var: &Path) -> Result<()> {
     std::fs::create_dir_all(new_var)
         .with_context(|| format!("Creating {}", new_var.display()))?;
 
@@ -244,8 +254,8 @@ fn preserve_var(src_var: &Path, new_var: &Path, deploy_dir: &Path) -> Result<()>
         println!("  Filesystem supports reflinks — using copy-on-write clone (Strategy C)");
         preserve_var_reflink(src_var, new_var)
     } else {
-        println!("  Filesystem does not support reflinks — injecting var.mount unit (Strategy D)");
-        preserve_var_mount_unit(deploy_dir)
+        println!("  Filesystem does not support reflinks — falling back to full copy (Strategy D)");
+        preserve_var_copy(src_var, new_var)
     }
 }
 
@@ -302,19 +312,15 @@ fn preserve_var_reflink(src_var: &Path, new_var: &Path) -> Result<()> {
 
         if SKIP_JOURNAL && name_str == "log" {
             // Copy log/ but skip log/journal/.
-            copy_dir_skip_subdir(&src_entry, &dst_entry, "journal")?;
+            copy_dir_skip_subdir(&src_entry, &dst_entry, "journal", true)?;
             continue;
         }
 
         println!("    Reflink-copying {} → {}", src_entry.display(), dst_entry.display());
         let status = std::process::Command::new("cp")
-            .args([
-                "--reflink=always",
-                "-a",
-                "--no-clobber",
-            ])
+            .args(["--reflink=always", "-a", "--no-clobber"])
             .arg(&src_entry)
-            .arg(new_var)  // cp -a SRC DESTDIR copies SRC into DESTDIR
+            .arg(new_var)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()
@@ -336,8 +342,10 @@ fn preserve_var_reflink(src_var: &Path, new_var: &Path) -> Result<()> {
 
 /// Copy a directory recursively, skipping one named subdirectory.
 ///
-/// Used to copy `var/log/` while excluding `var/log/journal/`.
-fn copy_dir_skip_subdir(src: &Path, dst: &Path, skip_name: &str) -> Result<()> {
+/// Used by both Strategy C and Strategy D to copy `var/log/` while excluding
+/// `var/log/journal/`.  `reflink` selects whether `cp --reflink=always` or
+/// plain `cp -a` is used.
+fn copy_dir_skip_subdir(src: &Path, dst: &Path, skip_name: &str, reflink: bool) -> Result<()> {
     std::fs::create_dir_all(dst)
         .with_context(|| format!("Creating {}", dst.display()))?;
 
@@ -355,18 +363,23 @@ fn copy_dir_skip_subdir(src: &Path, dst: &Path, skip_name: &str) -> Result<()> {
         }
 
         let src_entry = src.join(name_str.as_ref());
-        let status = std::process::Command::new("cp")
-            .args(["--reflink=always", "-a", "--no-clobber"])
+        let mut cmd = std::process::Command::new("cp");
+        if reflink {
+            cmd.args(["--reflink=always", "-a", "--no-clobber"]);
+        } else {
+            cmd.args(["-a", "--no-clobber"]);
+        }
+        let status = cmd
             .arg(&src_entry)
             .arg(dst)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()
-            .with_context(|| format!("cp --reflink=always {}", src_entry.display()))?;
+            .with_context(|| format!("cp -a {}", src_entry.display()))?;
 
         if !status.success() {
             eprintln!(
-                "WARNING: cp --reflink=always failed for {} (exit {:?})",
+                "WARNING: cp failed for {} (exit {:?})",
                 src_entry.display(),
                 status.code()
             );
@@ -376,49 +389,79 @@ fn copy_dir_skip_subdir(src: &Path, dst: &Path, skip_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Strategy D: inject a `var.mount` systemd unit into `<deploy_dir>/etc/`
-/// that bind-mounts the host's `/var` (at the physical location it will have
-/// after reboot: `/sysroot/var`) onto the new system's `/var`.
+/// Strategy D: plain recursive copy of `/var` for filesystems without reflink support.
 ///
-/// This is a transitional state for ext4 systems without reflink support.
-#[context("Injecting var.mount unit into deployment etc/ (Strategy D)")]
-fn preserve_var_mount_unit(deploy_dir: &Path) -> Result<()> {
-    let unit_dir = deploy_dir.join("etc/systemd/system");
-    std::fs::create_dir_all(&unit_dir)
-        .with_context(|| format!("Creating {}", unit_dir.display()))?;
+/// # Known limitation
+///
+/// This performs a full `cp -a` of every included subdirectory of the running
+/// `/var` into the new deployment's ostree stateroot `var/`.  For most workloads
+/// this is fine, but it is **unsafe for databases and other applications that
+/// keep open write handles into `/var`** (e.g. PostgreSQL in `/var/lib/pgsql`,
+/// MySQL/MariaDB in `/var/lib/mysql`, SQLite databases under `/var/lib/*`).
+/// Copying a live database with `cp -a` will almost certainly produce a
+/// corrupted copy.
+///
+/// The correct fix is to run this migration only after stopping all stateful
+/// services that write to `/var`, or — better — to migrate the filesystem to
+/// btrfs or XFS (which support reflinks, Strategy C) so that the copy is
+/// instantaneous and atomic from the kernel's perspective.
+///
+/// A future improvement would be to accept a user-supplied exclusion list so
+/// that specific high-risk directories (e.g. `/var/lib/pgsql`) can be skipped
+/// and migrated manually.  For now, operators are responsible for stopping
+/// affected services before running `bootc install to-existing-root --preserve-var`
+/// on ext4 (or other non-reflink) filesystems.
+///
+/// See: <https://github.com/bootc-dev/bootc/issues/2220>
+#[context("Copying /var into new deployment (Strategy D)")]
+fn preserve_var_copy(src_var: &Path, new_var: &Path) -> Result<()> {
+    // Top-level names to skip — these are ephemeral / regenerable.
+    const SKIP: &[&str] = &["tmp", "cache", "lib/containers"];
+    // Also skip log/journal specifically (large; regenerated by journald).
+    const SKIP_JOURNAL: bool = true;
 
-    let unit_path = unit_dir.join("var.mount");
-    let unit_content = "\
-[Unit]\n\
-Description=Bind-mount pre-migration /var from physical root\n\
-Documentation=https://github.com/bootc-dev/bootc\n\
-Before=local-fs.target\n\
-ConditionPathExists=/sysroot/var\n\
-\n\
-[Mount]\n\
-What=/sysroot/var\n\
-Where=/var\n\
-Type=none\n\
-Options=bind\n\
-\n\
-[Install]\n\
-WantedBy=local-fs.target\n";
+    let entries = std::fs::read_dir(src_var)
+        .with_context(|| format!("Reading {}", src_var.display()))?;
 
-    std::fs::write(&unit_path, unit_content)
-        .with_context(|| format!("Writing {}", unit_path.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("Reading entry in {}", src_var.display()))?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
 
-    // Enable by creating the symlink under local-fs.target.wants/.
-    let wants_dir = unit_dir.join("local-fs.target.wants");
-    std::fs::create_dir_all(&wants_dir)
-        .with_context(|| format!("Creating {}", wants_dir.display()))?;
-    let symlink_path = wants_dir.join("var.mount");
-    let _ = std::fs::remove_file(&symlink_path);
-    std::os::unix::fs::symlink("../var.mount", &symlink_path)
-        .with_context(|| format!("Creating symlink {}", symlink_path.display()))?;
+        if SKIP.iter().any(|s| !s.contains('/') && *s == name_str.as_ref()) {
+            println!("    Skipping {} (ephemeral)", src_var.join(name_str.as_ref()).display());
+            continue;
+        }
 
-    println!("  var.mount unit injected at {}", unit_path.display());
-    println!("  NOTE: on first boot /var will be bind-mounted from /sysroot/var.");
-    println!("  After verifying the new system, copy data to /var and remove the unit.");
+        let src_entry = src_var.join(name_str.as_ref());
+        let dst_entry = new_var.join(name_str.as_ref());
+
+        if SKIP_JOURNAL && name_str == "log" {
+            copy_dir_skip_subdir(&src_entry, &dst_entry, "journal", false)?;
+            continue;
+        }
+
+        println!("    Copying {} → {}", src_entry.display(), dst_entry.display());
+        let status = std::process::Command::new("cp")
+            .args(["-a", "--no-clobber"])
+            .arg(&src_entry)
+            .arg(new_var)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .with_context(|| format!("cp -a {}", src_entry.display()))?;
+
+        if !status.success() {
+            eprintln!(
+                "WARNING: cp -a failed for {} (exit {:?}); \
+                 that entry may be absent or incomplete in the new deployment.",
+                src_entry.display(),
+                status.code()
+            );
+        }
+    }
+
+    println!("  /var copy complete.");
     Ok(())
 }
 
