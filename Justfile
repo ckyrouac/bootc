@@ -61,6 +61,12 @@ _nocache_arg := if nocache != "" { "--no-cache" } else { "" }
 _baseconfigs_env := if baseconfigs != "" { "--env=BOOTC_baseconfigs=" + baseconfigs } else { "" }
 testimage_label := "bootc.testimage=1"
 lbi_images := "quay.io/curl/curl:latest quay.io/curl/curl-base:latest registry.access.redhat.com/ubi9/podman:latest"
+# Extra images pre-pulled on the GHA host so they are available via --bind-storage-ro
+# inside test VMs without hitting the registry mid-test:
+#   bib_image: used by test-33-bib-build (needs --bind-storage-ro on plan-33)
+#   lbi_switch_images: additional bound images used by test-21-logically-bound-switch
+bib_image := "quay.io/centos-bootc/bootc-image-builder:latest"
+lbi_switch_images := "registry.access.redhat.com/ubi9/ubi-minimal:9.4 registry.access.redhat.com/ubi9/ubi-minimal:9.3 docker.io/library/alpine:latest"
 fedora-coreos := "quay.io/fedora/fedora-coreos:testing-devel"
 generic_buildargs := ""
 _extra_src_args := if extra_src != "" { "-v " + extra_src + ":/run/extra-src:ro --security-opt=label=disable" } else { "" }
@@ -129,6 +135,15 @@ build-fetch: _keygen
     # Pull LBI images (also fetched later by _pull-lbi-images, but doing it
     # here means a failure is retried rather than aborting the full build).
     for img in {{lbi_images}}; do
+        retry podman pull -q "$img"
+    done
+    # Pull images that are needed at runtime inside test VMs via --bind-storage-ro.
+    # These are NOT baked into the test container image; instead they are made
+    # available to the VM through the virtiofs host-storage mount that bcvk
+    # sets up when a plan requests try_bind_storage.
+    #   bib_image:        bootc-image-builder, used by plan-33-bib-build
+    #   lbi_switch_images: bound images used by plan-21-logically-bound-switch
+    for img in {{bib_image}} {{lbi_switch_images}}; do
         retry podman pull -q "$img"
     done
     # Build the network-heavy fetch stage of the main image.  If this
@@ -242,9 +257,11 @@ validate:
     cargo xtask update-generated direct --check
     podman build {{base_buildargs}} --target validate-post-build .
 
-# Test container export via Anaconda liveimg install in a QEMU VM
+# Fetch the Anaconda boot ISO needed for the container export test.
+# Run this as an explicit init step (with retry) before test-container-export
+# so that transient network failures are isolated from the actual test run.
 [group('testing')]
-test-container-export: build
+fetch-anaconda-iso: build
     #!/bin/bash
     set -xeuo pipefail
     iso=target/anaconda-test/boot.iso
@@ -260,7 +277,20 @@ test-container-export: build
                 echo "Unsupported OS: ${ID}-${VERSION_ID}" >&2; exit 1 ;;
         esac
         mkdir -p target/anaconda-test
-        curl -L --retry 3 --progress-bar -o "$iso" "$url"
+        curl -L --retry 5 --retry-delay 30 --progress-bar -o "$iso" "$url"
+    fi
+
+# Test container export via Anaconda liveimg install in a QEMU VM.
+# Requires the ISO to already be present; run `just fetch-anaconda-iso` first
+# (or let the CI "Fetch Anaconda boot ISO" step handle it).
+[group('testing')]
+test-container-export: build
+    #!/bin/bash
+    set -xeuo pipefail
+    iso=target/anaconda-test/boot.iso
+    if [ ! -f "$iso" ]; then
+        echo "ERROR: $iso not found. Run 'just fetch-anaconda-iso' first." >&2
+        exit 1
     fi
     cargo run -p tests-integration -- anaconda-test --iso "$iso" {{base_img}}
 
@@ -540,6 +570,6 @@ copy-to-rootful $image:
 copy-lbi-to-rootful:
     #!/bin/bash
     set -euxo pipefail
-    for img in {{lbi_images}}; do
+    for img in {{lbi_images}} {{bib_image}} {{lbi_switch_images}}; do
         just copy-to-rootful "$img"
     done
