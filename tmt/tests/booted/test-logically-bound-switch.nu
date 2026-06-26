@@ -4,6 +4,7 @@
 #   duration: 30m
 # extra:
 #   fixme_skip_if_composefs: true
+#   try_bind_storage: true
 #
 # This test does:
 # bootc image switch bootc-bound-image
@@ -32,6 +33,19 @@ def initial_setup [] {
     bootc image copy-to-storage
     podman images
     podman image inspect localhost/bootc | from json
+
+    # Pre-seed the bound images used by this test into bootc's own storage.
+    # The images are pre-pulled on the CI host (via build-fetch) and exposed
+    # inside the VM through --bind-storage-ro (virtiofs additionalimagestore).
+    # Copying them into bootc storage now avoids a live registry pull when
+    # bootc resolves bound image declarations during `bootc switch`.
+    for img in [
+        "registry.access.redhat.com/ubi9/ubi-minimal:9.4",
+        "registry.access.redhat.com/ubi9/ubi-minimal:9.3",
+        "docker.io/library/alpine:latest",
+    ] {
+        bootc image pull-from-default-storage $img
+    }
 }
 
 def build_image [name images containers] {
