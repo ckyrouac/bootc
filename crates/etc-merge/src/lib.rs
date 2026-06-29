@@ -668,7 +668,11 @@ fn merge_leaf(
     };
 
     if matches!(new_inode, Some(Inode::Directory(..))) {
-        anyhow::bail!("Modified config file {file:?} newly defaults to directory. Cannot merge")
+        tracing::warn!(
+            "Modified config file {file:?} newly defaults to a directory in the new image; \
+             keeping the image's directory and skipping host customization"
+        );
+        return Ok(());
     };
 
     // If a new file with the same path exists, we delete it
@@ -1169,11 +1173,10 @@ mod tests {
 
         let merge_res = merge(&c, &current_etc_files, &n, &new_etc_files.unwrap(), &diff);
 
-        assert!(merge_res.is_err());
-        assert_eq!(
-            merge_res.unwrap_err().root_cause().to_string(),
-            "Modified config file \"file-to-dir\" newly defaults to directory. Cannot merge"
-        );
+        // The image's directory wins over the host's modified file; merge succeeds with a warning.
+        assert!(merge_res.is_ok(), "Expected merge to succeed: {:?}", merge_res);
+        // The directory should still exist in new_etc (image's directory wins)
+        assert!(n.metadata("file-to-dir").unwrap().is_dir());
 
         Ok(())
     }
