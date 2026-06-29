@@ -684,9 +684,23 @@ fn merge_leaf(
         // Using rustix's symlinkat here as we might have absolute symlinks which clash with ambient_authority
         symlinkat(&**target, new_etc_fd, file).context(format!("Creating symlink {file:?}"))?;
     } else {
-        current_etc_fd
+        let copy_result = current_etc_fd
             .copy(&file, new_etc_fd, &file)
-            .with_context(|| format!("Copying file {file:?}"))?;
+            .with_context(|| format!("Copying file {file:?}"));
+        // If a path component in the current /etc leads through an absolute symlink that
+        // escapes the cap-std root (e.g. /etc/alternatives symlinks), cap-std raises
+        // "a path led outside of the filesystem".  Warn and skip rather than aborting the
+        // whole merge; the image's existing content wins for that path.
+        if let Err(ref e) = copy_result {
+            if e.to_string().contains("a path led outside of the filesystem") {
+                tracing::warn!(
+                    "Skipping {file:?}: path escapes /etc sandbox (absolute symlink component); \
+                     keeping image's version"
+                );
+                return Ok(());
+            }
+        }
+        copy_result?;
     };
 
     rustix::fs::chownat(
@@ -798,8 +812,8 @@ pub fn merge(
     .context("Merging modified files")?;
 
     for removed in &diff.removed {
-        // Use symlink_metadata_optional so that symlinks that resolve to a path
-        // outside the new_etc_fd don't get followed
+        // Use symlink_metadata (lstat) so we don't follow absolute symlinks out
+        // of the cap-std sandbox (e.g. /etc/ssl/cert.pem → /etc/pki/…).
         let stat = new_etc_fd.symlink_metadata_optional(&removed)?;
 
         let Some(stat) = stat else {
