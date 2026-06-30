@@ -566,8 +566,8 @@ fn write_pkgmode_rollback_entry(root_path: &Path, kver: &str) -> Result<()> {
     let entry_content = format!(
         "title Previous OS — package-mode rollback (kernel {kver})\n\
          sort-key zz-pkgmode\n\
-         linux /pkgmode-rollback/vmlinuz\n\
-         initrd /pkgmode-rollback/initramfs.img\n\
+         linux /boot/pkgmode-rollback/vmlinuz\n\
+         initrd /boot/pkgmode-rollback/initramfs.img\n\
          options {options}\n"
     );
     std::fs::write(&entry_path, &entry_content)
