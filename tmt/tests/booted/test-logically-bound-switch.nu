@@ -40,8 +40,8 @@ def initial_setup [] {
     # Copying them into bootc storage now avoids a live registry pull when
     # bootc resolves bound image declarations during `bootc switch`.
     for img in [
-        "registry.access.redhat.com/ubi9/ubi-minimal:9.4",
-        "registry.access.redhat.com/ubi9/ubi-minimal:9.3",
+        "docker.io/library/alpine:3.19",
+        "docker.io/library/alpine:3.18",
         "docker.io/library/alpine:latest",
     ] {
         bootc image pull-from-default-storage $img
@@ -107,7 +107,7 @@ def first_boot [] {
 
     # build a bootc image that includes bound images
     let images = [
-        { "bound": true, "image": "registry.access.redhat.com/ubi9/ubi-minimal:9.4", "name": "ubi-minimal" },
+        { "bound": true, "image": "docker.io/library/alpine:3.19", "name": "ubi-minimal" },
         { "bound": false, "image": "quay.io/centos-bootc/centos-bootc:stream9", "name": "centos-bootc" }
     ]
 
@@ -129,7 +129,7 @@ def second_boot [] {
 
     # verify images are still there after boot
     let images = [
-        { "bound": true, "image": "registry.access.redhat.com/ubi9/ubi-minimal:9.4", "name": "ubi-minimal" },
+        { "bound": true, "image": "docker.io/library/alpine:3.19", "name": "ubi-minimal" },
         { "bound": false, "image": "quay.io/centos-bootc/centos-bootc:stream9", "name": "centos-bootc" }
     ]
 
@@ -141,7 +141,7 @@ def second_boot [] {
     # build a new bootc image with an additional bound image
     print "bootc upgrade with another bound image"
     let image_name = "localhost/bootc-bound"
-    let more_images = $images | append [{ "bound": true, "image": "registry.access.redhat.com/ubi9/ubi-minimal:9.3", "name": "ubi-minimal-9-3" }]
+    let more_images = $images | append [{ "bound": true, "image": "docker.io/library/alpine:3.18", "name": "ubi-minimal-9-3" }]
     build_image $image_name $more_images $containers
     bootc upgrade
     verify_images $more_images $containers
@@ -154,8 +154,8 @@ def third_boot [] {
     assert equal $booted.image.image localhost/bootc-bound
 
     let images = [
-        { "bound": true, "image": "registry.access.redhat.com/ubi9/ubi-minimal:9.4", "name": "ubi-minimal" },
-        { "bound": true, "image": "registry.access.redhat.com/ubi9/ubi-minimal:9.3", "name": "ubi-minimal-9-3" },
+        { "bound": true, "image": "docker.io/library/alpine:3.19", "name": "ubi-minimal" },
+        { "bound": true, "image": "docker.io/library/alpine:3.18", "name": "ubi-minimal-9-3" },
         { "bound": false, "image": "quay.io/centos-bootc/centos-bootc:stream9", "name": "centos-bootc" }
     ]
 

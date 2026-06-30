@@ -60,13 +60,13 @@ nocache := env("BOOTC_nocache", "")
 _nocache_arg := if nocache != "" { "--no-cache" } else { "" }
 _baseconfigs_env := if baseconfigs != "" { "--env=BOOTC_baseconfigs=" + baseconfigs } else { "" }
 testimage_label := "bootc.testimage=1"
-lbi_images := "quay.io/curl/curl:latest quay.io/curl/curl-base:latest registry.access.redhat.com/ubi9/podman:latest"
+lbi_images := "quay.io/curl/curl:latest quay.io/curl/curl-base:latest docker.io/library/alpine:latest"
 # Extra images pre-pulled on the GHA host so they are available via --bind-storage-ro
 # inside test VMs without hitting the registry mid-test:
 #   bib_image: used by test-33-bib-build (needs --bind-storage-ro on plan-33)
 #   lbi_switch_images: additional bound images used by test-21-logically-bound-switch
 bib_image := "quay.io/centos-bootc/bootc-image-builder:latest"
-lbi_switch_images := "registry.access.redhat.com/ubi9/ubi-minimal:9.4 registry.access.redhat.com/ubi9/ubi-minimal:9.3 docker.io/library/alpine:latest"
+lbi_switch_images := "docker.io/library/alpine:3.19 docker.io/library/alpine:3.18 docker.io/library/alpine:latest"
 fedora-coreos := "quay.io/fedora/fedora-coreos:testing-devel"
 generic_buildargs := ""
 _extra_src_args := if extra_src != "" { "-v " + extra_src + ":/run/extra-src:ro --security-opt=label=disable" } else { "" }
