@@ -1,9 +1,10 @@
 use anyhow::{anyhow, bail, Context, Result};
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8Path;
 use fn_error_context::context;
+use std::process::Command;
 
 use crate::task::Task;
-use bootc_blockdev::PartitionTable;
+use bootc_utils::CommandRunExt;
 
 /// The name of the mountpoint for efi (as a subdirectory of /boot, or at the toplevel)
 pub(crate) const EFI_DIR: &str = "efi";
@@ -17,29 +18,40 @@ pub(crate) const PREPBOOT_LABEL: &str = "PowerPC-PReP-boot";
 /// We make a best-effort to support MBR partitioning too.
 pub(crate) const PREPBOOT_MBR_TYPE: &str = "41";
 
-/// Find the device to pass to bootupd. Only on powerpc64 right now
-/// we explicitly find one with a specific label.
+/// Check whether the target bootupd supports `--filesystem`.
 ///
-/// This should get fixed once we execute on https://github.com/coreos/bootupd/issues/432
-fn get_bootupd_device(device: &PartitionTable) -> Result<Utf8PathBuf> {
-    #[cfg(target_arch = "powerpc64")]
-    {
-        return device
-            .partitions
-            .iter()
-            .find(|p| matches!(p.parttype.as_str(), PREPBOOT_GUID | PREPBOOT_MBR_TYPE))
-            .ok_or_else(|| {
-                anyhow::anyhow!("Failed to find PReP partition with GUID {PREPBOOT_GUID}")
-            })
-            .map(|dev| dev.node.as_str().into());
+/// Runs `bootupctl backend install --help` and looks for `--filesystem` in the
+/// output. This allows us to use the new multi-device-aware `--filesystem` flag
+/// when available, and fall back to the legacy `--device` flag otherwise.
+fn bootupd_supports_filesystem() -> Result<bool> {
+    let output = Command::new("bootupctl")
+        .args(["backend", "install", "--help"])
+        .log_debug()
+        .run_get_string()?;
+
+    let use_filesystem = output.contains("--filesystem");
+
+    if use_filesystem {
+        tracing::debug!("bootupd supports --filesystem");
+    } else {
+        tracing::debug!("bootupd does not support --filesystem, falling back to --device");
     }
-    #[cfg(not(target_arch = "powerpc64"))]
-    return Ok(device.path().into());
+
+    Ok(use_filesystem)
 }
 
+/// Install the bootloader via bootupd.
+///
+/// When the target bootupd supports `--filesystem` we pass it pointing at the
+/// root filesystem mount so that bootupd can resolve the backing device(s) itself
+/// via `lsblk`. This enables multi-device support (Intel VROC RAID, multipath).
+///
+/// For older bootupd versions that lack `--filesystem` we fall back to the
+/// legacy `--device <device_path> <rootfs>` invocation, which only supports
+/// a single backing device.
 #[context("Installing bootloader")]
 pub(crate) fn install_via_bootupd(
-    device: &PartitionTable,
+    device: &bootc_blockdev::Device,
     rootfs: &Utf8Path,
     configopts: &crate::install::InstallConfigOpts,
 ) -> Result<()> {
@@ -47,29 +59,112 @@ pub(crate) fn install_via_bootupd(
     // bootc defaults to only targeting the platform boot method.
     let bootupd_opts = (!configopts.generic_image).then_some(["--update-firmware", "--auto"]);
 
-    let devpath = get_bootupd_device(device)?;
-    let args = ["backend", "install", "--write-uuid"]
-        .into_iter()
-        .chain(verbose)
-        .chain(bootupd_opts.iter().copied().flatten())
-        .chain(["--device", devpath.as_str(), rootfs.as_str()]);
-    Task::new("Running bootupctl to install bootloader", "bootupctl")
-        .args(args)
-        .verbose()
-        .run()
+    println!("Installing bootloader via bootupd");
+
+    let mut args: Vec<&str> = vec!["backend", "install", "--write-uuid"];
+    if let Some(v) = verbose {
+        args.push(v);
+    }
+    if let Some(ref opts) = bootupd_opts {
+        args.extend(opts.iter().copied());
+    }
+
+    // Probe whether the installed bootupd supports `--filesystem`.
+    // When it does, pass `--filesystem <rootfs>` so bootupd resolves the
+    // backing device(s) itself — this is required for multi-device setups
+    // (Intel VROC RAID, multipath) where there is more than one parent disk.
+    //
+    // When it doesn't, fall back to `--device <whole_disk> <rootfs>`.
+    // For --device we need the whole-disk path (e.g. /dev/vda), so we call
+    // require_single_root() — older bootupd doesn't support multiple devices.
+    if bootupd_supports_filesystem().context("Probing bootupd --filesystem support")? {
+        tracing::debug!("bootupd supports --filesystem, using multi-device-capable path");
+        // --filesystem <rootfs> <rootfs>  (rootfs appears twice: once as the flag
+        // argument for block device resolution, and once as the install root)
+        let rootfs_str = rootfs.as_str();
+        args.extend(["--filesystem", rootfs_str]);
+        args.push(rootfs_str);
+        Task::new("Running bootupctl to install bootloader", "bootupctl")
+            .args(args)
+            .verbose()
+            .run()
+    } else {
+        // Legacy path: find the single whole-disk backing device.
+        #[cfg(target_arch = "powerpc64")]
+        {
+            // On powerpc64, bootupd needs the PReP partition, not the whole disk.
+            let prep_path = get_prep_device(device)?;
+            args.extend(["--device", prep_path.as_str(), rootfs.as_str()]);
+            return Task::new("Running bootupctl to install bootloader", "bootupctl")
+                .args(args)
+                .verbose()
+                .run();
+        }
+
+        #[cfg(not(target_arch = "powerpc64"))]
+        {
+            let root_device_path = device
+                .require_single_root()
+                .context("Finding single root device for bootupd --device")?
+                .path();
+            tracing::debug!(
+                "bootupd does not support --filesystem, falling back to --device {root_device_path}"
+            );
+            args.extend(["--device", &root_device_path, rootfs.as_str()]);
+            Task::new("Running bootupctl to install bootloader", "bootupctl")
+                .args(args)
+                .verbose()
+                .run()
+        }
+    }
+}
+
+/// Find the PReP boot device to pass to bootupd on powerpc64.
+///
+/// On powerpc64, bootupd requires the PReP partition path rather than the
+/// whole disk. We walk all root devices and look for a partition with the
+/// PReP GUID or MBR type.
+#[cfg(target_arch = "powerpc64")]
+fn get_prep_device(device: &bootc_blockdev::Device) -> Result<String> {
+    let roots = device
+        .find_all_roots()
+        .context("Finding root devices for PReP lookup")?;
+    for root in &roots {
+        if let Some(children) = root.children.as_ref() {
+            for child in children {
+                if let Some(ref pt) = child.parttype {
+                    if pt.eq_ignore_ascii_case(PREPBOOT_GUID) || pt == PREPBOOT_MBR_TYPE {
+                        return Ok(child.path());
+                    }
+                }
+                // Also match by label for MBR layouts
+                if child.partlabel.as_deref() == Some(PREPBOOT_LABEL) {
+                    return Ok(child.path());
+                }
+            }
+        }
+    }
+    anyhow::bail!(
+        "Failed to find PReP partition with GUID {PREPBOOT_GUID} among root device(s)"
+    )
 }
 
 #[context("Installing bootloader using zipl")]
-pub(crate) fn install_via_zipl(device: &PartitionTable, boot_uuid: &str) -> Result<()> {
+pub(crate) fn install_via_zipl(device: &bootc_blockdev::Device, boot_uuid: &str) -> Result<()> {
+    // On s390x, zipl only supports a single backing device.
+    let root_device = device
+        .require_single_root()
+        .context("Finding single root device for zipl")?;
+
     // Identify the target boot partition from UUID
     let fs = crate::mount::inspect_filesystem_by_uuid(boot_uuid)?;
     let boot_dir = Utf8Path::new(&fs.target);
     let maj_min = fs.maj_min;
 
     // Ensure that the found partition is a part of the target device
-    let device_path = device.path();
+    let device_path = root_device.path();
 
-    let partitions = bootc_blockdev::list_dev(device_path)?
+    let partitions = bootc_blockdev::list_dev(Utf8Path::new(&device_path))?
         .children
         .with_context(|| format!("no partition found on {device_path}"))?;
     let boot_part = partitions
