@@ -131,7 +131,6 @@ impl Device {
 
     /// Older versions of util-linux may be missing some properties. Backfill them if they're missing.
     pub fn backfill_missing(&mut self) -> Result<()> {
-        // Add new properties to backfill here
         self.backfill_start()?;
         self.backfill_partn()?;
         // And recurse to child devices
@@ -609,6 +608,99 @@ pub fn parse_size_mib(mut s: &str) -> Result<u64> {
 mod test {
     use super::*;
 
+    // ── Helpers ─────────────────────────────────────────────────────────────
+
+    /// Build a minimal MBR disk Device with given child partition types.
+    fn make_mbr_disk(parttypes: &[&str]) -> Device {
+        Device {
+            name: "vda".into(),
+            serial: None,
+            model: None,
+            partlabel: None,
+            parttype: None,
+            partuuid: None,
+            partn: None,
+            size: 10737418240,
+            maj_min: None,
+            start: None,
+            label: None,
+            fstype: None,
+            uuid: None,
+            path: Some("/dev/vda".into()),
+            pttype: Some("dos".into()),
+            children: Some(
+                parttypes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, pt)| Device {
+                        name: format!("vda{}", i + 1),
+                        serial: None,
+                        model: None,
+                        partlabel: None,
+                        parttype: Some(pt.to_string()),
+                        partuuid: None,
+                        partn: Some(i as u32 + 1),
+                        size: 1048576,
+                        maj_min: None,
+                        start: Some(2048),
+                        label: None,
+                        fstype: None,
+                        uuid: None,
+                        path: None,
+                        pttype: Some("dos".into()),
+                        children: None,
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Build a minimal GPT disk Device from a list of (parttype, partn) pairs.
+    fn make_gpt_disk(parts: &[(&str, u32)]) -> Device {
+        Device {
+            name: "vda".into(),
+            serial: None,
+            model: None,
+            partlabel: None,
+            parttype: None,
+            partuuid: None,
+            partn: None,
+            size: 10737418240,
+            maj_min: None,
+            start: None,
+            label: None,
+            fstype: None,
+            uuid: None,
+            path: Some("/dev/vda".into()),
+            pttype: Some("gpt".into()),
+            children: Some(
+                parts
+                    .iter()
+                    .map(|(pt, n)| Device {
+                        name: format!("vda{n}"),
+                        serial: None,
+                        model: None,
+                        partlabel: None,
+                        parttype: Some(pt.to_string()),
+                        partuuid: None,
+                        partn: Some(*n),
+                        size: 1048576,
+                        maj_min: None,
+                        start: Some(2048),
+                        label: None,
+                        fstype: None,
+                        uuid: None,
+                        path: None,
+                        pttype: None,
+                        children: None,
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    // ── Size parsing ─────────────────────────────────────────────────────────
+
     #[test]
     fn test_parse_size_mib() {
         let ident_cases = [0, 10, 9, 1024].into_iter().map(|k| (k.to_string(), k));
@@ -626,6 +718,8 @@ mod test {
             assert_eq!(parse_size_mib(&s).unwrap(), v as u64, "Parsing {s}");
         }
     }
+
+    // ── lsblk fixture parsing ─────────────────────────────────────────────────
 
     #[test]
     fn test_parse_lsblk() {
@@ -711,65 +805,7 @@ mod test {
         assert_eq!(md0.fstype.as_deref().unwrap(), "ext4");
     }
 
-    /// Helper to construct a minimal MBR disk Device with given child partition types.
-    fn make_mbr_disk(parttypes: &[&str]) -> Device {
-        Device {
-            name: "vda".into(),
-            serial: None,
-            model: None,
-            partlabel: None,
-            parttype: None,
-            partuuid: None,
-            partn: None,
-            size: 10737418240,
-            maj_min: None,
-            start: None,
-            label: None,
-            fstype: None,
-            uuid: None,
-            path: Some("/dev/vda".into()),
-            pttype: Some("dos".into()),
-            children: Some(
-                parttypes
-                    .iter()
-                    .enumerate()
-                    .map(|(i, pt)| Device {
-                        name: format!("vda{}", i + 1),
-                        serial: None,
-                        model: None,
-                        partlabel: None,
-                        parttype: Some(pt.to_string()),
-                        partuuid: None,
-                        partn: Some(i as u32 + 1),
-                        size: 1048576,
-                        maj_min: None,
-                        start: Some(2048),
-                        label: None,
-                        fstype: None,
-                        uuid: None,
-                        path: None,
-                        pttype: Some("dos".into()),
-                        children: None,
-                    })
-                    .collect(),
-            ),
-        }
-    }
-
-    #[test]
-    fn test_mbr_esp_detection() {
-        // 0x06 (FAT16) is recognized as ESP
-        let dev = make_mbr_disk(&["0x06"]);
-        assert_eq!(dev.find_partition_of_esp().unwrap().partn, Some(1));
-
-        // 0xef (EFI System Partition) is recognized as ESP
-        let dev = make_mbr_disk(&["0x83", "0xef"]);
-        assert_eq!(dev.find_partition_of_esp().unwrap().partn, Some(2));
-
-        // No ESP types present: 0x83 (Linux) and 0x82 (swap)
-        let dev = make_mbr_disk(&["0x83", "0x82"]);
-        assert!(dev.find_partition_of_esp().is_err());
-    }
+    // ── sfdisk parsing ────────────────────────────────────────────────────────
 
     #[test]
     fn test_parse_sfdisk() -> Result<()> {
@@ -810,6 +846,323 @@ mod test {
         );
         Ok(())
     }
+
+    // ── ESP discovery — MBR ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_mbr_esp_detection() {
+        // 0x06 (FAT16) is recognized as ESP
+        let dev = make_mbr_disk(&["0x06"]);
+        assert_eq!(dev.find_partition_of_esp().unwrap().partn, Some(1));
+
+        // 0xef (EFI System Partition) is recognized as ESP
+        let dev = make_mbr_disk(&["0x83", "0xef"]);
+        assert_eq!(dev.find_partition_of_esp().unwrap().partn, Some(2));
+
+        // No ESP types present: 0x83 (Linux) and 0x82 (swap)
+        let dev = make_mbr_disk(&["0x83", "0x82"]);
+        assert!(dev.find_partition_of_esp().is_err());
+    }
+
+    // ── ESP discovery — GPT ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_find_partition_of_type_gpt() {
+        // Standard GPT disk: BIOS boot, ESP, root
+        let dev = make_gpt_disk(&[
+            (BIOS_BOOT, 1),
+            (ESP, 2),
+            ("0fc63daf-8483-4772-8e79-3d69d8477de4", 3),
+        ]);
+
+        // find_partition_of_type should find ESP case-insensitively
+        let esp = dev.find_partition_of_type(ESP).unwrap();
+        assert_eq!(esp.partn, Some(2));
+
+        // Upper-case ESP constant also works
+        let esp_upper = dev
+            .find_partition_of_type("C12A7328-F81F-11D2-BA4B-00A0C93EC93B")
+            .unwrap();
+        assert_eq!(esp_upper.partn, Some(2));
+
+        // BIOS boot found
+        let bios = dev.find_partition_of_bios_boot().unwrap();
+        assert_eq!(bios.partn, Some(1));
+
+        // Non-existent type → None
+        assert!(dev.find_partition_of_type("deadbeef-dead-beef-dead-beefdeadbeef").is_none());
+    }
+
+    #[test]
+    fn test_find_partition_of_esp_optional_gpt() {
+        // GPT disk with ESP
+        let dev = make_gpt_disk(&[(BIOS_BOOT, 1), (ESP, 2)]);
+        let esp = dev.find_partition_of_esp_optional().unwrap().unwrap();
+        assert_eq!(esp.partn, Some(2));
+
+        // GPT disk without ESP
+        let dev_no_esp = make_gpt_disk(&[(BIOS_BOOT, 1)]);
+        assert!(dev_no_esp
+            .find_partition_of_esp_optional()
+            .unwrap()
+            .is_none());
+
+        // Disk with no children at all
+        let childless = Device {
+            name: "vda".into(),
+            serial: None,
+            model: None,
+            partlabel: None,
+            parttype: None,
+            partuuid: None,
+            partn: None,
+            size: 10737418240,
+            maj_min: None,
+            start: None,
+            label: None,
+            fstype: None,
+            uuid: None,
+            path: Some("/dev/vda".into()),
+            pttype: Some("gpt".into()),
+            children: None,
+        };
+        assert!(childless.find_partition_of_esp_optional().unwrap().is_none());
+    }
+
+    // ── ESP discovery — pttype=None fallback (older lsblk) ───────────────────
+
+    #[test]
+    fn test_find_partition_of_esp_pttype_none_fallback() {
+        // When pttype is None (e.g. older lsblk or partition devices),
+        // we default to GPT UUID matching. A disk without explicit pttype
+        // but with a child having the ESP GUID should still work.
+        let dev = Device {
+            name: "sda".into(),
+            serial: None,
+            model: None,
+            partlabel: None,
+            parttype: None,
+            partuuid: None,
+            partn: None,
+            size: 10737418240,
+            maj_min: None,
+            start: None,
+            label: None,
+            fstype: None,
+            uuid: None,
+            path: Some("/dev/sda".into()),
+            pttype: None, // No pttype from lsblk
+            children: Some(vec![Device {
+                name: "sda1".into(),
+                serial: None,
+                model: None,
+                partlabel: None,
+                parttype: Some(ESP.to_string()),
+                partuuid: None,
+                partn: Some(1),
+                size: 536870912,
+                maj_min: None,
+                start: Some(2048),
+                label: None,
+                fstype: Some("vfat".into()),
+                uuid: None,
+                path: Some("/dev/sda1".into()),
+                pttype: None,
+                children: None,
+            }]),
+        };
+        let esp = dev.find_partition_of_esp().unwrap();
+        assert_eq!(esp.name, "sda1");
+    }
+
+    // ── ESP discovery — unsupported pttype ───────────────────────────────────
+
+    #[test]
+    fn test_find_partition_of_esp_unsupported_pttype() {
+        // An unsupported partition table type should return an error, not panic.
+        let dev = Device {
+            name: "sda".into(),
+            serial: None,
+            model: None,
+            partlabel: None,
+            parttype: None,
+            partuuid: None,
+            partn: None,
+            size: 10737418240,
+            maj_min: None,
+            start: None,
+            label: None,
+            fstype: None,
+            uuid: None,
+            path: Some("/dev/sda".into()),
+            pttype: Some("bsd".into()),
+            children: Some(vec![Device {
+                name: "sda1".into(),
+                serial: None,
+                model: None,
+                partlabel: None,
+                parttype: Some(ESP.to_string()),
+                partuuid: None,
+                partn: Some(1),
+                size: 536870912,
+                maj_min: None,
+                start: Some(2048),
+                label: None,
+                fstype: None,
+                uuid: None,
+                path: None,
+                pttype: None,
+                children: None,
+            }]),
+        };
+        let err = dev.find_partition_of_esp_optional().unwrap_err();
+        assert!(
+            err.to_string().contains("Unsupported partition table type"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── ESP discovery — VROC RAID recursion ──────────────────────────────────
+
+    #[test]
+    fn test_find_partition_of_esp_vroc_recursion() {
+        // Simulate a VROC-style topology: disk → md array (pttype=gpt) → ESP partition.
+        // The NVMe disk itself has pttype=None (no partition table at the disk level),
+        // so the None branch in find_partition_of_esp_optional is used, which calls
+        // find_partition_of_type(ESP) — that doesn't find it directly.
+        // Then recursion into md126 (pttype=gpt) finds md126p1 (ESP).
+        let md_array = Device {
+            name: "md126".into(),
+            serial: None,
+            model: None,
+            partlabel: None,
+            parttype: None,
+            partuuid: None,
+            partn: None,
+            size: 1_000_000_000_000,
+            maj_min: None,
+            start: None,
+            label: None,
+            fstype: Some("linux_raid_member".into()),
+            uuid: None,
+            path: Some("/dev/md126".into()),
+            pttype: Some("gpt".into()), // The md array has its own GPT
+            children: Some(vec![
+                Device {
+                    name: "md126p1".into(),
+                    serial: None,
+                    model: None,
+                    partlabel: None,
+                    parttype: Some(ESP.to_string()),
+                    partuuid: None,
+                    partn: Some(1),
+                    size: 536870912,
+                    maj_min: None,
+                    start: Some(2048),
+                    label: None,
+                    fstype: Some("vfat".into()),
+                    uuid: None,
+                    path: Some("/dev/md126p1".into()),
+                    pttype: None,
+                    children: None,
+                },
+                Device {
+                    name: "md126p3".into(),
+                    serial: None,
+                    model: None,
+                    partlabel: None,
+                    parttype: Some("0fc63daf-8483-4772-8e79-3d69d8477de4".into()),
+                    partuuid: None,
+                    partn: Some(3),
+                    size: 5368709120,
+                    maj_min: None,
+                    start: Some(1050624),
+                    label: None,
+                    fstype: Some("ext4".into()),
+                    uuid: None,
+                    path: Some("/dev/md126p3".into()),
+                    pttype: None,
+                    children: None,
+                },
+            ]),
+        };
+        let nvme_disk = Device {
+            name: "nvme0n1".into(),
+            serial: None,
+            model: None,
+            partlabel: None,
+            parttype: None,
+            partuuid: None,
+            partn: None,
+            size: 1_000_000_000_000,
+            maj_min: None,
+            start: None,
+            label: None,
+            fstype: None,
+            uuid: None,
+            path: Some("/dev/nvme0n1".into()),
+            pttype: None, // NVMe disk has no pttype (VROC uses md for partitioning)
+            children: Some(vec![md_array]),
+        };
+
+        // find_partition_of_esp should recurse through md126 and find md126p1
+        let esp = nvme_disk.find_partition_of_esp().unwrap();
+        assert_eq!(esp.name, "md126p1");
+        assert_eq!(esp.partn, Some(1));
+        assert_eq!(esp.parttype.as_deref().unwrap(), ESP);
+        assert_eq!(esp.fstype.as_deref().unwrap(), "vfat");
+    }
+
+    // ── ESP discovery — fixture-based end-to-end ──────────────────────────────
+
+    #[test]
+    fn test_find_partition_of_esp_vroc_from_fixture() {
+        let fixture = include_str!("../tests/fixtures/lsblk-vroc.json");
+        let devs: DevicesOutput = serde_json::from_str(fixture).unwrap();
+
+        for nvme in &devs.blockdevices {
+            // The NVMe disk's direct children are md arrays, not ESP partitions.
+            // Recursion into the md array (md126) finds md126p1.
+            let esp = nvme.find_partition_of_esp().unwrap();
+            assert_eq!(esp.name, "md126p1");
+            assert_eq!(esp.partn, Some(1));
+
+            // The NVMe disk itself has no direct ESP child —
+            // the md126 child is a RAID array, not an ESP partition.
+            let md126 = nvme
+                .children
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|c| c.name == "md126")
+                .unwrap();
+            // md126 IS a partition table device (pttype=gpt) that contains the ESP,
+            // but the NVMe disk's direct find_partition_of_type(ESP) should return None
+            // because it only searches the nvme's direct children (md126 is not an ESP).
+            assert!(nvme.find_partition_of_type(ESP).is_none());
+            // But md126 itself has the ESP as a direct child
+            assert!(md126.find_partition_of_type(ESP).is_some());
+        }
+    }
+
+    #[test]
+    fn test_find_colocated_esps_from_fixture() {
+        // The swraid fixture has two disks each with their own ESP.
+        // We exercise find_partition_of_esp_optional directly on each disk
+        // (find_colocated_esps requires list_parents() → real lsblk call).
+        let fixture = include_str!("../tests/fixtures/lsblk-swraid.json");
+        let devs: DevicesOutput = serde_json::from_str(fixture).unwrap();
+        assert_eq!(devs.blockdevices.len(), 2);
+
+        // Each disk independently finds its own ESP
+        for disk in &devs.blockdevices {
+            let esp = disk.find_partition_of_esp_optional().unwrap().unwrap();
+            assert_eq!(esp.fstype.as_deref().unwrap(), "vfat");
+            assert_eq!(esp.parttype.as_deref().unwrap(), ESP);
+        }
+    }
+
+    // ── Multipath partition number suffix parsing ─────────────────────────────
 
     #[test]
     fn test_parse_partition_number_from_suffix() {

@@ -1,0 +1,17 @@
+provision:
+  how: bootc
+  add-tmt-dependencies: true
+  container-file: hack/Containerfile
+  container-file-workdir: .
+  image-builder: quay.io/centos-bootc/bootc-image-builder:latest
+  disk: 50
+summary: Test multi-device ESP detection for to-existing-root
+execute:
+  how: tmt
+  script: exec nu tests/booted/test-multi-device-esp.nu
+prepare:
+  - how: install
+    package:
+      - lvm2
+      - dosfstools
+      - e2fsprogs
