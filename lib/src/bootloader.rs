@@ -90,7 +90,7 @@ pub(crate) fn install_via_bootupd(
             .run()
     } else {
         // Legacy path: find the single whole-disk backing device.
-        #[cfg(target_arch = "powerpc64")]
+        #[cfg(all(target_arch = "powerpc64", feature = "install-to-disk"))]
         {
             // On powerpc64, bootupd needs the PReP partition, not the whole disk.
             let prep_path = get_prep_device(device)?;
@@ -101,7 +101,7 @@ pub(crate) fn install_via_bootupd(
                 .run();
         }
 
-        #[cfg(not(target_arch = "powerpc64"))]
+        #[cfg(not(all(target_arch = "powerpc64", feature = "install-to-disk")))]
         {
             let root_device_path = device
                 .require_single_root()
@@ -124,7 +124,7 @@ pub(crate) fn install_via_bootupd(
 /// On powerpc64, bootupd requires the PReP partition path rather than the
 /// whole disk. We walk all root devices and look for a partition with the
 /// PReP GUID or MBR type.
-#[cfg(target_arch = "powerpc64")]
+#[cfg(all(target_arch = "powerpc64", feature = "install-to-disk"))]
 fn get_prep_device(device: &bootc_blockdev::Device) -> Result<String> {
     let roots = device
         .find_all_roots()
