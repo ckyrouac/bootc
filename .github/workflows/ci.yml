@@ -130,10 +130,14 @@ jobs:
         run: |
           set -xeu
           NU_VERSION=0.114.1
+          # Use the GITHUB_TOKEN to avoid API rate limits on the runner
           curl -sSL \
+            -H "Authorization: token ${{ github.token }}" \
             "https://github.com/nushell/nushell/releases/download/${NU_VERSION}/nu-${NU_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
-            | sudo tar -xz --strip-components=1 -C /usr/local/bin \
-              "nu-${NU_VERSION}-x86_64-unknown-linux-musl/nu"
+            -o /tmp/nu.tar.gz
+          sudo tar -xz --strip-components=1 -C /usr/local/bin -f /tmp/nu.tar.gz \
+            "nu-${NU_VERSION}-x86_64-unknown-linux-musl/nu"
+          rm /tmp/nu.tar.gz
           nu --version
 
       - name: Install tmt with provision-virtual support
