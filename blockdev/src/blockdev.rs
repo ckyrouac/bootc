@@ -356,7 +356,13 @@ impl Device {
     /// where exactly one ESP is expected.
     pub fn find_first_colocated_esp(&self) -> Result<Device> {
         self.find_colocated_esps()?
-            .and_then(|mut v| if v.is_empty() { None } else { Some(v.remove(0)) })
+            .and_then(|mut v| {
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.remove(0))
+                }
+            })
             .ok_or_else(|| anyhow!("No ESP partition found among backing devices"))
     }
 }
@@ -890,7 +896,9 @@ mod test {
         assert_eq!(bios.partn, Some(1));
 
         // Non-existent type → None
-        assert!(dev.find_partition_of_type("deadbeef-dead-beef-dead-beefdeadbeef").is_none());
+        assert!(dev
+            .find_partition_of_type("deadbeef-dead-beef-dead-beefdeadbeef")
+            .is_none());
     }
 
     #[test]
@@ -926,7 +934,10 @@ mod test {
             pttype: Some("gpt".into()),
             children: None,
         };
-        assert!(childless.find_partition_of_esp_optional().unwrap().is_none());
+        assert!(childless
+            .find_partition_of_esp_optional()
+            .unwrap()
+            .is_none());
     }
 
     // ── ESP discovery — pttype=None fallback (older lsblk) ───────────────────

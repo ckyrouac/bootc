@@ -144,9 +144,7 @@ fn get_prep_device(device: &bootc_blockdev::Device) -> Result<String> {
             }
         }
     }
-    anyhow::bail!(
-        "Failed to find PReP partition with GUID {PREPBOOT_GUID} among root device(s)"
-    )
+    anyhow::bail!("Failed to find PReP partition with GUID {PREPBOOT_GUID} among root device(s)")
 }
 
 #[context("Installing bootloader using zipl")]

@@ -1422,9 +1422,7 @@ async fn install_to_filesystem_impl(state: &State, rootfs: &mut RootSetup) -> Re
         Some("gpt") | None => {
             // GPT or unknown (e.g. partition device) — the expected case
         }
-        Some(o) => {
-            crate::utils::medium_visibility_warning(&format!("Unknown partition label {o}"))
-        }
+        Some(o) => crate::utils::medium_visibility_warning(&format!("Unknown partition label {o}")),
     }
 
     // We verify this upfront because it's currently required by bootupd
