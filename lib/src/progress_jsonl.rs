@@ -284,12 +284,6 @@ mod test {
 
     use super::*;
 
-    #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
-    struct S {
-        s: String,
-        v: u32,
-    }
-
     #[tokio::test]
     async fn test_jsonl() -> Result<()> {
         let testvalues = [
