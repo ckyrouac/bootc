@@ -90,72 +90,97 @@ jobs:
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'control/skip-ci') }}
     name: "TMT: multi-device ESP"
     runs-on: ubuntu-24.04
+    env:
+      LIBVIRT_DEFAULT_URI: qemu:///session
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Enable KVM access
+      - name: Bootc Ubuntu Setup (libvirt + KVM)
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+        with:
+          libvirt: true
+
+      - name: Install tmt
+        uses: ./.github/actions/install-tmt
+
+      - name: Install nushell
         run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
-            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-          ls -l /dev/kvm
+          set -xeuo pipefail
+          NU_VERSION=0.114.1
+          td=$(mktemp -d)
+          curl --retry 5 --retry-delay 10 -sSL \
+            "https://github.com/nushell/nushell/releases/download/${NU_VERSION}/nu-${NU_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            -o "${td}/nu.tar.gz"
+          sudo tar -xz --strip-components=1 -C /usr/local/bin -f "${td}/nu.tar.gz" \
+            "nu-${NU_VERSION}-x86_64-unknown-linux-musl/nu"
+          rm -rf "${td}"
+          nu --version
 
       - name: Free up disk space
         run: sudo ./ci/clean-gha-runner.sh
 
-      - name: Install virtualization dependencies
-        run: |
-          set -xeu
-          sudo apt-get update -q
-          sudo apt-get install -y \
-            qemu-system-x86 \
-            qemu-utils \
-            virtiofsd \
-            libvirt-daemon-system \
-            libvirt-dev \
-            pkg-config \
-            python3-pip
-          # podman machine looks for virtiofsd in /usr/libexec/podman/ or similar;
-          # on Ubuntu 24.04 virtiofsd lands in /usr/lib/virtiofsd. Add a symlink.
-          sudo mkdir -p /usr/libexec/podman
-          sudo ln -sf /usr/lib/virtiofsd /usr/libexec/podman/virtiofsd || true
-          # Also add /usr/lib to podman's helper_binaries_dir via containers.conf
-          mkdir -p ~/.config/containers
-          cat >> ~/.config/containers/containers.conf <<'EOF'
-          [engine]
-          helper_binaries_dir = ["/usr/local/libexec/podman", "/usr/local/lib/podman", "/usr/libexec/podman", "/usr/lib/podman", "/usr/lib"]
-          EOF
-
-      - name: Install nushell
-        run: |
-          set -xeu
-          NU_VERSION=0.114.1
-          # Use the GITHUB_TOKEN to avoid API rate limits on the runner
-          curl -sSL \
-            -H "Authorization: token ${{ github.token }}" \
-            "https://github.com/nushell/nushell/releases/download/${NU_VERSION}/nu-${NU_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
-            -o /tmp/nu.tar.gz
-          sudo tar -xz --strip-components=1 -C /usr/local/bin -f /tmp/nu.tar.gz \
-            "nu-${NU_VERSION}-x86_64-unknown-linux-musl/nu"
-          rm /tmp/nu.tar.gz
-          nu --version
-
-      - name: Install tmt with provision-virtual support
-        run: |
-          pip install --user "tmt[provision-virtual]==1.76.0"
-          echo "${HOME}/.local/bin" >> $GITHUB_PATH
-
       - name: Build bootc container image
         run: |
-          # Use rootless podman so the image is visible to tmt's rootless podman session
+          set -xeuo pipefail
           podman build -t localhost/bootc -f hack/Containerfile .
 
       - name: Run TMT multi-device ESP test
         run: |
-          set -xeu
-          tmt run -vvv plans -n test-32-multi-device-esp
+          set -xeuo pipefail
+          # Generate a unique VM name
+          VM_NAME="bootc-tmt-multi-device-esp-$$"
+
+          # Boot a VM from the container image using bcvk + libvirt
+          bcvk libvirt run \
+            --name "${VM_NAME}" \
+            --detach \
+            --label=bootc.test=1 \
+            localhost/bootc
+
+          # Ensure VM cleanup on exit
+          trap "bcvk libvirt rm --stop --force ${VM_NAME} || true" EXIT
+
+          # Wait for VM to be ready and extract SSH connection details
+          for i in $(seq 1 60); do
+            INFO=$(bcvk libvirt inspect "${VM_NAME}" --format=json 2>/dev/null || true)
+            SSH_PORT=$(echo "${INFO}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('ssh_port',''))" 2>/dev/null || true)
+            SSH_KEY=$(echo "${INFO}"  | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('ssh_private_key',''))" 2>/dev/null || true)
+            if [ -n "${SSH_PORT}" ] && [ -n "${SSH_KEY}" ]; then break; fi
+            echo "Waiting for VM to be ready (attempt ${i}/60)..."
+            sleep 5
+          done
+
+          if [ -z "${SSH_PORT}" ]; then
+            echo "ERROR: VM failed to become ready" >&2
+            exit 1
+          fi
+
+          # Write SSH key to temp file
+          KEY_FILE=$(mktemp)
+          echo "${SSH_KEY}" > "${KEY_FILE}"
+          chmod 600 "${KEY_FILE}"
+
+          # Verify SSH connectivity
+          for i in $(seq 1 60); do
+            if ssh -i "${KEY_FILE}" -p "${SSH_PORT}" \
+                -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=5 -o IdentitiesOnly=yes \
+                root@localhost 'echo ready' 2>/dev/null; then
+              break
+            fi
+            echo "Waiting for SSH (attempt ${i}/60)..."
+            sleep 5
+          done
+
+          # Run tmt tests via the connect provisioner (SSH into the running VM)
+          tmt -vvv run --id "multi-device-esp-${VM_NAME}" --all \
+            provision --how=connect \
+              --guest=localhost \
+              --user=root \
+              --port="${SSH_PORT}" \
+              --key="${KEY_FILE}" \
+            plan --name /plans/test-32-multi-device-esp
 
       - name: Archive TMT logs
         if: always()
