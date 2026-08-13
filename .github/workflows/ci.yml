@@ -114,6 +114,8 @@ jobs:
             qemu-utils \
             virtiofsd \
             libvirt-daemon-system \
+            libvirt-dev \
+            pkg-config \
             python3-pip
           # podman machine looks for virtiofsd in /usr/libexec/podman/ or similar;
           # on Ubuntu 24.04 virtiofsd lands in /usr/lib/virtiofsd. Add a symlink.
