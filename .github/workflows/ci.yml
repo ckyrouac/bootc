@@ -207,17 +207,17 @@ jobs:
 
           # Print tmt results summary for easier log inspection
           echo "=== TMT result: exit code ${TMT_RC} ==="
-          tmt -i "multi-device-esp-${VM_NAME}" run -l report -vvv 2>/dev/null || true
 
-          # Write key tmt output to the GitHub step summary (viewable in GHA UI)
-          {
-            echo "## TMT Test Results (exit code ${TMT_RC})"
-            echo '```'
-            find /var/tmp/tmt -name "output.txt" 2>/dev/null | while read f; do
-              echo "=== $f ===" && cat "$f" 2>/dev/null && echo ""
-            done
-            echo '```'
-          } >> "${GITHUB_STEP_SUMMARY}"
+          # Emit key tmt output as GitHub workflow annotations so they
+          # appear in api.github.com check-runs (accessible without CDN)
+          find /var/tmp/tmt -name "output.txt" 2>/dev/null | while read f; do
+            echo "::group::TMT output: $f"
+            cat "$f" 2>/dev/null || true
+            echo "::endgroup::"
+            # Also emit as a notice annotation for API visibility
+            content=$(tail -50 "$f" 2>/dev/null | tr '\n' '|' | head -c 1000)
+            echo "::notice title=TMT output::${content}"
+          done
 
           exit ${TMT_RC}
 
