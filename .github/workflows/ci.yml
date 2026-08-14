@@ -127,32 +127,44 @@ jobs:
 
       - name: Run TMT multi-device ESP test
         run: |
-          set -xeuo pipefail
+          set -xuo pipefail
           # Generate a unique VM name
           VM_NAME="bootc-tmt-multi-device-esp-$$"
 
           # Boot a VM from the container image using bcvk + libvirt
-          bcvk libvirt run \
+          if ! bcvk libvirt run \
             --name "${VM_NAME}" \
             --detach \
             --label=bootc.test=1 \
-            localhost/bootc
+            localhost/bootc; then
+            echo "ERROR: bcvk libvirt run failed" >&2
+            bcvk libvirt list || true
+            df -h || true
+            exit 1
+          fi
 
           # Ensure VM cleanup on exit
           trap "bcvk libvirt rm --stop --force ${VM_NAME} || true" EXIT
 
           # Wait for VM to be ready and extract SSH connection details
+          SSH_PORT=""
+          SSH_KEY=""
           for i in $(seq 1 60); do
             INFO=$(bcvk libvirt inspect "${VM_NAME}" --format=json 2>/dev/null || true)
+            echo "bcvk inspect output: ${INFO}" 
             SSH_PORT=$(echo "${INFO}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('ssh_port',''))" 2>/dev/null || true)
             SSH_KEY=$(echo "${INFO}"  | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('ssh_private_key',''))" 2>/dev/null || true)
-            if [ -n "${SSH_PORT}" ] && [ -n "${SSH_KEY}" ]; then break; fi
+            if [ -n "${SSH_PORT}" ] && [ -n "${SSH_KEY}" ]; then
+              echo "VM ready: SSH port ${SSH_PORT}"
+              break
+            fi
             echo "Waiting for VM to be ready (attempt ${i}/60)..."
             sleep 5
           done
 
           if [ -z "${SSH_PORT}" ]; then
-            echo "ERROR: VM failed to become ready" >&2
+            echo "ERROR: VM failed to become ready after 300s" >&2
+            bcvk libvirt list || true
             exit 1
           fi
 
@@ -162,16 +174,23 @@ jobs:
           chmod 600 "${KEY_FILE}"
 
           # Verify SSH connectivity
+          SSH_OK=false
           for i in $(seq 1 60); do
             if ssh -i "${KEY_FILE}" -p "${SSH_PORT}" \
                 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
                 -o ConnectTimeout=5 -o IdentitiesOnly=yes \
                 root@localhost 'echo ready' 2>/dev/null; then
+              SSH_OK=true
               break
             fi
             echo "Waiting for SSH (attempt ${i}/60)..."
             sleep 5
           done
+
+          if [ "${SSH_OK}" != "true" ]; then
+            echo "ERROR: SSH never became available" >&2
+            exit 1
+          fi
 
           # Run tmt tests via the connect provisioner (SSH into the running VM).
           # Pass running_env=image_mode to skip prepare steps that only apply
