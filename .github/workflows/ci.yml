@@ -173,8 +173,11 @@ jobs:
             sleep 5
           done
 
-          # Run tmt tests via the connect provisioner (SSH into the running VM)
-          tmt -vvv run --id "multi-device-esp-${VM_NAME}" --all \
+          # Run tmt tests via the connect provisioner (SSH into the running VM).
+          # Pass running_env=image_mode to skip prepare steps that only apply
+          # to package-mode (non-image-mode) systems, matching upstream behaviour.
+          tmt -vvv --context=running_env=image_mode \
+            run --id "multi-device-esp-${VM_NAME}" --all \
             provision --how=connect \
               --guest=localhost \
               --user=root \

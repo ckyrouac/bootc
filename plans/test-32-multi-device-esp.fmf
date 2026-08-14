@@ -12,3 +12,4 @@ prepare:
       - lvm2
       - dosfstools
       - e2fsprogs
+    when: running_env != image_mode
