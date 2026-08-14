@@ -184,6 +184,22 @@ jobs:
               --port="${SSH_PORT}" \
               --key="${KEY_FILE}" \
             plan --name /plans/test-32-multi-device-esp
+          TMT_RC=$?
+
+          # Print tmt results summary for easier log inspection
+          echo "=== TMT result: exit code ${TMT_RC} ==="
+          tmt run -l report -vvv 2>/dev/null || true
+          exit ${TMT_RC}
+
+      - name: Show TMT results
+        if: always()
+        run: |
+          echo "=== TMT log files ==="
+          find /var/tmp/tmt -name "*.log" -o -name "output.txt" 2>/dev/null | \
+            while read f; do
+              echo "--- $f ---"
+              tail -50 "$f" 2>/dev/null || true
+            done
 
       - name: Archive TMT logs
         if: always()
