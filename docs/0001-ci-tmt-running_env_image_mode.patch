@@ -1,0 +1,53 @@
+From 92122f4f45b93edb93994b48efb3903e1f5ef5e5 Mon Sep 17 00:00:00 2001
+From: ckyrouac <ckyrouac@redhat.com>
+Date: Fri, 14 Aug 2026 14:33:29 +0000
+Subject: [PATCH] ci/tmt: use running_env=image_mode context, matching upstream
+ behaviour
+
+The upstream bootc-dev/bootc CI passes --context=running_env=image_mode
+when running tmt with bcvk VMs (booted directly into the image). This
+causes 'when: running_env != image_mode' conditions in prepare steps to
+be skipped, avoiding the tmt bootc package manager which calls
+'bootc image copy-to-storage' hundreds of times.
+
+Apply the same pattern:
+- Add --context=running_env=image_mode to the tmt run command
+- Add 'when: running_env != image_mode' to the prepare: how: install
+  step for lvm2/dosfstools/e2fsprogs (skipped in CI, available for packit)
+
+This matches the upstream integration.fmf plan structure exactly.
+---
+ .github/workflows/ci.yml           | 7 +++++--
+ plans/test-32-multi-device-esp.fmf | 1 +
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 2ad69782..1fc8f7f7 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -173,8 +173,11 @@ jobs:
+             sleep 5
+           done
+ 
+-          # Run tmt tests via the connect provisioner (SSH into the running VM)
+-          tmt -vvv run --id "multi-device-esp-${VM_NAME}" --all \
++          # Run tmt tests via the connect provisioner (SSH into the running VM).
++          # Pass running_env=image_mode to skip prepare steps that only apply
++          # to package-mode (non-image-mode) systems, matching upstream behaviour.
++          tmt -vvv --context=running_env=image_mode \
++            run --id "multi-device-esp-${VM_NAME}" --all \
+             provision --how=connect \
+               --guest=localhost \
+               --user=root \
+diff --git a/plans/test-32-multi-device-esp.fmf b/plans/test-32-multi-device-esp.fmf
+index ae2e9a28..1af145a7 100644
+--- a/plans/test-32-multi-device-esp.fmf
++++ b/plans/test-32-multi-device-esp.fmf
+@@ -12,3 +12,4 @@ prepare:
+       - lvm2
+       - dosfstools
+       - e2fsprogs
++    when: running_env != image_mode
+-- 
+2.55.0
+
