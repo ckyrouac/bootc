@@ -471,6 +471,28 @@ pub fn compute_diff(
     current_etc_files: &FileSystem<CustomMetadata>,
     new_etc_files: &FileSystem<CustomMetadata>,
 ) -> anyhow::Result<Diff> {
+    compute_diff_impl(pristine_etc_files, current_etc_files, new_etc_files, true)
+}
+
+/// Computes differences without treating paths absent from current `/etc` as deletions.
+///
+/// This is intended for package-mode to image-mode migration, where the current
+/// system may predate defaults in the new image. In that case, absence does not
+/// imply that an administrator deleted the path.
+pub fn compute_diff_without_deletions(
+    pristine_etc_files: &FileSystem<CustomMetadata>,
+    current_etc_files: &FileSystem<CustomMetadata>,
+    new_etc_files: &FileSystem<CustomMetadata>,
+) -> anyhow::Result<Diff> {
+    compute_diff_impl(pristine_etc_files, current_etc_files, new_etc_files, false)
+}
+
+fn compute_diff_impl(
+    pristine_etc_files: &FileSystem<CustomMetadata>,
+    current_etc_files: &FileSystem<CustomMetadata>,
+    new_etc_files: &FileSystem<CustomMetadata>,
+    detect_deletions: bool,
+) -> anyhow::Result<Diff> {
     let mut diff = Diff {
         added: vec![],
         modified: vec![],
@@ -488,12 +510,14 @@ pub fn compute_diff(
         &mut diff,
     )?;
 
-    get_deletions(
-        &pristine_etc_files.root,
-        &current_etc_files.root,
-        PathBuf::new(),
-        &mut diff,
-    )?;
+    if detect_deletions {
+        get_deletions(
+            &pristine_etc_files.root,
+            &current_etc_files.root,
+            PathBuf::new(),
+            &mut diff,
+        )?;
+    }
 
     Ok(diff)
 }
@@ -1046,6 +1070,54 @@ mod tests {
                 .is_some()
         }));
 
+        Ok(())
+    }
+
+    #[test]
+    fn migration_diff_preserves_image_only_default() -> anyhow::Result<()> {
+        let tempdir = cap_std_ext::cap_tempfile::tempdir(cap_std::ambient_authority())?;
+
+        tempdir.create_dir("pristine_etc")?;
+        tempdir.create_dir("current_etc")?;
+        tempdir.create_dir("new_etc")?;
+
+        let pristine = tempdir.open_dir("pristine_etc")?;
+        let current = tempdir.open_dir("current_etc")?;
+        let new = tempdir.open_dir("new_etc")?;
+
+        pristine.write("image-only.conf", b"image default")?;
+        new.write("image-only.conf", b"image default")?;
+
+        let (pristine_tree, current_tree, new_tree) =
+            traverse_etc(&pristine, &current, Some(&new))?;
+        let new_tree = new_tree.unwrap();
+        let diff = compute_diff_without_deletions(&pristine_tree, &current_tree, &new_tree)?;
+
+        merge(&current, &current_tree, &new, &new_tree, &diff)?;
+
+        assert_eq!(new.read("image-only.conf")?, b"image default");
+        Ok(())
+    }
+
+    #[test]
+    fn compute_diff_still_detects_deletions() -> anyhow::Result<()> {
+        let tempdir = cap_std_ext::cap_tempfile::tempdir(cap_std::ambient_authority())?;
+
+        tempdir.create_dir("pristine_etc")?;
+        tempdir.create_dir("current_etc")?;
+        tempdir.create_dir("new_etc")?;
+
+        let pristine = tempdir.open_dir("pristine_etc")?;
+        let current = tempdir.open_dir("current_etc")?;
+        let new = tempdir.open_dir("new_etc")?;
+
+        pristine.write("deleted.conf", b"old default")?;
+
+        let (pristine_tree, current_tree, new_tree) =
+            traverse_etc(&pristine, &current, Some(&new))?;
+        let diff = compute_diff(&pristine_tree, &current_tree, &new_tree.as_ref().unwrap())?;
+
+        assert_eq!(diff.removed, [PathBuf::from("deleted.conf")]);
         Ok(())
     }
 
