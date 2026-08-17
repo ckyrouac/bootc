@@ -208,11 +208,12 @@ jobs:
           echo "=== TMT result: exit code ${TMT_RC} ==="
 
           # Copy the per-scenario log from the VM to the runner
-          scp -i "${KEY_FILE}" -P "${SSH_PORT}" \
+          echo "=== Attempting scp of test log from VM ==="
+          scp -v -i "${KEY_FILE}" -P "${SSH_PORT}" \
             -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -o IdentitiesOnly=yes \
             root@localhost:/var/tmp/bootc-esp-test.log \
-            /var/tmp/bootc-esp-test.log 2>/dev/null || true
+            /var/tmp/bootc-esp-test.log 2>&1 | tail -5 || echo "scp failed"
 
           exit ${TMT_RC}
 
