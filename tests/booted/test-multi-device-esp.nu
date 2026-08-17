@@ -385,46 +385,41 @@ def test_no_esp_failure [] {
 def main [] {
     tap begin "multi-device ESP detection tests"
 
-    # Write a detailed log file alongside tmt's own output
-    let logfile = "/var/tmp/bootc-esp-test.log"
-    $"=== bootc multi-device ESP test starting at (date now) ===\n" | save --append $logfile
-
     # This test requires a UEFI-booted host because it creates ESP partitions
     # and expects bootupd to install a UEFI bootloader. On BIOS systems,
     # bootupd would try to install GRUB for i386-pc which needs a BIOS Boot
     # Partition instead of an ESP.
     if not ("/sys/firmware/efi" | path exists) {
         print "SKIP: multi-device ESP test requires UEFI boot"
-        "SKIP: no UEFI\n" | save --append $logfile
         tap ok
         return
     }
 
-    "UEFI detected, starting tests\n" | save --append $logfile
+    print "UEFI detected, starting tests"
     bootc image copy-to-storage
-    "bootc image copy-to-storage done\n" | save --append $logfile
+    print "bootc image copy-to-storage done"
 
-    "Starting test_single_esp\n" | save --append $logfile
+    print "=== Starting test_single_esp ==="
     test_single_esp
-    "PASSED: test_single_esp\n" | save --append $logfile
+    print "=== PASSED: test_single_esp ==="
 
-    "Starting test_dual_esp\n" | save --append $logfile
+    print "=== Starting test_dual_esp ==="
     test_dual_esp
-    "PASSED: test_dual_esp\n" | save --append $logfile
+    print "=== PASSED: test_dual_esp ==="
 
-    "Starting test_three_devices_partial_esp\n" | save --append $logfile
+    print "=== Starting test_three_devices_partial_esp ==="
     test_three_devices_partial_esp
-    "PASSED: test_three_devices_partial_esp\n" | save --append $logfile
+    print "=== PASSED: test_three_devices_partial_esp ==="
 
-    "Starting test_single_device_no_lvm\n" | save --append $logfile
+    print "=== Starting test_single_device_no_lvm ==="
     test_single_device_no_lvm
-    "PASSED: test_single_device_no_lvm\n" | save --append $logfile
+    print "=== PASSED: test_single_device_no_lvm ==="
 
-    "Starting test_no_esp_failure\n" | save --append $logfile
+    print "=== Starting test_no_esp_failure ==="
     test_no_esp_failure
-    "PASSED: test_no_esp_failure\n" | save --append $logfile
+    print "=== PASSED: test_no_esp_failure ==="
 
-    $"=== ALL TESTS PASSED at (date now) ===\n" | save --append $logfile
+    print "=== ALL TESTS PASSED ==="
 
     tap ok
 }

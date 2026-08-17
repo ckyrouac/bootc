@@ -206,35 +206,31 @@ jobs:
           TMT_RC=$?
 
           echo "=== TMT result: exit code ${TMT_RC} ==="
-
-          # Copy the per-scenario log from the VM to the runner
-          echo "=== Attempting scp of test log from VM ==="
-          scp -v -i "${KEY_FILE}" -P "${SSH_PORT}" \
-            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            -o IdentitiesOnly=yes \
-            root@localhost:/var/tmp/bootc-esp-test.log \
-            /var/tmp/bootc-esp-test.log 2>&1 | tail -5 || echo "scp failed"
-
           exit ${TMT_RC}
 
       - name: Show TMT results
         if: always()
         run: |
-          echo "=== bootc ESP per-scenario test log ==="
-          if [ -f /var/tmp/bootc-esp-test.log ]; then
-            cat /var/tmp/bootc-esp-test.log
-            content=$(cat /var/tmp/bootc-esp-test.log | tr '\n' '|' | head -c 2000)
-            echo "::error title=bootc ESP test log::${content}"
-          else
-            echo "No per-scenario log found (test may not have started)"
-            echo "::error title=No test log::bootc-esp-test.log not found - test may have failed before writing it"
-          fi
+          echo "=== tmt workdir contents ==="
+          find /var/tmp/tmt -maxdepth 8 -type f 2>/dev/null | sort | head -50 || echo "(empty)"
           echo ""
-          echo "=== tmt output files ==="
-          find /var/tmp/tmt -name "output.txt" 2>/dev/null | while read f; do
+          echo "=== tmt test output (output.txt files) ==="
+          find /var/tmp/tmt -name "output.txt" -type f 2>/dev/null | while read f; do
             echo "--- $f ---"
             cat "$f" || true
+            echo ""
+            # Emit as error annotation for API visibility
+            content=$(cat "$f" | tr '\n' '|' | head -c 2000)
+            echo "::error title=TMT output ($f)::${content}"
           done
+          # If no output files found, check for any log files
+          if [ -z "$(find /var/tmp/tmt -name 'output.txt' 2>/dev/null)" ]; then
+            echo "No output.txt found. tmt.log files:"
+            find /var/tmp/tmt -name "*.log" -type f 2>/dev/null | while read f; do
+              tail -20 "$f" | while IFS= read -r line; do echo "$line"; done
+            done
+            echo "::error title=No tmt output::No output.txt found in tmt workdir"
+          fi
 
       - name: Archive TMT logs
         if: always()
