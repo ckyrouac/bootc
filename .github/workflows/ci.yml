@@ -205,40 +205,35 @@ jobs:
             plan --name /plans/test-32-multi-device-esp
           TMT_RC=$?
 
-          # Print tmt results summary for easier log inspection
           echo "=== TMT result: exit code ${TMT_RC} ==="
 
-          # Emit key tmt output as GitHub error annotations (visible in check-run API)
-          find /var/tmp/tmt -name "output.txt" 2>/dev/null | while read f; do
-            echo "::group::TMT output: $f"
-            cat "$f" 2>/dev/null || true
-            echo "::endgroup::"
-            content=$(cat "$f" 2>/dev/null | tr '\n' '|' | head -c 2000)
-            echo "::error title=TMT output::${content}"
-          done
+          # Copy the per-scenario log from the VM to the runner
+          scp -i "${KEY_FILE}" -P "${SSH_PORT}" \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o IdentitiesOnly=yes \
+            root@localhost:/var/tmp/bootc-esp-test.log \
+            /var/tmp/bootc-esp-test.log 2>/dev/null || true
 
           exit ${TMT_RC}
 
       - name: Show TMT results
         if: always()
         run: |
-          set -x
-          echo "=== /var/tmp/tmt tree ==="
-          find /var/tmp/tmt -maxdepth 8 2>/dev/null | head -100 || echo "(empty)"
-          echo "=== All files in tmt workdir ==="
-          find /var/tmp/tmt -type f 2>/dev/null | sort | while read f; do
-            echo "::group::$f"
-            cat "$f" 2>/dev/null | head -200 || true
-            echo "::endgroup::"
-          done
-          echo "=== bootc ESP test log ==="
+          echo "=== bootc ESP per-scenario test log ==="
           if [ -f /var/tmp/bootc-esp-test.log ]; then
             cat /var/tmp/bootc-esp-test.log
-            echo "::error title=bootc ESP test log::$(cat /var/tmp/bootc-esp-test.log | tr '\n' '|' | head -c 2000)"
+            content=$(cat /var/tmp/bootc-esp-test.log | tr '\n' '|' | head -c 2000)
+            echo "::error title=bootc ESP test log::${content}"
           else
-            echo "Log file not found at /var/tmp/bootc-esp-test.log"
-            echo "::error title=No test log::Test log /var/tmp/bootc-esp-test.log not found"
+            echo "No per-scenario log found (test may not have started)"
+            echo "::error title=No test log::bootc-esp-test.log not found - test may have failed before writing it"
           fi
+          echo ""
+          echo "=== tmt output files ==="
+          find /var/tmp/tmt -name "output.txt" 2>/dev/null | while read f; do
+            echo "--- $f ---"
+            cat "$f" || true
+          done
 
       - name: Archive TMT logs
         if: always()
