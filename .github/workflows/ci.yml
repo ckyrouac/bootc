@@ -208,15 +208,13 @@ jobs:
           # Print tmt results summary for easier log inspection
           echo "=== TMT result: exit code ${TMT_RC} ==="
 
-          # Emit key tmt output as GitHub workflow annotations so they
-          # appear in api.github.com check-runs (accessible without CDN)
+          # Emit key tmt output as GitHub error annotations (visible in check-run API)
           find /var/tmp/tmt -name "output.txt" 2>/dev/null | while read f; do
             echo "::group::TMT output: $f"
             cat "$f" 2>/dev/null || true
             echo "::endgroup::"
-            # Also emit as a notice annotation for API visibility
-            content=$(tail -50 "$f" 2>/dev/null | tr '\n' '|' | head -c 1000)
-            echo "::notice title=TMT output::${content}"
+            content=$(cat "$f" 2>/dev/null | tr '\n' '|' | head -c 2000)
+            echo "::error title=TMT output::${content}"
           done
 
           exit ${TMT_RC}
@@ -224,20 +222,27 @@ jobs:
       - name: Show TMT results
         if: always()
         run: |
-          echo "=== /var/tmp/tmt directory structure ==="
-          find /var/tmp/tmt -maxdepth 4 2>/dev/null || echo "(empty)"
+          echo "=== /var/tmp/tmt contents ==="
+          find /var/tmp/tmt -maxdepth 5 -type f 2>/dev/null | sort || echo "(empty)"
           echo ""
-          echo "=== TMT execute/output.txt files ==="
+          echo "=== output.txt files ==="
           find /var/tmp/tmt -name "output.txt" 2>/dev/null | while read f; do
             echo "--- $f ---"
             cat "$f" 2>/dev/null || true
             echo ""
           done
-          echo "=== TMT log files (last 100 lines each) ==="
-          find /var/tmp/tmt -name "*.log" 2>/dev/null | while read f; do
+          echo "=== tmt.log files (last 100 lines) ==="
+          find /var/tmp/tmt -name "tmt.log" 2>/dev/null | while read f; do
             echo "--- $f ---"
             tail -100 "$f" 2>/dev/null || true
             echo ""
+          done
+          # Emit critical failures as error annotations (visible in GHA API)
+          find /var/tmp/tmt -name "output.txt" 2>/dev/null | while read f; do
+            if grep -q "FAILED\|Error\|error\|failed" "$f" 2>/dev/null; then
+              summary=$(grep -E "FAILED|Error|error|failed|Starting|completed" "$f" 2>/dev/null | tail -20 | tr '\n' '|')
+              echo "::error title=TMT test failure::${summary}"
+            fi
           done
 
       - name: Archive TMT logs
