@@ -231,19 +231,23 @@ jobs:
             cat "$f" 2>/dev/null | head -200 || true
             echo "::endgroup::"
           done
-          # Emit any failures as error annotations
-          find /var/tmp/tmt -type f -name "*.txt" -o -name "*.log" 2>/dev/null | \
-            xargs grep -l -E "FAIL|Error|error" 2>/dev/null | while read f; do
-              content=$(grep -E "FAIL|Error|error|Starting|completed" "$f" 2>/dev/null | tail -20 | tr '\n' ' ' | cut -c1-1000)
-              echo "::error title=TMT failure in $f::${content}"
-            done
+          echo "=== bootc ESP test log ==="
+          if [ -f /var/tmp/bootc-esp-test.log ]; then
+            cat /var/tmp/bootc-esp-test.log
+            echo "::error title=bootc ESP test log::$(cat /var/tmp/bootc-esp-test.log | tr '\n' '|' | head -c 2000)"
+          else
+            echo "Log file not found at /var/tmp/bootc-esp-test.log"
+            echo "::error title=No test log::Test log /var/tmp/bootc-esp-test.log not found"
+          fi
 
       - name: Archive TMT logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tmt-logs-multi-device-esp
-          path: /var/tmp/tmt
+          path: |
+            /var/tmp/tmt
+            /var/tmp/bootc-esp-test.log
           if-no-files-found: ignore
   docs:
     if: ${{ contains(github.event.pull_request.labels.*.name, 'documentation') }}
