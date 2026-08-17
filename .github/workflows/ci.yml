@@ -222,28 +222,21 @@ jobs:
       - name: Show TMT results
         if: always()
         run: |
-          echo "=== /var/tmp/tmt contents ==="
-          find /var/tmp/tmt -maxdepth 5 -type f 2>/dev/null | sort || echo "(empty)"
-          echo ""
-          echo "=== output.txt files ==="
-          find /var/tmp/tmt -name "output.txt" 2>/dev/null | while read f; do
-            echo "--- $f ---"
-            cat "$f" 2>/dev/null || true
-            echo ""
+          set -x
+          echo "=== /var/tmp/tmt tree ==="
+          find /var/tmp/tmt -maxdepth 8 2>/dev/null | head -100 || echo "(empty)"
+          echo "=== All files in tmt workdir ==="
+          find /var/tmp/tmt -type f 2>/dev/null | sort | while read f; do
+            echo "::group::$f"
+            cat "$f" 2>/dev/null | head -200 || true
+            echo "::endgroup::"
           done
-          echo "=== tmt.log files (last 100 lines) ==="
-          find /var/tmp/tmt -name "tmt.log" 2>/dev/null | while read f; do
-            echo "--- $f ---"
-            tail -100 "$f" 2>/dev/null || true
-            echo ""
-          done
-          # Emit critical failures as error annotations (visible in GHA API)
-          find /var/tmp/tmt -name "output.txt" 2>/dev/null | while read f; do
-            if grep -q "FAILED\|Error\|error\|failed" "$f" 2>/dev/null; then
-              summary=$(grep -E "FAILED|Error|error|failed|Starting|completed" "$f" 2>/dev/null | tail -20 | tr '\n' '|')
-              echo "::error title=TMT test failure::${summary}"
-            fi
-          done
+          # Emit any failures as error annotations
+          find /var/tmp/tmt -type f -name "*.txt" -o -name "*.log" 2>/dev/null | \
+            xargs grep -l -E "FAIL|Error|error" 2>/dev/null | while read f; do
+              content=$(grep -E "FAIL|Error|error|Starting|completed" "$f" 2>/dev/null | tail -20 | tr '\n' ' ' | cut -c1-1000)
+              echo "::error title=TMT failure in $f::${content}"
+            done
 
       - name: Archive TMT logs
         if: always()
