@@ -153,6 +153,7 @@ def run_install [mountpoint: string] {
     (podman run
         --rm
         --privileged
+        --pull never
         -v $"($mountpoint):/target"
         -v /dev:/dev
         -v /run/udev:/run/udev:ro
@@ -396,8 +397,22 @@ def main [] {
     }
 
     print "UEFI detected, starting tests"
-    bootc image copy-to-storage
-    print "bootc image copy-to-storage done"
+    # Copy the booted image into podman container storage so 'podman run localhost/bootc' works.
+    # If the booted image transport is 'registry' pointing to localhost, the copy will read
+    # from the ostree object store (not the network) and export to containers-storage.
+    # Use --pull never in podman run (see run_install) to prevent network pull attempts.
+    print "=== Running bootc image copy-to-storage ==="
+    let copy_result = (do { bootc image copy-to-storage } | complete)
+    print $"bootc image copy-to-storage exit code: ($copy_result.exit_code)"
+    print $"stdout: ($copy_result.stdout | str substring 0..200)"
+    print $"stderr: ($copy_result.stderr | str substring 0..200)"
+    if $copy_result.exit_code != 0 {
+        error make {msg: $"bootc image copy-to-storage failed: ($copy_result.stderr)"}
+    }
+    print "=== bootc image copy-to-storage done ==="
+    # Verify the image is now in podman storage
+    let img_check = (do { podman image inspect $target_image } | complete)
+    print $"Image in podman storage: ($img_check.exit_code == 0)"
 
     print "=== Starting test_single_esp ==="
     test_single_esp
