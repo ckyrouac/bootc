@@ -211,29 +211,28 @@ jobs:
       - name: Show TMT results
         if: always()
         run: |
-          echo "=== checking /var/tmp/tmt ==="
-          ls -la /var/tmp/tmt/ 2>/dev/null || echo "no /var/tmp/tmt directory"
-          echo ""
-          echo "=== tmt workdir tree (first 100 entries) ==="
-          find /var/tmp/tmt -maxdepth 8 -type f 2>/dev/null | sort | head -100
-          echo ""
-          echo "=== tmt.log (last 100 lines of most recent) ==="
+          # Emit directory info as error annotations for API visibility
+          TMT_LS=$(ls -la /var/tmp/tmt/ 2>&1 | head -20 | tr '\n' '|')
+          echo "::error title=tmt dir listing::${TMT_LS}"
+
+          FILE_COUNT=$(find /var/tmp/tmt -type f 2>/dev/null | wc -l)
+          echo "::error title=tmt file count::Files in /var/tmp/tmt: ${FILE_COUNT}"
+
+          FIND_OUTPUT=$(find /var/tmp/tmt -maxdepth 8 -type f 2>/dev/null | sort | head -30 | tr '\n' '|')
+          echo "::error title=tmt files::${FIND_OUTPUT}"
+
+          # Show tmt.log if present
           LATEST_LOG=$(find /var/tmp/tmt -name "tmt.log" -type f 2>/dev/null | sort | tail -1)
           if [ -n "$LATEST_LOG" ]; then
-            tail -100 "$LATEST_LOG"
-            content=$(tail -100 "$LATEST_LOG" | tr '\n' '|' | head -c 2000)
-            echo "::error title=tmt.log tail::${content}"
+            LOG_TAIL=$(tail -50 "$LATEST_LOG" | tr '\n' '|' | head -c 2000)
+            echo "::error title=tmt.log::${LOG_TAIL}"
           fi
-          echo ""
-          echo "=== output.txt files ==="
+
+          # Show output.txt if present
           find /var/tmp/tmt -name "output.txt" -type f 2>/dev/null | while read f; do
-            echo "--- $f ---"
-            cat "$f"
             content=$(cat "$f" | tr '\n' '|' | head -c 2000)
-            echo "::error title=TMT test output::${content}"
+            echo "::error title=output.txt::${content}"
           done
-          [ -z "$(find /var/tmp/tmt -name 'output.txt' -type f 2>/dev/null)" ] && \
-            echo "::error title=No output.txt::No output.txt files found in tmt workdir"
 
       - name: Archive TMT logs
         if: always()
