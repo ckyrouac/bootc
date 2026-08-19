@@ -226,10 +226,22 @@ jobs:
           FIND_OUTPUT=$(find /var/tmp/tmt -maxdepth 8 -type f 2>/dev/null | sort | head -30 | tr '\n' '|')
           echo "::error title=tmt files::${FIND_OUTPUT}"
 
+          # Show execute/results.yaml - tells us what tmt recorded as test result
+          find /var/tmp/tmt -path "*/execute/results.yaml" -type f 2>/dev/null | while read f; do
+            content=$(cat "$f" | tr '\n' '|' | head -c 2000)
+            echo "::error title=execute/results.yaml::${content}"
+          done
+
+          # Show prepare/results.yaml
+          find /var/tmp/tmt -path "*/prepare/results.yaml" -type f 2>/dev/null | while read f; do
+            content=$(cat "$f" | tr '\n' '|' | head -c 1000)
+            echo "::error title=prepare/results.yaml::${content}"
+          done
+
           # Show tmt.log if present
           LATEST_LOG=$(find /var/tmp/tmt -name "tmt.log" -type f 2>/dev/null | sort | tail -1)
           if [ -n "$LATEST_LOG" ]; then
-            LOG_TAIL=$(tail -50 "$LATEST_LOG" | tr '\n' '|' | head -c 2000)
+            LOG_TAIL=$(tail -100 "$LATEST_LOG" | tr '\n' '|' | head -c 2000)
             echo "::error title=tmt.log::${LOG_TAIL}"
           fi
 
