@@ -131,11 +131,16 @@ jobs:
           # Generate a unique VM name
           VM_NAME="bootc-tmt-multi-device-esp-$$"
 
-          # Boot a VM from the container image using bcvk + libvirt
+          # Boot a VM from the container image using bcvk + libvirt.
+          # Use --target-transport containers-storage so that bootc status inside
+          # the VM shows transport=containers-storage (not registry), allowing
+          # 'bootc image copy-to-storage' to export from the ostree object store
+          # rather than trying to pull from docker://localhost which doesn't exist.
           if ! bcvk libvirt run \
             --name "${VM_NAME}" \
             --detach \
             --label=bootc.test=1 \
+            --target-transport containers-storage \
             localhost/bootc; then
             echo "ERROR: bcvk libvirt run failed" >&2
             bcvk libvirt list || true
