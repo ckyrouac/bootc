@@ -247,8 +247,14 @@ jobs:
 
           # Show output.txt if present
           find /var/tmp/tmt -name "output.txt" -type f 2>/dev/null | while read f; do
+            content=$(cat "$f" | tr '\n' '|' | head -c 3000)
+            echo "::error title=output.txt ($f)::${content}"
+          done
+
+          # Show failures.yaml if present
+          find /var/tmp/tmt -name "failures.yaml" -type f 2>/dev/null | while read f; do
             content=$(cat "$f" | tr '\n' '|' | head -c 2000)
-            echo "::error title=output.txt::${content}"
+            echo "::error title=failures.yaml::${content}"
           done
 
       - name: Archive TMT logs
