@@ -211,6 +211,17 @@ jobs:
           TMT_RC=$?
 
           echo "=== TMT result: exit code ${TMT_RC} ==="
+
+          # Fetch the test's own debug log from the guest while the VM is
+          # still up (the trap above destroys it as soon as this step exits).
+          # The nu test script mirrors its diagnostics here because nushell
+          # can lose buffered `print` output when the script exits on an
+          # uncaught error, which otherwise leaves tmt's output.txt empty.
+          scp -i "${KEY_FILE}" -P "${SSH_PORT}" \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            root@localhost:/var/tmp/bootc-esp-test.log /var/tmp/bootc-esp-test.log \
+            || echo "No guest debug log found at /var/tmp/bootc-esp-test.log"
+
           exit ${TMT_RC}
 
       - name: Show TMT results
@@ -256,6 +267,15 @@ jobs:
             content=$(cat "$f" | tr '\n' '|' | head -c 2000)
             echo "::error title=failures.yaml::${content}"
           done
+
+          # Show the nu test script's own debug log, fetched from the guest
+          # in the previous step. This has the full sequence of test
+          # diagnostics (including bootc install stdout/stderr) even when
+          # tmt's own output.txt capture comes back empty.
+          if [ -f /var/tmp/bootc-esp-test.log ]; then
+            content=$(cat /var/tmp/bootc-esp-test.log | tr '\n' '|' | head -c 6000)
+            echo "::error title=bootc-esp-test.log::${content}"
+          fi
 
       - name: Archive TMT logs
         if: always()

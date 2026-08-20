@@ -18,6 +18,18 @@ use tap.nu
 
 const target_image = "localhost/bootc"
 
+# Nushell buffers stdout and can lose it if the script exits abruptly on an
+# uncaught error, which makes `print`-based diagnostics unreliable when
+# captured over the tmt/ssh execution path. Mirror everything to a plain
+# file as well, since file writes are flushed synchronously and survive
+# regardless of how the process exits.
+const DEBUG_LOG = "/var/tmp/bootc-esp-test.log"
+
+def log [msg: string] {
+    print $msg
+    $"($msg)\n" | save --append $DEBUG_LOG
+}
+
 # ESP partition type GUID
 const ESP_TYPE = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
 # Linux LVM partition type GUID
@@ -148,30 +160,51 @@ def validate_esp [esp_partition: string] {
     }
 }
 
-# Run bootc install to-existing-root from within the container image under test
-def run_install [mountpoint: string] {
-    (podman run
-        --rm
-        --privileged
-        --pull never
-        -v $"($mountpoint):/target"
-        -v /dev:/dev
-        -v /run/udev:/run/udev:ro
-        -v /usr/share/empty:/usr/lib/bootc/bound-images.d
-        --pid=host
-        --security-opt label=type:unconfined_t
-        --env BOOTC_BOOTLOADER_DEBUG=1
-        $target_image
-        bootc install to-existing-root
-            --disable-selinux
-            --acknowledge-destructive
-            --target-no-signature-verification
-            /target)
+# Run bootc install to-existing-root from within the container image under test.
+#
+# Captures full stdout/stderr via `complete` and logs them (see `log`) so the
+# install output is diagnosable even when nushell's own stdout buffering
+# would otherwise lose `print` output on an abrupt/erroring exit.
+#
+# When `expect_failure` is false (the default), a non-zero exit raises an
+# error immediately with the captured stderr included in the message. When
+# `expect_failure` is true, the completion record is returned as-is so the
+# caller can make its own assertions (see test_no_esp_failure).
+def run_install [mountpoint: string, expect_failure: bool = false] {
+    let result = (do {
+        (podman run
+            --rm
+            --privileged
+            --pull never
+            -v $"($mountpoint):/target"
+            -v /dev:/dev
+            -v /run/udev:/run/udev:ro
+            -v /usr/share/empty:/usr/lib/bootc/bound-images.d
+            --pid=host
+            --security-opt label=type:unconfined_t
+            --env BOOTC_BOOTLOADER_DEBUG=1
+            $target_image
+            bootc install to-existing-root
+                --disable-selinux
+                --acknowledge-destructive
+                --target-no-signature-verification
+                /target)
+    } | complete)
+
+    log $"run_install exit_code: ($result.exit_code)"
+    log $"run_install stdout:\n($result.stdout)"
+    log $"run_install stderr:\n($result.stderr)"
+
+    if $result.exit_code != 0 and not $expect_failure {
+        error make {msg: $"bootc install to-existing-root failed with exit code ($result.exit_code): ($result.stderr)"}
+    }
+
+    $result
 }
 
 # Test scenario 1: Single ESP on first device
 def test_single_esp [] {
-    print "Starting single ESP test"
+    log "Starting single ESP test"
 
     let vg_name = "test_single_esp_vg"
     let mountpoint = "/var/mnt/test_single_esp"
@@ -209,12 +242,12 @@ def test_single_esp [] {
     cleanup $vg_name [$loop1, $loop2] $mountpoint
     rm -f $disk1 $disk2
 
-    print "Single ESP test completed successfully"
+    log "Single ESP test completed successfully"
 }
 
 # Test scenario 2: ESP on both devices
 def test_dual_esp [] {
-    print "Starting dual ESP test"
+    log "Starting dual ESP test"
 
     let vg_name = "test_dual_esp_vg"
     let mountpoint = "/var/mnt/test_dual_esp"
@@ -253,12 +286,12 @@ def test_dual_esp [] {
     cleanup $vg_name [$loop1, $loop2] $mountpoint
     rm -f $disk1 $disk2
 
-    print "Dual ESP test completed successfully"
+    log "Dual ESP test completed successfully"
 }
 
 # Test scenario 3: Three devices, ESP on disk1 and disk3 only
 def test_three_devices_partial_esp [] {
-    print "Starting three devices partial ESP test"
+    log "Starting three devices partial ESP test"
 
     let vg_name = "test_three_dev_vg"
     let mountpoint = "/var/mnt/test_three_dev"
@@ -300,12 +333,12 @@ def test_three_devices_partial_esp [] {
     cleanup $vg_name [$loop1, $loop2, $loop3] $mountpoint
     rm -f $disk1 $disk2 $disk3
 
-    print "Three devices partial ESP test completed successfully"
+    log "Three devices partial ESP test completed successfully"
 }
 
 # Test scenario 4: Single device with ESP + root partition (no LVM)
 def test_single_device_no_lvm [] {
-    print "Starting single device no LVM test"
+    log "Starting single device no LVM test"
 
     let mountpoint = "/var/mnt/test_no_lvm"
     let disk1 = "/var/tmp/disk1_nolvm.img"
@@ -331,12 +364,12 @@ def test_single_device_no_lvm [] {
     cleanup_simple $loop1 $mountpoint
     rm -f $disk1
 
-    print "Single device no LVM test completed successfully"
+    log "Single device no LVM test completed successfully"
 }
 
 # Test scenario 5: No ESP on any device (install should fail gracefully)
 def test_no_esp_failure [] {
-    print "Starting no ESP failure test"
+    log "Starting no ESP failure test"
 
     let vg_name = "test_no_esp_vg"
     let mountpoint = "/var/mnt/test_no_esp"
@@ -362,15 +395,13 @@ def test_no_esp_failure [] {
         lsblk --pairs --paths --inverse --output NAME,TYPE $lv_path
 
         # Run install and expect it to fail
-        let result = (do {
-            run_install $mountpoint
-        } | complete)
+        let result = (run_install $mountpoint true)
 
         assert ($result.exit_code != 0) "Expected install to fail with no ESP partitions"
         # Verify the failure is ESP-related
         let combined = $"($result.stdout)\n($result.stderr)"
         assert ($combined | str contains "ESP") $"Expected ESP-related error message, got: ($combined | str substring 0..200)"
-        print $"Install failed as expected with exit code ($result.exit_code)"
+        log $"Install failed as expected with exit code ($result.exit_code)"
     } catch {|e|
         cleanup $vg_name [$loop1, $loop2] $mountpoint
         rm -f $disk1 $disk2
@@ -380,10 +411,13 @@ def test_no_esp_failure [] {
     cleanup $vg_name [$loop1, $loop2] $mountpoint
     rm -f $disk1 $disk2
 
-    print "No ESP failure test completed successfully"
+    log "No ESP failure test completed successfully"
 }
 
 def main [] {
+    # Start with a clean debug log for this run (see `log`/`DEBUG_LOG`).
+    rm -f $DEBUG_LOG
+
     tap begin "multi-device ESP detection tests"
 
     # This test requires a UEFI-booted host because it creates ESP partitions
@@ -391,50 +425,50 @@ def main [] {
     # bootupd would try to install GRUB for i386-pc which needs a BIOS Boot
     # Partition instead of an ESP.
     if not ("/sys/firmware/efi" | path exists) {
-        print "SKIP: multi-device ESP test requires UEFI boot"
+        log "SKIP: multi-device ESP test requires UEFI boot"
         tap ok
         return
     }
 
-    print "UEFI detected, starting tests"
+    log "UEFI detected, starting tests"
     # Copy the booted image into podman container storage so 'podman run localhost/bootc' works.
     # If the booted image transport is 'registry' pointing to localhost, the copy will read
     # from the ostree object store (not the network) and export to containers-storage.
     # Use --pull never in podman run (see run_install) to prevent network pull attempts.
-    print "=== Running bootc image copy-to-storage ==="
+    log "=== Running bootc image copy-to-storage ==="
     let copy_result = (do { bootc image copy-to-storage } | complete)
-    print $"bootc image copy-to-storage exit code: ($copy_result.exit_code)"
-    print $"stdout: ($copy_result.stdout | str substring 0..200)"
-    print $"stderr: ($copy_result.stderr | str substring 0..200)"
+    log $"bootc image copy-to-storage exit code: ($copy_result.exit_code)"
+    log $"stdout: ($copy_result.stdout | str substring 0..200)"
+    log $"stderr: ($copy_result.stderr | str substring 0..200)"
     if $copy_result.exit_code != 0 {
         error make {msg: $"bootc image copy-to-storage failed: ($copy_result.stderr)"}
     }
-    print "=== bootc image copy-to-storage done ==="
+    log "=== bootc image copy-to-storage done ==="
     # Verify the image is now in podman storage
     let img_check = (do { podman image inspect $target_image } | complete)
-    print $"Image in podman storage: ($img_check.exit_code == 0)"
+    log $"Image in podman storage: ($img_check.exit_code == 0)"
 
-    print "=== Starting test_single_esp ==="
+    log "=== Starting test_single_esp ==="
     test_single_esp
-    print "=== PASSED: test_single_esp ==="
+    log "=== PASSED: test_single_esp ==="
 
-    print "=== Starting test_dual_esp ==="
+    log "=== Starting test_dual_esp ==="
     test_dual_esp
-    print "=== PASSED: test_dual_esp ==="
+    log "=== PASSED: test_dual_esp ==="
 
-    print "=== Starting test_three_devices_partial_esp ==="
+    log "=== Starting test_three_devices_partial_esp ==="
     test_three_devices_partial_esp
-    print "=== PASSED: test_three_devices_partial_esp ==="
+    log "=== PASSED: test_three_devices_partial_esp ==="
 
-    print "=== Starting test_single_device_no_lvm ==="
+    log "=== Starting test_single_device_no_lvm ==="
     test_single_device_no_lvm
-    print "=== PASSED: test_single_device_no_lvm ==="
+    log "=== PASSED: test_single_device_no_lvm ==="
 
-    print "=== Starting test_no_esp_failure ==="
+    log "=== Starting test_no_esp_failure ==="
     test_no_esp_failure
-    print "=== PASSED: test_no_esp_failure ==="
+    log "=== PASSED: test_no_esp_failure ==="
 
-    print "=== ALL TESTS PASSED ==="
+    log "=== ALL TESTS PASSED ==="
 
     tap ok
 }
