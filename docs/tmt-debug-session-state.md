@@ -1,40 +1,54 @@
 # TMT Debug Session State
 
-## Phase 2: Full TMT Suite (in progress)
+## Phase 2: Full TMT Suite — RESOLVED
 
-After the multi-device ESP plan (`test-32-multi-device-esp`) was proven
-working (see "Phase 1" below), the `tmt-multi-device-esp` CI job was
-generalized into a `tmt-suite` matrix job that runs all six `plans/test-NN-*.fmf`
-plans (`plans/integration.fmf` is intentionally excluded — see the job-level
-comment in `ci.yml` for why). Each matrix entry builds its own container
-image (most use `hack/Containerfile`; `test-22-logically-bound-install` uses
+CI run https://github.com/ckyrouac/bootc/actions/runs/32416581695 (commit
+`5c268b29`) passed all six `TMT: *` matrix legs on the **first attempt**:
+`readonly`, `local-upgrade`, `install-outside-container`, `lbi-install`,
+`lbi-switch`, `multi-device-esp`. A follow-up docs-only push
+(run 32419766575) confirmed the matrix is stable — all six green again.
+
+Verified these are genuine passes, not false-greens, by downloading the
+`tmt-logs-<label>` artifacts and inspecting `output.txt`:
+- `local-upgrade` and `lbi-switch` (the two `tmt-reboot`-based plans) show
+  real "verifying second boot" / "verifying third boot" output after actual
+  guest reboots — tmt's reboot handling over the `connect` provisioner
+  against a bcvk/libvirt guest just works, no debugging needed.
+- `lbi-switch` shows bound images actually being fetched at switch/upgrade
+  time (`Fetching bound image: docker.io/library/alpine:latest...done`,
+  `...ubi9/ubi-minimal:9.4...done`, `...9.3...done`).
+- `lbi-install` shows all three expected bound images
+  (`registry.access.redhat.com/ubi9/podman:latest`,
+  `quay.io/curl/curl:latest`, `quay.io/curl/curl-base:latest`) present and
+  validated.
+
+None of the risk areas flagged going in (reboot handling, external registry
+access, LBI bound-image resolution during bcvk install) turned out to be a
+problem. The pre-existing "Test install" CI job failure seen on these runs
+is unrelated — it was already failing on runs before any of this TMT work
+started (confirmed on run 32406751373, back when Phase 1 was marked
+resolved), so it is not a regression from this work.
+
+### What changed
+
+The `tmt-multi-device-esp` CI job was generalized into a `tmt-suite` matrix
+job that runs all six `plans/test-NN-*.fmf` plans (`plans/integration.fmf`
+is intentionally excluded — see the job-level comment in `ci.yml` for why).
+Each matrix entry builds its own container image (most use
+`hack/Containerfile`; `test-22-logically-bound-install` uses
 `tests/containerfiles/lbi/Containerfile`), boots it with the same
 bcvk+libvirt+tmt-`connect` approach as test-32, and runs its plan.
 
-This is expected to require iteration, same as test-32 did. Known risk areas
-going in (see the matrix comments in `ci.yml` for details):
+Risk areas identified going in, for reference (see the matrix comments in
+`ci.yml`) — all of these turned out fine on the first try, see above:
 - `test-20-local-upgrade` and `test-21-logically-bound-switch` use
-  `tmt-reboot` (twice each) — this is the first time this repo has exercised
-  tmt's reboot handling over the `connect` provisioner against a bcvk guest,
-  and `install-tmt/action.yml`'s own comment notes tmt has regressed reboot
-  handling before.
-- `test-21-logically-bound-switch` also needs the guest to reach external
+  `tmt-reboot` (twice each) — first time this repo exercised tmt's reboot
+  handling over the `connect` provisioner against a bcvk guest.
+- `test-21-logically-bound-switch` needs the guest to reach external
   registries (quay.io, registry.access.redhat.com, docker.io) at test
   runtime.
-- `test-22-logically-bound-install` needs bound images
-  (`quay.io/curl/curl[-base]:latest`, `registry.access.redhat.com/ubi9/podman:latest`)
-  to be resolvable during `bootc install` inside the VM; it's not certain
-  the runner-side `podman pull` pre-warm step actually helps bcvk's install
-  path find them (see the step's comment in `ci.yml`).
-- `test-01-readonly` and `test-23-install-outside-container` are simple,
-  read-only/negative-only tests with no reboots or network dependencies —
-  expected to be low-risk, similar to test-32.
-
-Next step: push and watch the `tmt-suite` matrix run in CI
-(`gh run list --repo ckyrouac/bootc --branch main`), then debug each failing
-leg the same way test-32 was debugged (see "Debugging Tools Reference" and
-"How to Read CI Results" below — the `tmt-logs-<label>` artifact per matrix
-leg is the most reliable source of truth).
+- `test-22-logically-bound-install` needs bound images resolvable during
+  `bootc install` inside the VM.
 
 ## Phase 1: Multi-Device ESP Test — RESOLVED
 
