@@ -8,4 +8,4 @@ provision:
 summary: Execute logically bound images tests for installing image
 execute:
   how: tmt
-  script: exec nu tests/booted/test-logically-bound-install.nu
+  script: nu tests/booted/test-logically-bound-install.nu

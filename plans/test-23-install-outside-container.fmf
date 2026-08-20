@@ -8,4 +8,4 @@ provision:
 summary: Execute tests for installing outside of a container
 execute:
   how: tmt
-  script: exec nu tests/booted/test-install-outside-container.nu
+  script: nu tests/booted/test-install-outside-container.nu

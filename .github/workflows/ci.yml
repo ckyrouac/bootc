@@ -86,12 +86,69 @@ jobs:
           sudo bootc-integration-tests host-privileged localhost/bootc
           # Finally the install-alongside suite
           sudo bootc-integration-tests install-alongside localhost/bootc
-  tmt-multi-device-esp:
+  # Run the booted TMT test suite (plans/test-NN-*.fmf).
+  #
+  # Each plan declares its own `provision: how: bootc` (build+boot via the
+  # tmt+provision-bootc plugin), but that plugin was unreliable in this GH
+  # Actions environment (connection-refused loops -- see
+  # docs/tmt-debug-session-state.md for the full history). Instead we build
+  # the image ourselves, boot it with bcvk+libvirt, and point tmt at it via
+  # the `connect` provisioner (CLI-level `provision --how=connect` overrides
+  # whatever each plan's own `provision:` step says). This is the same
+  # underlying approach (bcvk + libvirt + tmt connect) upstream
+  # bootc-dev/bootc uses, just done here with explicit shell steps instead
+  # of upstream's `cargo xtask run-tmt` (which doesn't exist in this
+  # v1.1.6-based branch).
+  #
+  # plans/integration.fmf is intentionally not included: it's a
+  # Testing-Farm-oriented meta-plan that provisions a bare-metal machine and
+  # re-runs all of these plans again internally, which would be redundant
+  # (and isn't suited to a lightweight GH Actions runner) given we already
+  # run each plan directly below.
+  tmt-suite:
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'control/skip-ci') }}
-    name: "TMT: multi-device ESP"
+    name: "TMT: ${{ matrix.label }}"
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     env:
       LIBVIRT_DEFAULT_URI: qemu:///session
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - plan: test-01-readonly
+            label: readonly
+            containerfile: hack/Containerfile
+          # Uses tmt-reboot (twice). This is the first time this repo has
+          # exercised tmt's reboot handling over the `connect` provisioner
+          # against a bcvk/libvirt guest -- the install-tmt action pins tmt
+          # specifically because reboot handling has regressed before (see
+          # its comment), so this plan is the most likely of the six to need
+          # follow-up debugging if it fails.
+          - plan: test-20-local-upgrade
+            label: local-upgrade
+            containerfile: hack/Containerfile
+          # Also uses tmt-reboot (twice), plus pulls images from external
+          # registries (quay.io, registry.access.redhat.com, docker.io) from
+          # inside the guest at test runtime -- see comment above and
+          # tests/booted/test-logically-bound-switch.nu.
+          - plan: test-21-logically-bound-switch
+            label: lbi-switch
+            containerfile: hack/Containerfile
+          - plan: test-22-logically-bound-install
+            label: lbi-install
+            containerfile: tests/containerfiles/lbi/Containerfile
+          - plan: test-23-install-outside-container
+            label: install-outside-container
+            containerfile: hack/Containerfile
+          - plan: test-32-multi-device-esp
+            label: multi-device-esp
+            containerfile: hack/Containerfile
+            # This test mirrors its diagnostics to a plain file on the guest
+            # (see tests/booted/test-multi-device-esp.nu) to work around
+            # nushell losing buffered stdout on an uncaught error. Fetch it
+            # after the tmt run; harmless no-op for plans that don't write it.
+            guest_debug_log: /var/tmp/bootc-esp-test.log
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -120,16 +177,34 @@ jobs:
       - name: Free up disk space
         run: sudo ./ci/clean-gha-runner.sh
 
+      # test-22 boots an image whose bound-images.d (see
+      # tests/containerfiles/lbi/Containerfile) references these images by
+      # name, and they need to get pulled during `bootc install`. This
+      # mirrors what `cargo xtask test-tmt` does on the assumption that
+      # having them warm in the runner's podman storage helps bcvk's
+      # install step resolve them (bcvk can expose the runner's storage to
+      # the guest via containers-storage transport). If this turns out not
+      # to matter for how bcvk performs the install, this step is a
+      # harmless no-op and can be removed.
+      - name: Pre-pull LBI test images
+        if: matrix.plan == 'test-22-logically-bound-install'
+        run: |
+          set -xeuo pipefail
+          podman pull \
+            quay.io/curl/curl-base:latest \
+            quay.io/curl/curl:latest \
+            registry.access.redhat.com/ubi9/podman:latest
+
       - name: Build bootc container image
         run: |
           set -xeuo pipefail
-          podman build -t localhost/bootc -f hack/Containerfile .
+          podman build -t localhost/bootc -f "${{ matrix.containerfile }}" .
 
-      - name: Run TMT multi-device ESP test
+      - name: Run TMT plan (${{ matrix.plan }})
         run: |
           set -xuo pipefail
           # Generate a unique VM name
-          VM_NAME="bootc-tmt-multi-device-esp-$$"
+          VM_NAME="bootc-tmt-${{ matrix.label }}-$$"
 
           # Boot a VM from the container image using bcvk + libvirt.
           # Use --target-transport containers-storage so that bootc status inside
@@ -198,29 +273,32 @@ jobs:
           fi
 
           # Run tmt tests via the connect provisioner (SSH into the running VM).
+          # This overrides whatever each plan's own `provision:` step says
+          # (see the job-level comment above for why).
           # Pass running_env=image_mode to skip prepare steps that only apply
           # to package-mode (non-image-mode) systems, matching upstream behaviour.
           tmt -vvv --context=running_env=image_mode \
-            run --id "multi-device-esp-${VM_NAME}" --all \
+            run --id "${{ matrix.label }}-${VM_NAME}" --all \
             provision --how=connect \
               --guest=localhost \
               --user=root \
               --port="${SSH_PORT}" \
               --key="${KEY_FILE}" \
-            plan --name /plans/test-32-multi-device-esp
+            plan --name "/plans/${{ matrix.plan }}"
           TMT_RC=$?
 
           echo "=== TMT result: exit code ${TMT_RC} ==="
 
-          # Fetch the test's own debug log from the guest while the VM is
-          # still up (the trap above destroys it as soon as this step exits).
-          # The nu test script mirrors its diagnostics here because nushell
-          # can lose buffered `print` output when the script exits on an
-          # uncaught error, which otherwise leaves tmt's output.txt empty.
-          scp -i "${KEY_FILE}" -P "${SSH_PORT}" \
-            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            root@localhost:/var/tmp/bootc-esp-test.log /var/tmp/bootc-esp-test.log \
-            || echo "No guest debug log found at /var/tmp/bootc-esp-test.log"
+          # Fetch the test's own debug log from the guest, if this plan
+          # writes one, while the VM is still up (the trap above destroys it
+          # as soon as this step exits).
+          GUEST_DEBUG_LOG="${{ matrix.guest_debug_log }}"
+          if [ -n "${GUEST_DEBUG_LOG}" ]; then
+            scp -i "${KEY_FILE}" -P "${SSH_PORT}" \
+              -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              "root@localhost:${GUEST_DEBUG_LOG}" "${GUEST_DEBUG_LOG}" \
+              || echo "No guest debug log found at ${GUEST_DEBUG_LOG}"
+          fi
 
           exit ${TMT_RC}
 
@@ -268,23 +346,22 @@ jobs:
             echo "::error title=failures.yaml::${content}"
           done
 
-          # Show the nu test script's own debug log, fetched from the guest
-          # in the previous step. This has the full sequence of test
-          # diagnostics (including bootc install stdout/stderr) even when
-          # tmt's own output.txt capture comes back empty.
-          if [ -f /var/tmp/bootc-esp-test.log ]; then
-            content=$(cat /var/tmp/bootc-esp-test.log | tr '\n' '|' | head -c 6000)
-            echo "::error title=bootc-esp-test.log::${content}"
+          # Show the test's own guest-side debug log, if this plan writes
+          # one and it was fetched in the previous step (see comment there).
+          GUEST_DEBUG_LOG="${{ matrix.guest_debug_log }}"
+          if [ -n "${GUEST_DEBUG_LOG}" ] && [ -f "${GUEST_DEBUG_LOG}" ]; then
+            content=$(cat "${GUEST_DEBUG_LOG}" | tr '\n' '|' | head -c 6000)
+            echo "::error title=guest debug log (${GUEST_DEBUG_LOG})::${content}"
           fi
 
       - name: Archive TMT logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: tmt-logs-multi-device-esp
+          name: "tmt-logs-${{ matrix.label }}"
           path: |
             /var/tmp/tmt
-            /var/tmp/bootc-esp-test.log
+            ${{ matrix.guest_debug_log }}
           if-no-files-found: ignore
   docs:
     if: ${{ contains(github.event.pull_request.labels.*.name, 'documentation') }}
