@@ -184,10 +184,17 @@ def run_install [mountpoint: string, expect_failure: bool = false] {
             --security-opt label=type:unconfined_t
             --env BOOTC_BOOTLOADER_DEBUG=1
             $target_image
+            # bootc install defaults to fetching the *target* image (i.e. the
+            # image future upgrades will pull) via the `registry` transport,
+            # which would try to pull "localhost/bootc" from a registry at
+            # localhost:443 and fail since there is none. The image was loaded
+            # into local podman storage via `bootc image copy-to-storage`, so
+            # tell it to use that instead.
             bootc install to-existing-root
                 --disable-selinux
                 --acknowledge-destructive
                 --target-no-signature-verification
+                --target-transport containers-storage
                 /target)
     } | complete)
 
