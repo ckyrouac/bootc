@@ -1,6 +1,42 @@
-# TMT Multi-Device ESP Test Debug Session State
+# TMT Debug Session State
 
-## Current Status: RESOLVED
+## Phase 2: Full TMT Suite (in progress)
+
+After the multi-device ESP plan (`test-32-multi-device-esp`) was proven
+working (see "Phase 1" below), the `tmt-multi-device-esp` CI job was
+generalized into a `tmt-suite` matrix job that runs all six `plans/test-NN-*.fmf`
+plans (`plans/integration.fmf` is intentionally excluded — see the job-level
+comment in `ci.yml` for why). Each matrix entry builds its own container
+image (most use `hack/Containerfile`; `test-22-logically-bound-install` uses
+`tests/containerfiles/lbi/Containerfile`), boots it with the same
+bcvk+libvirt+tmt-`connect` approach as test-32, and runs its plan.
+
+This is expected to require iteration, same as test-32 did. Known risk areas
+going in (see the matrix comments in `ci.yml` for details):
+- `test-20-local-upgrade` and `test-21-logically-bound-switch` use
+  `tmt-reboot` (twice each) — this is the first time this repo has exercised
+  tmt's reboot handling over the `connect` provisioner against a bcvk guest,
+  and `install-tmt/action.yml`'s own comment notes tmt has regressed reboot
+  handling before.
+- `test-21-logically-bound-switch` also needs the guest to reach external
+  registries (quay.io, registry.access.redhat.com, docker.io) at test
+  runtime.
+- `test-22-logically-bound-install` needs bound images
+  (`quay.io/curl/curl[-base]:latest`, `registry.access.redhat.com/ubi9/podman:latest`)
+  to be resolvable during `bootc install` inside the VM; it's not certain
+  the runner-side `podman pull` pre-warm step actually helps bcvk's install
+  path find them (see the step's comment in `ci.yml`).
+- `test-01-readonly` and `test-23-install-outside-container` are simple,
+  read-only/negative-only tests with no reboots or network dependencies —
+  expected to be low-risk, similar to test-32.
+
+Next step: push and watch the `tmt-suite` matrix run in CI
+(`gh run list --repo ckyrouac/bootc --branch main`), then debug each failing
+leg the same way test-32 was debugged (see "Debugging Tools Reference" and
+"How to Read CI Results" below — the `tmt-logs-<label>` artifact per matrix
+leg is the most reliable source of truth).
+
+## Phase 1: Multi-Device ESP Test — RESOLVED
 
 CI run https://github.com/ckyrouac/bootc/actions/runs/32406751373 (commit
 `106cbd52`, which includes the `831f5f91` target-transport fix) passed the
