@@ -1,31 +1,61 @@
 # TMT Multi-Device ESP Test Debug Session State
 
-## Current Status
+## Current Status (updated by restarted session)
 
-The TMT multi-device ESP test (`test-32-multi-device-esp`) is running in CI but failing
-at the first scenario (`test_single_esp`) with:
+Root cause of the empty `output.txt` found: nushell buffers stdout internally and
+loses everything printed so far when the script exits abruptly on an uncaught
+`error make`. That's why removing `exec` (commit `6c35f57d`) didn't help — tmt/ssh
+was capturing correctly, there was just nothing flushed to capture. The CI run
+after that fix (`b3a46970`, run 32396069525) confirmed this: `output.txt` had only
+the SSH "permanently added" banner, no nu `print` output at all, even though the
+test ran for 2m18s and clearly executed many `print` statements before failing.
 
-```
-Error: Single ESP test failed: {msg: External command had a non-zero exit code}
-```
+While fixing this, also found and fixed a **nushell parse error**: wrapping the
+`podman run` invocation in `do { podman run ... --pull never ... } | complete`
+(added in `c4a71b24` to capture output) fails to parse in nushell — `--pull never`
+followed by a multi-line arg list confuses the parser inside a bare `do {}` block
+("expected operator" at `never`). This was never caught because nothing surfaced
+the parser error clearly. Fixed by wrapping the external command in its own parens
+inside the `do` block: `do { (podman run ...) } | complete`. Verified by sourcing
+the script locally with `nu -c "source tests/booted/test-multi-device-esp.nu"`.
 
-The test runs for ~2 minutes before failing. `bootc image copy-to-storage` takes ~1 min,
-then `test_single_esp` fails immediately when calling `run_install`.
+Fix implemented in commit `0d9f636f` (pushed to `ckyrouac/main` and
+`ckyrouac/test-backport-multi-device`):
+- Added a `log` helper in the nu test script that mirrors every `print` to
+  `/var/tmp/bootc-esp-test.log` via `save --append` (synchronous file write,
+  survives regardless of how the nu process exits).
+- `run_install` now always captures stdout/stderr via `complete` and logs them,
+  with an `expect_failure` flag so `test_no_esp_failure` no longer needs its own
+  `do{}+complete` wrapper (which would have swallowed the internal `error make`
+  on unexpected success).
+- `ci.yml`: right after the `tmt run` command finishes (still inside the same
+  shell step, before the `trap ... EXIT` tears down the VM), `scp` the guest's
+  `/var/tmp/bootc-esp-test.log` back to the runner. `Show TMT results` now also
+  emits its content as a `::error::` annotation.
+
+### Next Step
+Push has been done — watch the next CI run on `ckyrouac/bootc` (`main` branch,
+or the `test-backport-multi-device` branch if a PR is opened) for the
+`bootc-esp-test.log` annotation in the `TMT: multi-device ESP` job. That should
+finally show which scenario fails and, critically, the actual `bootc install
+to-existing-root` stdout/stderr (run with `BOOTC_BOOTLOADER_DEBUG=1`).
 
 ## Branch State
 
-- **Branch**: `test-backport-multi-device`
-- **Remote main**: `02590c7b6ff4` (pushed to ckyrouac/bootc)
-- **Local HEAD**: `6c35f57d` (NOT YET PUSHED)
+- **Branch**: `test-backport-multi-device` (also mirrored onto `main` on the
+  `ckyrouac` fork, since `ci.yml` only triggers on push to `main` or PRs)
+- **Local HEAD**: `0d9f636f` (pushed to `ckyrouac/main` and
+  `ckyrouac/test-backport-multi-device`)
 
-## Commits Ready to Push
+## Previous Commits (already pushed)
 
 ```
 6c35f57d tmt: remove exec from script - allows tmt to capture nushell stdout
 ```
 
 This removes `exec` from `script: exec nu tests/...` → `script: nu tests/...` so tmt
-can capture nushell's stdout into `output.txt` for diagnostics.
+can capture nushell's stdout into `output.txt` for diagnostics. (Necessary but not
+sufficient — see buffering root cause above.)
 
 ## Root Cause Analysis So Far
 
