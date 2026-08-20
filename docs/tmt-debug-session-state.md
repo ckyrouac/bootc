@@ -1,9 +1,34 @@
 # TMT Multi-Device ESP Test Debug Session State
 
-## Current Status
+## Current Status: RESOLVED
 
-Root cause of the actual test failure has been found and fixed (commit `831f5f91`).
-CI run for that fix is in flight; see "Next Step" below.
+CI run https://github.com/ckyrouac/bootc/actions/runs/32406751373 (commit
+`106cbd52`, which includes the `831f5f91` target-transport fix) passed the
+`TMT: multi-device ESP` job in 24m38s. The `bootc-esp-test.log` artifact
+confirms all five scenarios completed successfully:
+
+```
+=== Starting test_single_esp ===          ... === PASSED: test_single_esp ===
+=== Starting test_dual_esp ===            ... === PASSED: test_dual_esp ===
+=== Starting test_three_devices_partial_esp === ... === PASSED: test_three_devices_partial_esp ===
+=== Starting test_single_device_no_lvm ===      ... === PASSED: test_single_device_no_lvm ===
+=== Starting test_no_esp_failure ===            ... === PASSED: test_no_esp_failure ===
+=== ALL TESTS PASSED ===
+```
+
+The multi-device ESP backport (`backport: multi-device parent support to
+v1.1.6`) is validated: single/dual/partial ESP across LVM-spanned devices,
+single-device-no-LVM, and the no-ESP graceful-failure case all behave
+correctly, including bootupd correctly skipping `/dev/loop2` in the single-ESP
+case (`Skipping device /dev/loop2 for EFI: ESP partition not found`) and
+correctly installing to both ESPs in the dual-ESP case.
+
+Remaining optional follow-up (not blocking): consider opening a PR from
+`test-backport-multi-device` against `ckyrouac/main` (or upstream) now that
+the test is green, and/or removing the extra debug scaffolding (verbose
+`log` calls, `bootc-esp-test.log` scp step) if it's considered too noisy for
+a merged test — though keeping it is low-cost and has already proven useful
+for diagnosing tmt/nushell issues.
 
 ## Root Cause History (in the order they were found)
 
@@ -60,29 +85,17 @@ CI run for that fix is in flight; see "Next Step" below.
    to `bootc install to-existing-root` in `run_install`, matching how the image
    actually got there.
 
-## Next Step
-
-Commit `831f5f91` (target-transport fix) has been pushed to `ckyrouac/main` and
-`ckyrouac/test-backport-multi-device`. Watch the triggered CI run's
-`TMT: multi-device ESP` job:
+## Debugging Tools Reference (kept for future issues)
 
 ```bash
 gh run list --repo ckyrouac/bootc --branch main --limit 5
 gh run view <run-id> --repo ckyrouac/bootc
-# once the TMT job finishes, get its debug log either via the artifact:
+# get its debug log either via the artifact:
 gh run download <run-id> --repo ckyrouac/bootc -n tmt-logs-multi-device-esp -D /tmp/tmt-artifact
 find /tmp/tmt-artifact -iname output.txt -o -iname bootc-esp-test.log
 # or via annotations:
 gh api /repos/ckyrouac/bootc/check-runs/<tmt-job-id>/annotations
 ```
-
-If `test_single_esp` now passes, watch for the remaining four scenarios
-(`test_dual_esp`, `test_three_devices_partial_esp`, `test_single_device_no_lvm`,
-`test_no_esp_failure`) — they use the same `run_install` helper so should
-benefit from the same fix, but each exercises different multi-device/ESP
-detection code paths in the `blockdev`/`install` backport and could still
-uncover real bugs in the backported logic itself (which is the actual point of
-this test).
 
 Note: the `output.txt (...)` and `bootc-esp-test.log` GitHub Actions
 `::error::` annotations in `Show TMT results` can come back truncated/garbled
