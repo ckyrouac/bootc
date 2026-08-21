@@ -1,5 +1,39 @@
 # TMT Debug Session State
 
+## Phase 3: Pre-existing "Test install" job — RESOLVED
+
+The `Test install` job (a separate, unrelated job that runs the
+`tests-integration` Rust binary suite, not TMT) had been failing on every
+run throughout Phases 1-2 above. Root cause (confirmed by reading GitHub's
+`actions/runner-images` build scripts directly, not by guessing):
+
+GH's `ubuntu-24.04` runner image no longer installs podman via apt (only
+`buildah`/`skopeo` do, at the usual `/usr/bin`); podman itself comes from a
+static bundle installed to `/usr/local/bin` instead (see
+`images/ubuntu/scripts/build/install-container-tools.sh` in
+`actions/runner-images` — they switched because Ubuntu 24.04's apt-packaged
+podman, 4.9.3, is too old).
+
+`ostree-ext/ci/priv-integration.sh` (vendored/shared code, unchanged
+upstream too) runs inside a container that bind-mounts the host's real
+`/run/systemd` and `/run/dbus`, then uses `systemd-run --wait podman ...` —
+which actually runs podman *on the host*, not in the container, since the
+socket is shared. `systemd-run` resolves the bare `podman` argument to an
+absolute path using the *container's* `$PATH` (centos-bootc installs podman
+via dnf to `/usr/bin/podman`), then asks whatever systemd owns the
+bind-mounted socket (the host's real PID 1) to exec that same absolute
+path. The host tries `execve("/usr/bin/podman", ...)` against its own real
+filesystem, where podman only exists at `/usr/local/bin` — exec fails with
+`ENOENT`, which systemd reports as exit code 203 (`EXIT_EXEC`), matching
+exactly what the CI logs showed (`Main processes terminated with:
+code=exited/status=203`, 2ms runtime).
+
+Fix (commit `fd9ccc5c`): add `/usr/bin/podman` as a symlink to the real
+podman on the host before running the integration tests, so the absolute
+path resolved inside the container also exists on the host side. Verified
+green in CI: run 32501722475 — every job passed, including `Test install`
+(46m51s) for the first time across this whole debugging effort.
+
 ## Phase 2: Full TMT Suite — RESOLVED
 
 CI run https://github.com/ckyrouac/bootc/actions/runs/32416581695 (commit
