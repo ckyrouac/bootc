@@ -13,7 +13,7 @@ mkdir -p -m 0700 /var/roothome
 mkdir -p ~/.config/nushell
 echo '$env.config = { show_banner: false, }' > ~/.config/nushell/config.nu
 touch ~/.config/nushell/env.nu
-dnf -y install nu
+dnf -y install nu rsync
 dnf clean all
 # Stock extra cleaning of logs and caches in general (mostly dnf)
 rm /var/log/* /var/cache /var/lib/{dnf,rpm-state,rhsm} -rf
@@ -37,6 +37,11 @@ d /var/roothome/buildinfo/content_manifests 0755 - - -
 f /var/roothome/buildinfo/content_manifests/content-sets.json 0644 - - -
 EOF
 fi
+# Remove the actual content-sets.json file from /var so the bootc var-tmpfiles lint
+# doesn't flag it as an unsupported (non-directory/non-symlink) file in /var.
+# The tmpfiles.d entry above handles recreation on first boot.
+rm -f /var/roothome/buildinfo/content-sets.json \
+      /var/roothome/buildinfo/content_manifests/content-sets.json 2>/dev/null || true
 
 # And add missing sysusers.d entries
 if ! grep -q -r sudo /usr/lib/sysusers.d; then
