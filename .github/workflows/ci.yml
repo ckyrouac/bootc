@@ -69,6 +69,24 @@ jobs:
         uses: actions/checkout@v4
       - name: Free up disk space on runner
         run: sudo ./ci/clean-gha-runner.sh
+      # GH's ubuntu-24.04 runner image no longer ships podman via apt (only
+      # buildah/skopeo do, at the usual /usr/bin); podman itself comes from a
+      # static bundle installed to /usr/local/bin instead (see
+      # actions/runner-images images/ubuntu/scripts/build/install-container-tools.sh).
+      # ostree-ext/ci/priv-integration.sh (run below) bind-mounts the host's
+      # real /run/systemd into the container and uses `systemd-run --wait
+      # podman ...` to run podman *on the host* -- but systemd-run resolves
+      # "podman" using the *container's* $PATH (centos-bootc installs it via
+      # dnf to /usr/bin/podman), then asks the host's systemd to exec that
+      # same absolute path. Since the host only has podman at
+      # /usr/local/bin, that exec fails (systemd exit code 203/EXEC). Add a
+      # matching /usr/bin/podman on the host so the resolved path exists on
+      # both sides.
+      - name: Work around host/container podman path mismatch for systemd-run
+        run: |
+          if [ ! -e /usr/bin/podman ]; then
+            sudo ln -s "$(command -v podman)" /usr/bin/podman
+          fi
       - name: Integration tests
         run: |
           set -xeu
