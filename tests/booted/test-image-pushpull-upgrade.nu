@@ -60,7 +60,7 @@ RUN echo test content > /usr/share/blah.txt
     try { systemctl kill test-cat-progress }
     systemd-run -u test-cat-progress -- /bin/bash -c $"exec cat ($progress_fifo) > ($progress_json)"
     # nushell doesn't do fd passing right now either, so run via bash
-    bash -c $"bootc switch --progress-fd 3 --transport containers-storage localhost/bootc-derived 3>($progress_fifo)"
+    bash -c $"bootc switch --progress-fd 3 --transport containers-storage --download-only localhost/bootc-derived 3>($progress_fifo)"
     # Now, let's do some checking of the progress json
     let progress = open --raw $progress_json | from json -o
     sanity_check_switch_progress_json $progress
@@ -100,10 +100,19 @@ def sanity_check_switch_progress_json [data] {
     assert equal $deploy_names ["merging", "deploying", "bound_images", "cleanup", "cleanup"]
 }
 
-# The second boot; verify we're in the derived image
+# The second boot must still be the original image because switch was download-only.
 def second_boot [] {
     print "verifying second boot"
-    # booted from the local container storage and image
+    assert equal $booted.image.image localhost/bootc
+    let st = bootc status --json | from json
+    assert equal $st.status.staged.downloadOnly true
+    bootc switch --from-downloaded
+    tmt-reboot
+}
+
+# The third boot; verify the downloaded switch was explicitly applied.
+def third_boot [] {
+    print "verifying third boot"
     assert equal $booted.image.transport containers-storage
     assert equal $booted.image.image localhost/bootc-derived
     # We wrote this file
@@ -133,17 +142,28 @@ RUN echo test content2 > /usr/share/blah.txt
     let booted_digest = $booted.imageDigest
     print $"booted_digest = ($booted_digest)"
     # We should already be fetching updates from container storage
-    bootc upgrade
-    # Verify we staged an update
+    bootc upgrade --download-only
+    # Verify we staged a download-only update
     let st = bootc status --json | from json
     let staged_digest = $st.status.staged.image.imageDigest
     assert ($booted_digest != $staged_digest)
-    # And reboot into the upgrade
+    assert equal $st.status.staged.downloadOnly true
+    # A reboot alone must not apply a download-only update.
     tmt-reboot
 }
 
-# Check we have the updated kargs
-def third_boot [] {
+# The fourth boot remains on the old deployment, then explicitly applies upgrade.
+def fourth_boot [] {
+    print "verifying download-only upgrade"
+    assert equal $booted.image.image localhost/bootc-derived
+    let t = open /usr/share/blah.txt | str trim
+    assert equal $t "test content"
+    bootc upgrade --from-downloaded
+    tmt-reboot
+}
+
+# Check we have the updated kargs after applying the downloaded upgrade.
+def fifth_boot [] {
     print "verifying third boot"
     assert equal $booted.image.transport containers-storage
     assert equal $booted.image.image localhost/bootc-derived
@@ -171,6 +191,8 @@ def main [] {
         null | "0" => initial_build,
         "1" => second_boot,
         "2" => third_boot,
+        "3" => fourth_boot,
+        "4" => fifth_boot,
         $o => { error make { msg: $"Invalid TMT_REBOOT_COUNT ($o)" } },
     }
 }
