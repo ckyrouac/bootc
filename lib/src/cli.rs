@@ -854,7 +854,15 @@ async fn upgrade(opts: UpgradeOpts) -> Result<()> {
             println!("No update available.")
         } else {
             let osname = booted_deployment.osname();
-            crate::deploy::stage(sysroot, &osname, &fetched, &spec, prog.clone(), opts.download_opts.download_only).await?;
+            crate::deploy::stage(
+                sysroot,
+                &osname,
+                &fetched,
+                &spec,
+                prog.clone(),
+                opts.download_opts.download_only,
+            )
+            .await?;
             changed = true;
             if let Some(prev) = booted_image.as_ref() {
                 if let Some(fetched_manifest) = fetched.get_manifest(repo)? {
@@ -882,9 +890,14 @@ async fn upgrade(opts: UpgradeOpts) -> Result<()> {
 #[context("Switching")]
 async fn switch(opts: SwitchOpts) -> Result<()> {
     if opts.download_opts.from_downloaded {
-        anyhow::ensure!(opts.target.is_none(), "--from-downloaded does not accept a target image");
+        anyhow::ensure!(
+            opts.target.is_none(),
+            "--from-downloaded does not accept a target image"
+        );
         let sysroot = &get_storage().await?;
-        let staged = sysroot.staged_deployment().ok_or_else(|| anyhow::anyhow!("No staged deployment found"))?;
+        let staged = sysroot
+            .staged_deployment()
+            .ok_or_else(|| anyhow::anyhow!("No staged deployment found"))?;
         if staged.is_finalization_locked() {
             sysroot.change_finalization(&staged)?;
             sysroot.update_mtime()?;
@@ -895,7 +908,10 @@ async fn switch(opts: SwitchOpts) -> Result<()> {
         }
         return Ok(());
     }
-    let target_image = opts.target.as_ref().ok_or_else(|| anyhow::anyhow!("No target image specified"))?;
+    let target_image = opts
+        .target
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No target image specified"))?;
     let transport = ostree_container::Transport::try_from(opts.transport.as_str())?;
     let imgref = ostree_container::ImageReference {
         transport,
@@ -954,7 +970,15 @@ async fn switch(opts: SwitchOpts) -> Result<()> {
     }
 
     let stateroot = booted_deployment.osname();
-    crate::deploy::stage(sysroot, &stateroot, &fetched, &new_spec, prog.clone(), opts.download_opts.download_only).await?;
+    crate::deploy::stage(
+        sysroot,
+        &stateroot,
+        &fetched,
+        &new_spec,
+        prog.clone(),
+        opts.download_opts.download_only,
+    )
+    .await?;
 
     sysroot.update_mtime()?;
 
@@ -1011,7 +1035,15 @@ async fn edit(opts: EditOpts) -> Result<()> {
     // TODO gc old layers here
 
     let stateroot = booted_deployment.osname();
-    crate::deploy::stage(sysroot, &stateroot, &fetched, &new_spec, prog.clone(), false).await?;
+    crate::deploy::stage(
+        sysroot,
+        &stateroot,
+        &fetched,
+        &new_spec,
+        prog.clone(),
+        false,
+    )
+    .await?;
 
     sysroot.update_mtime()?;
 
