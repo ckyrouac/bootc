@@ -125,6 +125,9 @@ pub struct BootEntry {
     pub incompatible: bool,
     /// Whether this entry will be subject to garbage collection
     pub pinned: bool,
+    /// Whether this staged deployment is protected from automatic finalization.
+    #[serde(default)]
+    pub download_only: bool,
     /// The container storage backend
     #[serde(default)]
     pub store: Option<Store>,

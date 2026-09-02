@@ -285,6 +285,7 @@ mod test {
     use super::*;
 
     #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
+    #[allow(dead_code)]
     struct S {
         s: String,
         v: u32,

@@ -485,6 +485,7 @@ async fn deploy(
     stateroot: &str,
     image: &ImageState,
     origin: &glib::KeyFile,
+    lock_finalization: bool,
 ) -> Result<Deployment> {
     // Compute the kernel argument overrides. In practice today this API is always expecting
     // a merge deployment. The kargs code also always looks at the booted root (which
@@ -537,6 +538,9 @@ async fn deploy(
     // SAFETY: We must have a staged deployment
     let staged = sysroot.staged_deployment().unwrap();
     assert_eq!(staged.index(), r);
+    if lock_finalization {
+        sysroot.change_finalization(&staged)?;
+    }
     Ok(staged)
 }
 
@@ -560,6 +564,7 @@ pub(crate) async fn stage(
     image: &ImageState,
     spec: &RequiredHostSpec<'_>,
     prog: ProgressWriter,
+    lock_finalization: bool,
 ) -> Result<()> {
     let mut subtask = SubTaskStep {
         subtask: "merging".into(),
@@ -611,6 +616,7 @@ pub(crate) async fn stage(
         stateroot,
         image,
         &origin,
+        lock_finalization,
     )
     .await?;
 
