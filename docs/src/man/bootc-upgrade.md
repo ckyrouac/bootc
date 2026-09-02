@@ -47,6 +47,14 @@ the update in addition.
     will detect the case where no kernel changes are queued, and perform
     a userspace-only restart.
 
+**\--download-only**
+
+:   Download and stage the update without applying it.
+
+**\--from-downloaded**
+
+:   Apply a staged deployment previously downloaded with **\--download-only**.
+
 **-h**, **\--help**
 
 :   Print help (see a summary with -h)

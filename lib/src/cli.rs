@@ -742,6 +742,21 @@ async fn upgrade(opts: UpgradeOpts) -> Result<()> {
     let imgref = host.spec.image.as_ref();
     let prog: ProgressWriter = opts.progress.try_into()?;
 
+    if opts.download_opts.from_downloaded {
+        let staged = sysroot
+            .staged_deployment()
+            .ok_or_else(|| anyhow::anyhow!("No staged deployment found"))?;
+        if staged.is_finalization_locked() {
+            sysroot.change_finalization(&staged)?;
+            sysroot.update_mtime()?;
+            println!("Staged deployment will now be applied on reboot");
+        }
+        if opts.apply {
+            crate::reboot::reboot()?;
+        }
+        return Ok(());
+    }
+
     // If there's no specified image, let's be nice and check if the booted system is using rpm-ostree
     if imgref.is_none() {
         let booted_incompatible = host
@@ -818,6 +833,15 @@ async fn upgrade(opts: UpgradeOpts) -> Result<()> {
                     sysroot.change_finalization(&staged)?;
                     println!("Image downloaded, but will not be applied on reboot");
                     changed = true;
+                }
+            } else if !opts.check {
+                let staged = sysroot.staged_deployment().unwrap();
+                if staged.is_finalization_locked() {
+                    sysroot.change_finalization(&staged)?;
+                    println!("Staged deployment will now be applied on reboot");
+                    changed = true;
+                } else {
+                    println!("Staged update present, not changed.");
                 }
             } else {
                 println!("Staged update present, not changed.");
