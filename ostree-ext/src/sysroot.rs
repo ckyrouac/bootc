@@ -31,6 +31,25 @@ impl Deref for SysrootLock {
 }
 
 impl SysrootLock {
+    /// Toggle the finalization lock on a staged deployment.
+    #[allow(unsafe_code)]
+    pub fn change_finalization(&self, deployment: &ostree::Deployment) -> Result<()> {
+        use ostree::glib::translate::*;
+        use std::ptr;
+        unsafe {
+            let mut error = ptr::null_mut();
+            let ok = ostree::ffi::ostree_sysroot_change_finalization(
+                self.sysroot.to_glib_none().0,
+                deployment.to_glib_none().0,
+                &mut error,
+            );
+            if ok == 0 {
+                return Err(from_glib_full::<_, ostree::glib::Error>(error).into());
+            }
+        }
+        Ok(())
+    }
+
     /// Asynchronously acquire a sysroot lock.  If the lock cannot be acquired
     /// immediately, a status message will be printed to standard output.
     /// The lock will be unlocked when this object is dropped.

@@ -159,6 +159,7 @@ fn boot_entry_from_deployment(
         incompatible,
         store,
         pinned: deployment.is_pinned(),
+        download_only: deployment.is_staged() && deployment.is_finalization_locked(),
         ostree: Some(crate::spec::BootEntryOstree {
             checksum: deployment.csum().into(),
             // SAFETY: The deployserial is really unsigned

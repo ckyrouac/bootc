@@ -55,6 +55,16 @@ impl TryFrom<ProgressOptions> for ProgressWriter {
     }
 }
 
+#[derive(Debug, Parser, PartialEq, Eq)]
+pub(crate) struct DownloadOnlyOpts {
+    /// Download and stage the update without applying it.
+    #[clap(long, conflicts_with_all = ["check", "apply"])]
+    pub(crate) download_only: bool,
+    /// Apply a staged deployment previously downloaded with --download-only.
+    #[clap(long, conflicts_with_all = ["check", "download_only"])]
+    pub(crate) from_downloaded: bool,
+}
+
 /// Perform an upgrade operation
 #[derive(Debug, Parser, PartialEq, Eq)]
 pub(crate) struct UpgradeOpts {
@@ -76,6 +86,9 @@ pub(crate) struct UpgradeOpts {
     /// a userspace-only restart.
     #[clap(long, conflicts_with = "check")]
     pub(crate) apply: bool,
+
+    #[clap(flatten)]
+    pub(crate) download_opts: DownloadOnlyOpts,
 
     #[clap(flatten)]
     pub(crate) progress: ProgressOptions,
@@ -123,7 +136,10 @@ pub(crate) struct SwitchOpts {
     pub(crate) retain: bool,
 
     /// Target image to use for the next boot.
-    pub(crate) target: String,
+    pub(crate) target: Option<String>,
+
+    #[clap(flatten)]
+    pub(crate) download_opts: DownloadOnlyOpts,
 
     #[clap(flatten)]
     pub(crate) progress: ProgressOptions,
@@ -796,7 +812,16 @@ async fn upgrade(opts: UpgradeOpts) -> Result<()> {
             .map(|img| &img.manifest_digest == fetched_digest)
             .unwrap_or_default();
         if staged_unchanged {
-            println!("Staged update present, not changed.");
+            if opts.download_opts.download_only {
+                let staged = sysroot.staged_deployment().unwrap();
+                if !staged.is_finalization_locked() {
+                    sysroot.change_finalization(&staged)?;
+                    println!("Image downloaded, but will not be applied on reboot");
+                    changed = true;
+                }
+            } else {
+                println!("Staged update present, not changed.");
+            }
 
             if opts.apply {
                 crate::reboot::reboot()?;
@@ -805,7 +830,7 @@ async fn upgrade(opts: UpgradeOpts) -> Result<()> {
             println!("No update available.")
         } else {
             let osname = booted_deployment.osname();
-            crate::deploy::stage(sysroot, &osname, &fetched, &spec, prog.clone()).await?;
+            crate::deploy::stage(sysroot, &osname, &fetched, &spec, prog.clone(), opts.download_opts.download_only).await?;
             changed = true;
             if let Some(prev) = booted_image.as_ref() {
                 if let Some(fetched_manifest) = fetched.get_manifest(repo)? {
@@ -832,10 +857,25 @@ async fn upgrade(opts: UpgradeOpts) -> Result<()> {
 /// Implementation of the `bootc switch` CLI command.
 #[context("Switching")]
 async fn switch(opts: SwitchOpts) -> Result<()> {
+    if opts.download_opts.from_downloaded {
+        anyhow::ensure!(opts.target.is_none(), "--from-downloaded does not accept a target image");
+        let sysroot = &get_storage().await?;
+        let staged = sysroot.staged_deployment().ok_or_else(|| anyhow::anyhow!("No staged deployment found"))?;
+        if staged.is_finalization_locked() {
+            sysroot.change_finalization(&staged)?;
+            sysroot.update_mtime()?;
+            println!("Staged deployment will now be applied on reboot");
+        }
+        if opts.apply {
+            crate::reboot::reboot()?;
+        }
+        return Ok(());
+    }
+    let target_image = opts.target.as_ref().ok_or_else(|| anyhow::anyhow!("No target image specified"))?;
     let transport = ostree_container::Transport::try_from(opts.transport.as_str())?;
     let imgref = ostree_container::ImageReference {
         transport,
-        name: opts.target.to_string(),
+        name: target_image.to_string(),
     };
     let sigverify = sigpolicy_from_opt(opts.enforce_container_sigpolicy);
     let target = ostree_container::OstreeImageReference { sigverify, imgref };
@@ -890,7 +930,7 @@ async fn switch(opts: SwitchOpts) -> Result<()> {
     }
 
     let stateroot = booted_deployment.osname();
-    crate::deploy::stage(sysroot, &stateroot, &fetched, &new_spec, prog.clone()).await?;
+    crate::deploy::stage(sysroot, &stateroot, &fetched, &new_spec, prog.clone(), opts.download_opts.download_only).await?;
 
     sysroot.update_mtime()?;
 
@@ -947,7 +987,7 @@ async fn edit(opts: EditOpts) -> Result<()> {
     // TODO gc old layers here
 
     let stateroot = booted_deployment.osname();
-    crate::deploy::stage(sysroot, &stateroot, &fetched, &new_spec, prog.clone()).await?;
+    crate::deploy::stage(sysroot, &stateroot, &fetched, &new_spec, prog.clone(), false).await?;
 
     sysroot.update_mtime()?;
 

@@ -6,7 +6,8 @@ bootc-switch - Target a new container image reference to boot
 
 **bootc switch** \[**\--quiet**\] \[**\--apply**\] \[**\--transport**\]
 \[**\--enforce-container-sigpolicy**\] \[**\--retain**\]
-\[**-h**\|**\--help**\] \<*TARGET*\>
+\[**\--download-only**\|**\--from-downloaded**\]
+\[**-h**\|**\--help**\] \[\<*TARGET*\>\]
 
 # DESCRIPTION
 
@@ -54,6 +55,14 @@ updates via container image tags; for example,
 **\--retain**
 
 :   Retain reference to currently booted image
+
+**\--download-only**
+
+:   Download and stage the update without applying it.
+
+**\--from-downloaded**
+
+:   Apply a staged deployment previously downloaded with **\--download-only**.
 
 **-h**, **\--help**
 
