@@ -179,7 +179,7 @@ def fifth_boot [] {
     }
     # And the kargs that should be removed are gone
     for x in $removed {
-        assert not ($removed in $cmdline)
+        assert not ($x in $cmdline)
     }
 
     tap ok
