@@ -24,6 +24,11 @@ def parse_cmdline []  {
     open /proc/cmdline | str trim | split row " "
 }
 
+# Container storage includes the implicit latest tag in image references.
+def normalize_image_tag [image: string] {
+    $image | str replace --regex ':latest$' ''
+}
+
 # Run on the first boot
 def initial_build [] {
     tap begin "local image push + pull + upgrade"
@@ -103,9 +108,10 @@ def sanity_check_switch_progress_json [data] {
 # The second boot must still be the original image because switch was download-only.
 def second_boot [] {
     print "verifying second boot"
-    assert equal $booted.image.image localhost/bootc
+    assert equal (normalize_image_tag $booted.image.image) localhost/bootc
     let st = bootc status --json | from json
-    assert equal $st.status.staged.downloadOnly true
+    assert equal $st.status.staged null
+    bootc switch --transport containers-storage --download-only localhost/bootc-derived
     bootc switch --from-downloaded
     tmt-reboot
 }
@@ -114,7 +120,7 @@ def second_boot [] {
 def third_boot [] {
     print "verifying third boot"
     assert equal $booted.image.transport containers-storage
-    assert equal $booted.image.image localhost/bootc-derived
+    assert equal (normalize_image_tag $booted.image.image) localhost/bootc-derived
     # We wrote this file
     let t = open /usr/share/blah.txt | str trim
     assert equal $t "test content"
@@ -155,9 +161,12 @@ RUN echo test content2 > /usr/share/blah.txt
 # The fourth boot remains on the old deployment, then explicitly applies upgrade.
 def fourth_boot [] {
     print "verifying download-only upgrade"
-    assert equal $booted.image.image localhost/bootc-derived
+    assert equal (normalize_image_tag $booted.image.image) localhost/bootc-derived
     let t = open /usr/share/blah.txt | str trim
     assert equal $t "test content"
+    let st = bootc status --json | from json
+    assert equal $st.status.staged null
+    bootc upgrade --download-only
     bootc upgrade --from-downloaded
     tmt-reboot
 }
@@ -166,7 +175,7 @@ def fourth_boot [] {
 def fifth_boot [] {
     print "verifying third boot"
     assert equal $booted.image.transport containers-storage
-    assert equal $booted.image.image localhost/bootc-derived
+    assert equal (normalize_image_tag $booted.image.image) localhost/bootc-derived
     let t = open /usr/share/blah.txt | str trim
     assert equal $t "test content2"
 
