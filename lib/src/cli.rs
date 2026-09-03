@@ -58,10 +58,10 @@ impl TryFrom<ProgressOptions> for ProgressWriter {
 #[derive(Debug, Parser, PartialEq, Eq)]
 pub(crate) struct DownloadOnlyOpts {
     /// Download and stage the update without applying it.
-    #[clap(long, conflicts_with_all = ["check", "apply"])]
+    #[clap(long, conflicts_with = "apply")]
     pub(crate) download_only: bool,
     /// Apply a staged deployment previously downloaded with --download-only.
-    #[clap(long, conflicts_with_all = ["check", "download_only"])]
+    #[clap(long, conflicts_with = "download_only")]
     pub(crate) from_downloaded: bool,
 }
 
@@ -76,7 +76,7 @@ pub(crate) struct UpgradeOpts {
     ///
     /// This only downloads an updated manifest and image configuration (i.e. typically kilobyte-sized metadata)
     /// as opposed to the image layers.
-    #[clap(long, conflicts_with = "apply")]
+    #[clap(long, conflicts_with_all = ["apply", "download_only", "from_downloaded"])]
     pub(crate) check: bool,
 
     /// Restart or reboot into the new target image.
