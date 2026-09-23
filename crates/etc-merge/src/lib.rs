@@ -812,7 +812,10 @@ fn merge_leaf(
     };
 
     if matches!(new_inode, Some(Inode::Directory(..))) {
-        anyhow::bail!("Modified config file {file:?} newly defaults to directory. Cannot merge")
+        anyhow::bail!(
+            "Cannot merge host path {file:?}: the new image contains a directory at this path; \
+             resolve the conflict manually before retrying"
+        );
     };
 
     // If a new file with the same path exists, we delete it
@@ -826,7 +829,13 @@ fn merge_leaf(
     } else {
         current_etc_fd
             .copy(&file, new_etc_fd, &file)
-            .with_context(|| format!("Copying file {file:?}"))?;
+            .with_context(|| {
+                format!(
+                    "Merge conflict for host /etc path {file:?}: unable to copy it into the new /etc; \
+                     inspect and resolve conflicting path components (especially absolute symlinks \
+                     that escape /etc) so the host file can be copied, then retry"
+                )
+            })?;
     };
 
     rustix::fs::chownat(
@@ -1363,11 +1372,78 @@ mod tests {
 
         let merge_res = merge(&c, &current_etc_files, &n, &new_etc_files.unwrap(), &diff);
 
-        assert!(merge_res.is_err());
-        assert_eq!(
-            merge_res.unwrap_err().root_cause().to_string(),
-            "Modified config file \"file-to-dir\" newly defaults to directory. Cannot merge"
+        // The directory should still exist in new_etc (image's directory wins)
+        let error = merge_res.expect_err("file-to-directory conflict must fail migration");
+        let error = format!("{error:#}");
+        assert!(error.contains("Cannot merge host path"));
+        assert!(error.contains("resolve the conflict manually before retrying"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn regular_file_copy_conflict_returns_actionable_error() -> anyhow::Result<()> {
+        let tempdir = cap_std_ext::cap_tempfile::tempdir(cap_std::ambient_authority())?;
+
+        tempdir.create_dir("pristine_etc")?;
+        tempdir.create_dir("current_etc")?;
+        tempdir.create_dir("new_etc")?;
+
+        let p = tempdir.open_dir("pristine_etc")?;
+        let c = tempdir.open_dir("current_etc")?;
+        let n = tempdir.open_dir("new_etc")?;
+
+        p.write("conflict", "pristine contents")?;
+        c.write("conflict", "host contents")?;
+        n.write("conflict", "image contents")?;
+
+        let (pristine_tree, current_tree, new_tree) = traverse_etc(&p, &c, Some(&n))?;
+        let new_tree = new_tree.unwrap();
+        let diff = compute_diff(&pristine_tree, &current_tree, &new_tree)?;
+
+        // Make the source path escape the /etc sandbox after traversal so the
+        // snapshot still identifies it as a modified regular host file.
+        c.remove_file("conflict")?;
+        symlinkat("/outside-etc", &c, "conflict")?;
+
+        let error = merge(&c, &current_tree, &n, &new_tree, &diff)
+            .expect_err("copy through an absolute symlink outside current_etc must fail");
+        let error = format!("{error:#}");
+        assert!(error.contains("Merge conflict"), "{error}");
+        assert!(error.contains("host /etc path \"conflict\""), "{error}");
+        assert!(error.contains("absolute symlinks"), "{error}");
+        assert!(
+            error.contains("resolve conflicting path components"),
+            "{error}"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn regular_host_file_replaces_new_image_symlink() -> anyhow::Result<()> {
+        let tempdir = cap_std_ext::cap_tempfile::tempdir(cap_std::ambient_authority())?;
+
+        tempdir.create_dir("pristine_etc")?;
+        tempdir.create_dir("current_etc")?;
+        tempdir.create_dir("new_etc")?;
+
+        let p = tempdir.open_dir("pristine_etc")?;
+        let c = tempdir.open_dir("current_etc")?;
+        let n = tempdir.open_dir("new_etc")?;
+
+        p.write("conflict", "pristine contents")?;
+        c.write("conflict", "host contents")?;
+        symlinkat("/outside-etc", &n, "conflict")?;
+
+        let (pristine_tree, current_tree, new_tree) = traverse_etc(&p, &c, Some(&n))?;
+        let new_tree = new_tree.unwrap();
+        let diff = compute_diff(&pristine_tree, &current_tree, &new_tree)?;
+
+        merge(&c, &current_tree, &n, &new_tree, &diff)?;
+
+        assert_eq!(n.read("conflict")?, b"host contents");
+        assert!(n.metadata("conflict")?.is_file());
 
         Ok(())
     }
