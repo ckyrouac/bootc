@@ -61,11 +61,20 @@ mod package_boot;
 pub(crate) use package_boot::PackageBootEntry;
 
 use std::path::{Component, Path};
-use std::process::Stdio;
+use std::{
+    ffi::OsStr,
+    io::Write,
+    os::fd::AsFd,
+    path::PathBuf,
+    process::{Command, Stdio},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result};
 use cap_std_ext::cap_std::ambient_authority;
 use cap_std_ext::cap_std::fs::Dir as CapStdDir;
+use cap_std_ext::cap_std::io_lifetimes::AsFilelike;
+use cap_std_ext::cmdext::{CapStdExtCommandExt, CmdFds};
 use composefs_ctl::composefs::generic_tree::{FileSystem, Stat};
 use etc_merge::{compute_diff_without_deletions, merge, traverse_etc};
 use fn_error_context::context;
@@ -96,7 +105,9 @@ pub(crate) fn merge_etc_into_deployment(root_path: &Path, deploy_dir: &Path) -> 
 /// `src_var` is the running system's `/var` (at `<root_path>/var`).
 /// `new_var` is the new deployment's empty `var/` directory.
 pub(crate) fn preserve_var(src_var: &Path, new_var: &Path, exclusions: &[String]) -> Result<()> {
-    std::fs::create_dir_all(new_var).with_context(|| format!("Creating {}", new_var.display()))?;
+    let src_var = CapStdDir::open_ambient_dir(src_var, ambient_authority())
+        .with_context(|| format!("Opening source {}", src_var.display()))?;
+    let new_var = open_or_create_var_dir(new_var)?;
 
     let mut effective_exclusions = ["tmp", "cache", "log/journal", "lib/containers"]
         .into_iter()
@@ -104,13 +115,39 @@ pub(crate) fn preserve_var(src_var: &Path, new_var: &Path, exclusions: &[String]
         .collect::<Vec<_>>();
     effective_exclusions.extend(exclusions.iter().cloned());
 
-    if reflinks_supported(src_var, new_var) {
+    if reflinks_supported(&src_var, &new_var)? {
         println!("  Filesystem supports reflinks — using copy-on-write clone (Strategy C)");
-        preserve_var_reflink(src_var, new_var, &effective_exclusions)
+        preserve_var_reflink(&src_var, &new_var, &effective_exclusions)
     } else {
         println!("  Filesystem does not support reflinks — falling back to full copy (Strategy D)");
-        preserve_var_copy(src_var, new_var, &effective_exclusions)
+        preserve_var_copy(&src_var, &new_var, &effective_exclusions)
     }
+}
+
+/// Open the destination through its parent capability, creating just the
+/// final `/var` directory if needed. The caller-supplied parent is the initial
+/// ambient authority; all subsequent traversal is relative to opened handles.
+fn open_or_create_var_dir(path: &Path) -> Result<CapStdDir> {
+    let parent = path.parent().context("Destination /var has no parent")?;
+    let name = path
+        .file_name()
+        .context("Destination /var has no final path component")?;
+    let parent = CapStdDir::open_ambient_dir(parent, ambient_authority())
+        .with_context(|| format!("Opening destination parent {}", parent.display()))?;
+    match parent.create_dir(name) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            anyhow::ensure!(
+                parent.symlink_metadata(name)?.is_dir(),
+                "Destination {} exists and is not a directory",
+                path.display()
+            );
+        }
+        Err(e) => return Err(e).with_context(|| format!("Creating {}", path.display())),
+    }
+    parent
+        .open_dir(name)
+        .with_context(|| format!("Opening destination {}", path.display()))
 }
 
 pub(crate) fn deployment_var_path(deploy_dir: &Path) -> Result<std::path::PathBuf> {
@@ -125,77 +162,147 @@ pub(crate) fn deployment_var_path(deploy_dir: &Path) -> Result<std::path::PathBu
 
 /// Returns true if the filesystem hosting `new_var` supports reflinks.
 ///
-/// Probes by attempting a zero-byte reflink from `src_var` into `new_var`.
-fn reflinks_supported(src_var: &Path, new_var: &Path) -> bool {
-    let probe_src = src_var.join(".bootc-reflink-probe-src");
-    let probe_dst = new_var.join(".bootc-reflink-probe");
+/// Probes with a small temporary file from `src_var` into `new_var`.
+fn reflinks_supported(src_var: &CapStdDir, new_var: &CapStdDir) -> Result<bool> {
+    use cap_std_ext::cap_std::fs::OpenOptions;
 
-    let _ = std::fs::write(&probe_src, b"probe");
-    let result = std::process::Command::new("cp")
-        .args(["--reflink=always", "-a"])
-        .arg(&probe_src)
-        .arg(&probe_dst)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+    // Unique names avoid overwriting a user file in either tree.
+    let probe_name = format!(".bootc-reflink-probe-{}", uuid::Uuid::new_v4());
+    let probe_dst = format!("{probe_name}-copy");
+    let mut probe =
+        match src_var.open_with(&probe_name, OpenOptions::new().write(true).create_new(true)) {
+            Ok(probe) => probe,
+            Err(e) => {
+                tracing::debug!("Cannot create /var reflink probe, using full copy: {e}");
+                return Ok(false);
+            }
+        };
+    if let Err(e) = probe.write_all(b"probe") {
+        drop(probe);
+        src_var.remove_file(&probe_name)?;
+        tracing::debug!("Cannot write /var reflink probe, using full copy: {e}");
+        return Ok(false);
+    }
+    drop(probe);
+
+    let status = run_cp(
+        src_var,
+        &[OsStr::new(&probe_name)],
+        new_var,
+        Some(OsStr::new(&probe_dst)),
+        &["--reflink=always", "-a"],
+        Stdio::null(),
+        Stdio::null(),
+    );
+    let cleanup_src = src_var.remove_file(&probe_name);
+    let cleanup_dst = new_var.remove_file(&probe_dst);
+    cleanup_src.with_context(|| format!("Removing /var reflink probe {probe_name}"))?;
+    // A failed reflink does not leave a destination, so ENOENT is expected.
+    match cleanup_dst {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("Removing /var reflink probe copy"),
+    }
+
+    Ok(status?.success())
+}
+
+/// Run GNU cp with directory handles inherited as fixed descriptors. Each
+/// operand is `/proc/self/fd/N[/entry]`; cp's top-level paths therefore remain
+/// rooted in the opened capabilities even if the original paths are renamed.
+/// GNU cp still performs its own recursive traversal beneath each operand, so
+/// this is not race-safe against a concurrent writer replacing entries while
+/// the copy is in progress.
+fn run_cp(
+    src_root: &CapStdDir,
+    src_names: &[&OsStr],
+    dst_root: &CapStdDir,
+    dst_name: Option<&OsStr>,
+    options: &[&str],
+    stdout: Stdio,
+    stderr: Stdio,
+) -> Result<std::process::ExitStatus> {
+    let src_fd = Arc::new(
+        src_root
+            .as_filelike_view::<std::fs::File>()
+            .as_fd()
+            .try_clone_to_owned()?,
+    );
+    let dst_fd = Arc::new(
+        dst_root
+            .as_filelike_view::<std::fs::File>()
+            .as_fd()
+            .try_clone_to_owned()?,
+    );
+    let mut fds = CmdFds::new();
+    fds.take_fd_n(src_fd, 3);
+    fds.take_fd_n(dst_fd, 4);
+
+    let src_paths = src_names.iter().map(|name| {
+        let mut path = PathBuf::from("/proc/self/fd/3");
+        path.push(name);
+        path
+    });
+    let mut dst_path = PathBuf::from("/proc/self/fd/4");
+    if let Some(name) = dst_name {
+        dst_path.push(name);
+    }
+
+    let status = Command::new("cp")
+        .args(options)
+        .arg("--")
+        .args(src_paths)
+        .arg(dst_path)
+        .stdout(stdout)
+        .stderr(stderr)
+        .take_fds(fds)
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    let _ = std::fs::remove_file(&probe_src);
-    let _ = std::fs::remove_file(&probe_dst);
-    result
+        .context("Running cp")?;
+    Ok(status)
 }
 
 /// Strategy C: reflink-copy each top-level entry under `src_var` into `new_var`.
 ///
 /// Skips well-known ephemeral subdirectories.
 #[context("Reflink-copying /var into new deployment (Strategy C)")]
-fn preserve_var_reflink(src_var: &Path, new_var: &Path, exclusions: &[String]) -> Result<()> {
-    let entries =
-        std::fs::read_dir(src_var).with_context(|| format!("Reading {}", src_var.display()))?;
+fn preserve_var_reflink(
+    src_var: &CapStdDir,
+    new_var: &CapStdDir,
+    exclusions: &[String],
+) -> Result<()> {
+    let entries = src_var.read_dir(".").context("Reading source /var")?;
 
     for entry in entries {
-        let entry = entry.with_context(|| format!("Reading entry in {}", src_var.display()))?;
+        let entry = entry.context("Reading entry in source /var")?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        if exclusions.iter().any(|s| s == name_str.as_ref()) {
-            println!(
-                "    Skipping {} (ephemeral)",
-                src_var.join(name_str.as_ref()).display()
-            );
+        if exclusions.iter().any(|s| name.to_str() == Some(s.as_str())) {
+            println!("    Skipping {} (ephemeral)", name_str);
             continue;
         }
 
-        let src_entry = src_var.join(name_str.as_ref());
-        let dst_entry = new_var.join(name_str.as_ref());
-
-        if let Some(skip) = exclusions.iter().find_map(|path| {
-            path.strip_prefix(&format!("{name_str}/"))
-                .filter(|rest| !rest.contains('/'))
-        }) {
-            copy_dir_skip_subdir(&src_entry, &dst_entry, skip, true)?;
+        let skips = nested_exclusions(&name, exclusions);
+        if !skips.is_empty() && src_var.symlink_metadata(&name)?.is_dir() {
+            copy_dir_skip_subdir(src_var, new_var, &name, &skips, true)?;
             continue;
         }
 
-        println!(
-            "    Reflink-copying {} → {}",
-            src_entry.display(),
-            dst_entry.display()
-        );
-        let status = std::process::Command::new("cp")
-            .args(["--reflink=always", "-a", "--no-clobber"])
-            .arg(&src_entry)
-            .arg(new_var)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .with_context(|| format!("cp --reflink=always {}", src_entry.display()))?;
+        println!("    Reflink-copying {} → {}", name_str, name_str);
+        let status = run_cp(
+            src_var,
+            &[&name],
+            new_var,
+            None,
+            &["--reflink=always", "-a", "--no-clobber"],
+            Stdio::inherit(),
+            Stdio::inherit(),
+        )?;
 
         anyhow::ensure!(
             status.success(),
             "cp --reflink=always failed for {}",
-            src_entry.display()
+            name_str
         );
     }
 
@@ -203,42 +310,70 @@ fn preserve_var_reflink(src_var: &Path, new_var: &Path, exclusions: &[String]) -
     Ok(())
 }
 
-/// Copy a directory recursively, skipping one named subdirectory.
+/// Copy a directory recursively, skipping selected child directories.
 ///
 /// Used by both Strategy C and Strategy D to copy `var/log/` while excluding
 /// `var/log/journal/`.  `reflink` selects whether `cp --reflink=always` or
-/// plain `cp -a` is used.
-fn copy_dir_skip_subdir(src: &Path, dst: &Path, skip_name: &str, reflink: bool) -> Result<()> {
-    std::fs::create_dir_all(dst).with_context(|| format!("Creating {}", dst.display()))?;
+/// plain `cp -a` is used. Included sibling entries are passed in one cp process
+/// so hardlinks between them remain linked. As in the previous implementation,
+/// this filtered path does not copy metadata from the containing directory
+/// itself; ordinary (unfiltered) entries are copied wholly by cp -a.
+fn copy_dir_skip_subdir(
+    src_root: &CapStdDir,
+    dst_root: &CapStdDir,
+    dir_name: &OsStr,
+    skip_names: &[&str],
+    reflink: bool,
+) -> Result<()> {
+    let src = open_child_dir_nofollow(src_root, dir_name)
+        .with_context(|| format!("Opening /var/{}", dir_name.to_string_lossy()))?;
+    let dst = open_or_create_child_dir(dst_root, dir_name)?;
+    let entries = src
+        .read_dir(".")
+        .context("Reading excluded-copy source directory")?;
 
-    let entries = std::fs::read_dir(src).with_context(|| format!("Reading {}", src.display()))?;
-
+    let mut included_entries = Vec::new();
     for entry in entries {
-        let entry = entry.with_context(|| format!("Reading entry in {}", src.display()))?;
+        let entry = entry.context("Reading entry in source child directory")?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        if name_str == skip_name {
-            println!("    Skipping {}/{} (ephemeral)", src.display(), name_str);
+        if skip_names.iter().any(|skip| name == OsStr::new(skip)) {
+            println!(
+                "    Skipping {}/{} (ephemeral)",
+                dir_name.to_string_lossy(),
+                name_str
+            );
             continue;
         }
+        included_entries.push(name);
+    }
 
-        let src_entry = src.join(name_str.as_ref());
-        let mut cmd = std::process::Command::new("cp");
-        if reflink {
-            cmd.args(["--reflink=always", "-a", "--no-clobber"]);
+    if !included_entries.is_empty() {
+        let names = included_entries
+            .iter()
+            .map(|name| name.as_os_str())
+            .collect::<Vec<_>>();
+        let options = if reflink {
+            &["--reflink=always", "-a", "--no-clobber"][..]
         } else {
-            cmd.args(["-a", "--no-clobber"]);
-        }
-        let status = cmd
-            .arg(&src_entry)
-            .arg(dst)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .with_context(|| format!("cp -a {}", src_entry.display()))?;
+            &["-a", "--no-clobber"][..]
+        };
+        let status = run_cp(
+            &src,
+            &names,
+            &dst,
+            None,
+            options,
+            Stdio::inherit(),
+            Stdio::inherit(),
+        )?;
 
-        anyhow::ensure!(status.success(), "cp failed for {}", src_entry.display());
+        anyhow::ensure!(
+            status.success(),
+            "cp failed while copying {}",
+            dir_name.to_string_lossy()
+        );
     }
 
     Ok(())
@@ -269,53 +404,91 @@ fn copy_dir_skip_subdir(src: &Path, dst: &Path, skip_name: &str, reflink: bool) 
 ///
 /// See: <https://github.com/bootc-dev/bootc/issues/2220>
 #[context("Copying /var into new deployment (Strategy D)")]
-fn preserve_var_copy(src_var: &Path, new_var: &Path, exclusions: &[String]) -> Result<()> {
-    let entries =
-        std::fs::read_dir(src_var).with_context(|| format!("Reading {}", src_var.display()))?;
+fn preserve_var_copy(
+    src_var: &CapStdDir,
+    new_var: &CapStdDir,
+    exclusions: &[String],
+) -> Result<()> {
+    let entries = src_var.read_dir(".").context("Reading source /var")?;
 
     for entry in entries {
-        let entry = entry.with_context(|| format!("Reading entry in {}", src_var.display()))?;
+        let entry = entry.context("Reading entry in source /var")?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        if exclusions.iter().any(|s| s == name_str.as_ref()) {
-            println!(
-                "    Skipping {} (ephemeral)",
-                src_var.join(name_str.as_ref()).display()
-            );
+        if exclusions.iter().any(|s| name.to_str() == Some(s.as_str())) {
+            println!("    Skipping {} (ephemeral)", name_str);
             continue;
         }
 
-        let src_entry = src_var.join(name_str.as_ref());
-        let dst_entry = new_var.join(name_str.as_ref());
-
-        if let Some(skip) = exclusions.iter().find_map(|path| {
-            path.strip_prefix(&format!("{name_str}/"))
-                .filter(|rest| !rest.contains('/'))
-        }) {
-            copy_dir_skip_subdir(&src_entry, &dst_entry, skip, false)?;
+        let skips = nested_exclusions(&name, exclusions);
+        if !skips.is_empty() && src_var.symlink_metadata(&name)?.is_dir() {
+            copy_dir_skip_subdir(src_var, new_var, &name, &skips, false)?;
             continue;
         }
 
-        println!(
-            "    Copying {} → {}",
-            src_entry.display(),
-            dst_entry.display()
-        );
-        let status = std::process::Command::new("cp")
-            .args(["-a", "--no-clobber"])
-            .arg(&src_entry)
-            .arg(new_var)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .with_context(|| format!("cp -a {}", src_entry.display()))?;
+        println!("    Copying {} → {}", name_str, name_str);
+        let status = run_cp(
+            src_var,
+            &[&name],
+            new_var,
+            None,
+            &["-a", "--no-clobber"],
+            Stdio::inherit(),
+            Stdio::inherit(),
+        )?;
 
-        anyhow::ensure!(status.success(), "cp -a failed for {}", src_entry.display());
+        anyhow::ensure!(status.success(), "cp -a failed for {}", name_str);
     }
 
     println!("  /var copy complete.");
     Ok(())
+}
+
+fn nested_exclusions<'a>(name: &OsStr, exclusions: &'a [String]) -> Vec<&'a str> {
+    let Some(name) = name.to_str() else {
+        return Vec::new();
+    };
+    let prefix = format!("{name}/");
+    exclusions
+        .iter()
+        .filter_map(|path| {
+            path.strip_prefix(&prefix)
+                .filter(|rest| !rest.contains('/'))
+        })
+        .collect()
+}
+
+/// Open a single source child directory without following a symlink swapped
+/// into place after the caller's metadata check. The entry name comes directly
+/// from `read_dir`, so this is one path component beneath the capability root.
+fn open_child_dir_nofollow(parent: &CapStdDir, name: &OsStr) -> std::io::Result<CapStdDir> {
+    use rustix::fs::{Mode, OFlags};
+
+    let fd = rustix::fs::openat(
+        parent.as_filelike_view::<std::fs::File>().as_fd(),
+        name,
+        OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::RDONLY,
+        Mode::empty(),
+    )?;
+    Ok(CapStdDir::from_std_file(std::fs::File::from(fd)))
+}
+
+fn open_or_create_child_dir(parent: &CapStdDir, name: &OsStr) -> Result<CapStdDir> {
+    match parent.create_dir(name) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            anyhow::ensure!(
+                parent.symlink_metadata(name)?.is_dir(),
+                "Destination child {} exists and is not a directory",
+                name.to_string_lossy()
+            );
+        }
+        Err(e) => return Err(e).context("Creating destination child directory"),
+    }
+    parent
+        .open_dir(name)
+        .context("Opening destination child directory")
 }
 
 /// Validate exclusions before touching either tree. Paths are relative to `/var`.
@@ -378,6 +551,16 @@ fn merge_etc(host_etc: &Path, deploy_usr_etc: &Path, deploy_etc: &Path) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cap_std_ext::dirext::CapStdExtDirExt;
+    use std::{
+        fs,
+        os::unix::fs::{MetadataExt, PermissionsExt, symlink},
+        time::{Duration, SystemTime},
+    };
+
+    fn cap_dir(path: &Path) -> CapStdDir {
+        CapStdDir::open_ambient_dir(path, ambient_authority()).unwrap()
+    }
 
     #[test]
     fn exclusions_are_relative_and_normalized() {
@@ -397,5 +580,161 @@ mod tests {
             deployment_var_path(deploy).unwrap(),
             Path::new("/sysroot/ostree/deploy/default/var")
         );
+    }
+
+    #[test]
+    fn plain_copy_skips_multiple_children_under_parent() -> Result<()> {
+        let exclusions = ["tmp".into(), "log/journal".into(), "log/private".into()];
+        assert_eq!(
+            nested_exclusions(OsStr::new("log"), &exclusions),
+            ["journal", "private"]
+        );
+
+        let temp = tempfile::tempdir()?;
+        let src_path = temp.path().join("src");
+        let dst_path = temp.path().join("dst");
+        fs::create_dir_all(src_path.join("tmp"))?;
+        fs::create_dir_all(src_path.join("log/journal"))?;
+        fs::create_dir_all(src_path.join("log/private"))?;
+        fs::create_dir_all(src_path.join("log/keep"))?;
+        fs::write(src_path.join("tmp/ignored"), b"tmp")?;
+        fs::write(src_path.join("log/journal/ignored"), b"journal")?;
+        fs::write(src_path.join("log/private/ignored"), b"private")?;
+        fs::write(src_path.join("log/keep/preserved"), b"keep")?;
+        fs::hard_link(
+            src_path.join("log/keep/preserved"),
+            src_path.join("log/keep/preserved-hardlink"),
+        )?;
+        fs::create_dir(&dst_path)?;
+
+        preserve_var_copy(&cap_dir(&src_path), &cap_dir(&dst_path), &exclusions)?;
+
+        assert!(!dst_path.join("tmp").exists());
+        assert!(!dst_path.join("log/journal").exists());
+        assert!(!dst_path.join("log/private").exists());
+        assert_eq!(fs::read(dst_path.join("log/keep/preserved"))?, b"keep");
+        assert_eq!(
+            fs::metadata(dst_path.join("log/keep/preserved"))?.ino(),
+            fs::metadata(dst_path.join("log/keep/preserved-hardlink"))?.ino()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reflink_strategy_skips_multiple_children_under_parent() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let src_path = temp.path().join("src");
+        let dst_path = temp.path().join("dst");
+        fs::create_dir_all(src_path.join("log/journal"))?;
+        fs::create_dir_all(src_path.join("log/private"))?;
+        fs::create_dir_all(src_path.join("log/keep"))?;
+        fs::write(src_path.join("log/journal/ignored"), b"journal")?;
+        fs::write(src_path.join("log/private/ignored"), b"private")?;
+        fs::write(src_path.join("log/keep/preserved"), b"keep")?;
+        fs::create_dir(&dst_path)?;
+        let src = cap_dir(&src_path);
+        let dst = cap_dir(&dst_path);
+        let supports_reflink = reflinks_supported(&src, &dst)?;
+        if !supports_reflink {
+            fs::remove_file(src_path.join("log/keep/preserved"))?;
+            fs::remove_dir(src_path.join("log/keep"))?;
+        }
+
+        // Exercise Strategy C's exclusion routing on every filesystem and, if
+        // available, its reflink copy of a retained sibling.
+        preserve_var_reflink(&src, &dst, &["log/journal".into(), "log/private".into()])?;
+
+        assert!(!dst_path.join("log/journal").exists());
+        assert!(!dst_path.join("log/private").exists());
+        assert_eq!(
+            dst_path.join("log/keep/preserved").exists(),
+            supports_reflink
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copy_preserves_symlink_without_traversing_target() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let src_path = temp.path().join("src");
+        let dst_path = temp.path().join("dst");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&src_path)?;
+        fs::create_dir(&dst_path)?;
+        fs::create_dir(&outside)?;
+        fs::write(outside.join("sentinel"), b"outside")?;
+        symlink(&outside, src_path.join("escape"))?;
+
+        preserve_var_copy(
+            &cap_dir(&src_path),
+            &cap_dir(&dst_path),
+            &["escape/sentinel".into()],
+        )?;
+
+        let copied = fs::symlink_metadata(dst_path.join("escape"))?;
+        assert!(copied.file_type().is_symlink());
+        assert_eq!(fs::read_link(dst_path.join("escape"))?, outside);
+        // The target remains outside the destination tree; it was not copied.
+        assert!(!dst_path.join("sentinel").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn copy_preserves_archive_metadata_and_hardlinks() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let src_path = temp.path().join("src");
+        let dst_path = temp.path().join("dst");
+        let src_state = src_path.join("state");
+        fs::create_dir_all(&src_state)?;
+        fs::create_dir(&dst_path)?;
+        fs::write(src_state.join("one"), b"contents")?;
+        fs::hard_link(src_state.join("one"), src_state.join("two"))?;
+        fs::set_permissions(&src_state, fs::Permissions::from_mode(0o751))?;
+        fs::set_permissions(src_state.join("one"), fs::Permissions::from_mode(0o640))?;
+        let src_cap = cap_dir(&src_path);
+        let dst_cap = cap_dir(&dst_path);
+        let xattr_supported = src_cap
+            .setxattr("state/one", "user.bootc_migrate_test", b"xattr")
+            .is_ok();
+        let expected_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        fs::File::open(&src_state)?.set_times(fs::FileTimes::new().set_modified(expected_mtime))?;
+
+        preserve_var_copy(&src_cap, &dst_cap, &[])?;
+
+        let copied_dir = fs::metadata(dst_path.join("state"))?;
+        let copied_one = fs::metadata(dst_path.join("state/one"))?;
+        let copied_two = fs::metadata(dst_path.join("state/two"))?;
+        assert_eq!(copied_dir.permissions().mode() & 0o7777, 0o751);
+        assert_eq!(copied_one.permissions().mode() & 0o7777, 0o640);
+        assert_eq!(copied_dir.modified()?, expected_mtime);
+        assert_eq!(copied_one.ino(), copied_two.ino());
+        assert_eq!(copied_one.nlink(), 2);
+        assert_eq!(copied_one.uid(), fs::metadata(src_state.join("one"))?.uid());
+        assert_eq!(copied_one.gid(), fs::metadata(src_state.join("one"))?.gid());
+        if xattr_supported {
+            assert_eq!(
+                dst_cap.getxattr("state/one", "user.bootc_migrate_test")?,
+                Some(b"xattr".to_vec())
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn copy_keeps_existing_collisions_untouched() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let src_path = temp.path().join("src");
+        let dst_path = temp.path().join("dst");
+        fs::create_dir_all(src_path.join("state"))?;
+        fs::create_dir_all(dst_path.join("state"))?;
+        fs::write(src_path.join("state/existing"), b"source")?;
+        fs::write(src_path.join("state/new"), b"new")?;
+        fs::write(dst_path.join("state/existing"), b"destination")?;
+
+        preserve_var_copy(&cap_dir(&src_path), &cap_dir(&dst_path), &[])?;
+
+        assert_eq!(fs::read(dst_path.join("state/existing"))?, b"destination");
+        assert_eq!(fs::read(dst_path.join("state/new"))?, b"new");
+        Ok(())
     }
 }
