@@ -520,6 +520,10 @@ pub(crate) struct InstallToFilesystemOpts {
 
     #[clap(flatten)]
     pub(crate) composefs_opts: InstallComposefsOpts,
+
+    /// Internal opt-in used only by `to-existing-root`.
+    #[clap(skip)]
+    pub(crate) preserve_package_boot: bool,
 }
 
 #[derive(Debug, Clone, clap::Parser, PartialEq, Eq)]
@@ -573,6 +577,15 @@ pub(crate) struct InstallToExistingRootOpts {
     /// The running system's `root_path` must be mounted (e.g. `-v /:/target`).
     #[clap(long)]
     pub(crate) preserve_var: bool,
+
+    /// Preserve a bootable rollback to the currently running package-mode OS.
+    ///
+    /// On supported bootupd-managed GRUB/BLS systems, retain the existing
+    /// package kernel, initrd, and BLS entry while installing the new bootloader.
+    /// This option is independent of `/var` preservation and `/etc` merging,
+    /// and cannot be combined with `--cleanup`.
+    #[clap(long)]
+    pub(crate) preserve_package_boot: bool,
 
     /// Relative paths below `/var` to leave out while preserving `/var`.
     #[clap(long = "preserve-var-skip", value_name = "PATH")]
@@ -2587,6 +2600,25 @@ pub enum Cleanup {
     TriggerOnNextBoot,
 }
 
+fn validate_package_boot_cleanup(preserve_package_boot: bool, cleanup: bool) -> Result<()> {
+    anyhow::ensure!(
+        !(preserve_package_boot && cleanup),
+        "--preserve-package-boot cannot be combined with --cleanup because cleanup removes package-mode rollback dependencies"
+    );
+    Ok(())
+}
+
+fn validate_package_boot_source(
+    preserve_package_boot: bool,
+    source_imgref_explicit: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        !(preserve_package_boot && source_imgref_explicit),
+        "--preserve-package-boot does not support --source-imgref because equality with the running installer image cannot be established"
+    );
+    Ok(())
+}
+
 /// Implementation of the `bootc install to-filesystem` CLI command.
 #[context("Installing to filesystem")]
 pub(crate) async fn install_to_filesystem(
@@ -2594,6 +2626,11 @@ pub(crate) async fn install_to_filesystem(
     targeting_host_root: bool,
     cleanup: Cleanup,
 ) -> Result<Option<camino::Utf8PathBuf>> {
+    validate_package_boot_source(
+        opts.preserve_package_boot,
+        opts.source_opts.source_imgref.is_some(),
+    )?;
+
     // Log the installation operation to systemd journal
     const INSTALL_FILESYSTEM_JOURNAL_ID: &str = "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3";
     let source_image = opts
@@ -2690,6 +2727,8 @@ pub(crate) async fn install_to_filesystem(
     // Gather data about the root filesystem
     let inspect = bootc_mount::inspect_filesystem(&fsopts.root_path)?;
 
+    let preserve_package_boot = opts.preserve_package_boot;
+
     // Gather global state, destructuring the provided options.
     // IMPORTANT: We might re-execute the current process in this function (for SELinux among other things)
     // IMPORTANT: and hence anything that is done before MUST BE IDEMPOTENT.
@@ -2704,6 +2743,53 @@ pub(crate) async fn install_to_filesystem(
     )
     .await?;
 
+    // Validate the existing package entry before any boot cleanup. The opt-in
+    // path retains /boot in place; the ordinary path below is unchanged.
+    let package_boot_entry = if preserve_package_boot {
+        anyhow::ensure!(
+            targeting_host_root,
+            "--preserve-package-boot requires to-existing-root"
+        );
+        anyhow::ensure!(
+            !is_already_ostree,
+            "--preserve-package-boot requires a package-mode source system"
+        );
+        anyhow::ensure!(
+            !state.composefs_options.composefs_backend,
+            "--preserve-package-boot requires the ostree backend"
+        );
+        anyhow::ensure!(
+            state.host_is_container && state.target_opts.target_imgref.is_none(),
+            "--preserve-package-boot requires installing the same image that provides the running bootc installer"
+        );
+        anyhow::ensure!(
+            matches!(fsopts.replace, Some(ReplaceMode::Alongside)),
+            "--preserve-package-boot requires --replace=alongside"
+        );
+        let supports_bootupd = crate::bootloader::supports_bootupd(&state.container_root)?;
+        let bootloader = state.config_opts.bootloader.unwrap_or(if supports_bootupd {
+            Bootloader::Grub
+        } else {
+            Bootloader::Systemd
+        });
+        anyhow::ensure!(
+            supports_bootupd && bootloader == Bootloader::Grub,
+            "--preserve-package-boot currently supports only bootupd-managed GRUB BLS layouts"
+        );
+        let kernel_version = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .context("Reading running package-mode kernel version")?;
+        let kernel_version = kernel_version.trim();
+        let cmdline = std::fs::read_to_string("/proc/cmdline")
+            .context("Reading running package-mode kernel command line")?;
+        Some(migrate::PackageBootEntry::preflight(
+            target_root_path.as_std_path(),
+            kernel_version,
+            &cmdline,
+        )?)
+    } else {
+        None
+    };
+
     // Check to see if this happens to be the real host root
     if !fsopts.acknowledge_destructive {
         warn_on_host_root(&target_rootfs_fd)?;
@@ -2717,7 +2803,11 @@ pub(crate) async fn install_to_filesystem(
                 .await??;
         }
         Some(ReplaceMode::Alongside) => {
-            clean_boot_directories(&target_rootfs_fd, &target_root_path, is_already_ostree)?
+            if package_boot_entry.is_some() {
+                println!("Preserving existing package-mode GRUB/BLS boot entry");
+            } else {
+                clean_boot_directories(&target_rootfs_fd, &target_root_path, is_already_ostree)?;
+            }
         }
         None => require_empty_rootdir(&rootfs_fd)?,
     }
@@ -2865,6 +2955,9 @@ pub(crate) async fn install_to_filesystem(
     };
 
     let deployment_path = install_to_filesystem_impl(&state, &mut rootfs, cleanup).await?;
+    if let Some(entry) = &package_boot_entry {
+        entry.verify_retained()?;
+    }
 
     // Drop all data about the root except the path to ensure any file descriptors etc. are closed.
     drop(rootfs);
@@ -2875,6 +2968,8 @@ pub(crate) async fn install_to_filesystem(
 }
 
 pub(crate) async fn install_to_existing_root(opts: InstallToExistingRootOpts) -> Result<()> {
+    validate_package_boot_cleanup(opts.preserve_package_boot, opts.cleanup)?;
+
     // Log the existing root installation operation to systemd journal
     const INSTALL_EXISTING_ROOT_JOURNAL_ID: &str = "7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1";
     let source_image = opts
@@ -2906,6 +3001,7 @@ pub(crate) async fn install_to_existing_root(opts: InstallToExistingRootOpts) ->
 
     // Extract migration flags before opts is consumed.
     let preserve_var = opts.preserve_var;
+    let preserve_package_boot = opts.preserve_package_boot;
     let merge_etc = opts.merge_etc;
     let root_path = std::path::PathBuf::from(opts.root_path.as_str());
     let mut preserve_var_skip = opts.preserve_var_skip;
@@ -2917,6 +3013,9 @@ pub(crate) async fn install_to_existing_root(opts: InstallToExistingRootOpts) ->
     let preserve_var_skip = migrate::validate_exclusions(&preserve_var_skip)?;
     if (preserve_var || merge_etc) && opts.composefs_opts.composefs_backend {
         anyhow::bail!("--preserve-var and --merge-etc require the ostree backend");
+    }
+    if preserve_package_boot && opts.composefs_opts.composefs_backend {
+        anyhow::bail!("--preserve-package-boot requires the ostree backend");
     }
 
     let fs_opts = InstallToFilesystemOpts {
@@ -2932,6 +3031,7 @@ pub(crate) async fn install_to_existing_root(opts: InstallToExistingRootOpts) ->
         target_opts: opts.target_opts,
         config_opts: opts.config_opts,
         composefs_opts: opts.composefs_opts,
+        preserve_package_boot,
     };
 
     let deployment_path = install_to_filesystem(fs_opts, true, cleanup).await?;
@@ -3159,6 +3259,25 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(c.block_opts.device, "/dev/vda");
+    }
+
+    #[test]
+    fn package_boot_rollback_rejects_cleanup() {
+        assert!(validate_package_boot_cleanup(true, true).is_err());
+        assert!(validate_package_boot_cleanup(true, false).is_ok());
+        assert!(validate_package_boot_cleanup(false, true).is_ok());
+    }
+
+    #[test]
+    fn package_boot_rollback_rejects_external_source() {
+        let error = validate_package_boot_source(true, true).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("equality with the running installer image")
+        );
+        assert!(validate_package_boot_source(true, false).is_ok());
+        assert!(validate_package_boot_source(false, true).is_ok());
     }
 
     #[test]

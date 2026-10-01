@@ -5,6 +5,10 @@ target_image=localhost/bootc-to-existing-root-preserve-var-merge-etc:latest
 target_image_archive=/var/tmp/bootc-to-existing-root-preserve-var-merge-etc.oci
 var_marker=/var/lib/bootc-tmt-preserve-var/sentinel
 etc_dir=/etc/bootc-tmt-merge
+package_marker=/root/bootc-tmt-package-mode-marker
+package_kernel=/root/bootc-tmt-package-kernel
+package_entry=/root/bootc-tmt-package-mode-entry
+package_entry_copy=/root/bootc-tmt-package-mode-entry.conf
 
 case ${TMT_REBOOT_COUNT:-0} in
     0)
@@ -19,6 +23,22 @@ case ${TMT_REBOOT_COUNT:-0} in
         # Exercise both an admin-created file and an admin modification of an
         # image default. The derived image below supplies the pristine values.
         mkdir -p "$etc_dir" "${var_marker%/*}"
+        printf '%s\n' package-mode > "$package_marker"
+        uname -r > "$package_kernel"
+        mapfile -t running_entries < <(
+            for entry in /boot/loader/entries/*.conf; do
+                test "$(sed -n 's/^version //p' "$entry")" = "$(uname -r)" || continue
+                grep -q '^linux ' "$entry" || continue
+                grep -q '^initrd ' "$entry" || continue
+                grep -q '^options ' "$entry" || continue
+                grep -q '^options .*ostree=' "$entry" && continue
+                printf '%s\n' "$entry"
+            done
+        )
+        test "${#running_entries[@]}" -eq 1
+        running_entry=${running_entries[0]}
+        basename "$running_entry" > "$package_entry"
+        cp "$running_entry" "$package_entry_copy"
 
         # TMT connects as root. Package-mode hosts keep root's home at /root,
         # while bootc images link /root to /var/roothome, so preserve its key
@@ -41,6 +61,7 @@ case ${TMT_REBOOT_COUNT:-0} in
             "$target_image" \
             bootc install to-existing-root \
                 --preserve-var \
+                --preserve-package-boot \
                 --merge-etc \
                 --acknowledge-destructive
 
@@ -59,6 +80,32 @@ case ${TMT_REBOOT_COUNT:-0} in
         test "$(<"$etc_dir/default.conf")" = admin-modified
         test "$(<"$etc_dir/admin-only.conf")" = admin-only
         test "$(<"$etc_dir/image-only.conf")" = image-only
+
+        # The original package-mode entry and all of its assets must remain
+        # selectable after bootupd installs the new GRUB BLS loader.
+        rollback_entry="/boot/loader/entries/$(<"/sysroot$package_entry")"
+        test -f "$rollback_entry"
+        cmp "$rollback_entry" "/sysroot$package_entry_copy"
+        rollback_title=$(sed -n 's/^title //p' "$rollback_entry")
+        test -n "$rollback_title"
+        test "$(sed -n 's/^version //p' "$rollback_entry")" = "$(<"/sysroot$package_kernel")"
+        while read -r _ assets; do
+            for asset in $assets; do
+                test -f "/boot/${asset#/}"
+            done
+        done < <(grep -E '^(linux|initrd|devicetree) ' "$rollback_entry")
+        ! grep -q '^options .*ostree=' "$rollback_entry"
+        test "$(<"/sysroot$package_marker")" = package-mode
+
+        grub2-reboot "$rollback_title"
+        tmt-reboot -c 'systemctl reboot'
+        ;;
+    2)
+        # Actually boot the previous package-mode OS, not merely retain a BLS
+        # file. This checks both the package kernel/initrd and its old root.
+        test ! -e /run/ostree-booted
+        test "$(<"$package_marker")" = package-mode
+        test "$(uname -r)" = "$(<"$package_kernel")"
         ;;
     *)
         printf 'Unexpected TMT_REBOOT_COUNT=%s\n' "$TMT_REBOOT_COUNT" >&2

@@ -29,6 +29,17 @@ customizations in `/etc`. The opt-in `--preserve-var` and `--merge-etc` options
 provide these migrations on the **ostree backend only**. They run after the
 installation completes and before the first reboot.
 
+`--preserve-package-boot` independently retains the existing selectable BLS
+entry and boot files for the currently running package-mode OS while bootc
+installs its bootloader. It validates the running kernel entry before `/boot`
+is modified, and verifies the entry and files remain afterward. The option
+currently supports bootupd-managed GRUB BLS layouts; unsupported layouts fail
+before `/boot` is cleaned. The entry must match the running kernel image,
+effective kernel arguments, and root device. A standalone `$kernelopts` is
+resolved using `grub2-editenv`; other dynamic variables or unavailable GRUB
+environment data fail closed. The option cannot be combined with `--cleanup`,
+and does not preserve `/var` or merge `/etc`.
+
 `--preserve-var` copies the old `/var` into the new stateroot. Where supported,
 the copy uses filesystem reflinks; otherwise it performs a full copy. A full copy
 can be unsafe while databases or other stateful services are running, so stop
@@ -259,6 +270,10 @@ of migrating the fstab entries. See the "Injecting kernel arguments" section abo
 **--preserve-var-skip**=*PATH*
 
     Relative paths below `/var` to leave out while preserving `/var`
+
+**--preserve-package-boot**
+
+    Preserve the existing package-mode GRUB BLS entry and boot files on supported systems
 
 **--merge-etc**
 

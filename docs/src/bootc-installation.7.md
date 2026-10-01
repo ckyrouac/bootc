@@ -271,6 +271,17 @@ ostree-only `--merge-etc` option instead performs a three-way merge of the
 host's `/etc` customizations into the new deployment before the first reboot. See the
 [to-existing-root man page](man/bootc-install-to-existing-root.8.md) for details.
 
+On supported package-mode systems, `--preserve-package-boot` keeps the existing
+GRUB BLS entry and its kernel/initrd files in place while bootc installs its
+bootloader. It validates that the running package kernel has a usable entry
+before installation and verifies that the entry and files remain afterward.
+This option is independent of `--preserve-var` and `--merge-etc`, and cannot be
+combined with `--cleanup`. Currently only bootupd-managed GRUB BLS layouts are
+supported. The BLS entry must match the running kernel image, effective kernel
+arguments, and root device. A standalone `$kernelopts` is resolved through
+`grub2-editenv`; other dynamic variables or unavailable GRUB environment data
+are rejected before `/boot` is cleaned.
+
 ##### Before reboot: Injecting new configuration
 
 After running `bootc install to-existing-root`, you may want to inject

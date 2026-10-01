@@ -4,10 +4,12 @@
 //! `bootc install to-existing-root` useful for converting a live package-mode
 //! (RPM/DEB) system to a bootc image-mode deployment without losing data.
 //!
-//! These steps are triggered by passing `--preserve-var` and/or `--merge-etc`
-//! to `bootc install to-existing-root`.  They run **after** the core install
-//! (ostree deploy + bootupd) completes but **before** the first reboot, while
-//! the package-mode environment is still the running OS.
+//! `/var` and `/etc` migration are triggered by passing `--preserve-var` and/or
+//! `--merge-etc` to `bootc install to-existing-root`. They run **after** the
+//! core install (ostree deploy + bootupd) completes but **before** the first
+//! reboot. Package boot rollback validation runs before `/boot` cleanup; the
+//! opt-in install path leaves the existing package entry and its files in place
+//! and verifies them again after bootupd.
 //!
 //! ## `/var` preservation (`--preserve-var`)
 //!
@@ -53,6 +55,10 @@
 //! needs to be transferred to make the migrated system functional.
 //!
 //! Rollback preservation is intentionally independent from `/var` migration.
+
+mod package_boot;
+
+pub(crate) use package_boot::PackageBootEntry;
 
 use std::path::{Component, Path};
 use std::process::Stdio;
