@@ -63,7 +63,6 @@ pub(crate) use package_boot::PackageBootEntry;
 use std::path::{Component, Path};
 use std::{
     ffi::OsStr,
-    io::Write,
     os::fd::AsFd,
     path::PathBuf,
     process::{Command, Stdio},
@@ -78,6 +77,8 @@ use cap_std_ext::cmdext::{CapStdExtCommandExt, CmdFds};
 use composefs_ctl::composefs::generic_tree::{FileSystem, Stat};
 use etc_merge::{compute_diff_without_deletions, merge, traverse_etc};
 use fn_error_context::context;
+
+use crate::store::reflink::supports_reflink;
 
 // ── Top-level entry points ────────────────────────────────────────────────────
 
@@ -115,7 +116,7 @@ pub(crate) fn preserve_var(src_var: &Path, new_var: &Path, exclusions: &[String]
         .collect::<Vec<_>>();
     effective_exclusions.extend(exclusions.iter().cloned());
 
-    if reflinks_supported(&src_var, &new_var)? {
+    if supports_reflink(&src_var, &new_var)? {
         println!("  Filesystem supports reflinks — using copy-on-write clone (Strategy C)");
         preserve_var_reflink(&src_var, &new_var, &effective_exclusions)
     } else {
@@ -158,53 +159,6 @@ pub(crate) fn deployment_var_path(deploy_dir: &Path) -> Result<std::path::PathBu
         .parent()
         .context("Deployment path has no stateroot")?;
     Ok(stateroot.join("var"))
-}
-
-/// Returns true if the filesystem hosting `new_var` supports reflinks.
-///
-/// Probes with a small temporary file from `src_var` into `new_var`.
-fn reflinks_supported(src_var: &CapStdDir, new_var: &CapStdDir) -> Result<bool> {
-    use cap_std_ext::cap_std::fs::OpenOptions;
-
-    // Unique names avoid overwriting a user file in either tree.
-    let probe_name = format!(".bootc-reflink-probe-{}", uuid::Uuid::new_v4());
-    let probe_dst = format!("{probe_name}-copy");
-    let mut probe =
-        match src_var.open_with(&probe_name, OpenOptions::new().write(true).create_new(true)) {
-            Ok(probe) => probe,
-            Err(e) => {
-                tracing::debug!("Cannot create /var reflink probe, using full copy: {e}");
-                return Ok(false);
-            }
-        };
-    if let Err(e) = probe.write_all(b"probe") {
-        drop(probe);
-        src_var.remove_file(&probe_name)?;
-        tracing::debug!("Cannot write /var reflink probe, using full copy: {e}");
-        return Ok(false);
-    }
-    drop(probe);
-
-    let status = run_cp(
-        src_var,
-        &[OsStr::new(&probe_name)],
-        new_var,
-        Some(OsStr::new(&probe_dst)),
-        &["--reflink=always", "-a"],
-        Stdio::null(),
-        Stdio::null(),
-    );
-    let cleanup_src = src_var.remove_file(&probe_name);
-    let cleanup_dst = new_var.remove_file(&probe_dst);
-    cleanup_src.with_context(|| format!("Removing /var reflink probe {probe_name}"))?;
-    // A failed reflink does not leave a destination, so ENOENT is expected.
-    match cleanup_dst {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).context("Removing /var reflink probe copy"),
-    }
-
-    Ok(status?.success())
 }
 
 /// Run GNU cp with directory handles inherited as fixed descriptors. Each
@@ -634,7 +588,7 @@ mod tests {
         fs::create_dir(&dst_path)?;
         let src = cap_dir(&src_path);
         let dst = cap_dir(&dst_path);
-        let supports_reflink = reflinks_supported(&src, &dst)?;
+        let supports_reflink = supports_reflink(&src, &dst)?;
         if !supports_reflink {
             fs::remove_file(src_path.join("log/keep/preserved"))?;
             fs::remove_dir(src_path.join("log/keep"))?;
