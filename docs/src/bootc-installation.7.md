@@ -263,10 +263,14 @@ previous installation.
 By default, the old `/var` and `/etc` are not migrated into the new deployment. With
 the ostree backend, `--preserve-var` opts into copying the old `/var` into the new
 stateroot before reboot; this uses reflinks when supported and otherwise makes a full
-copy, which can be unsafe while databases or other stateful services are running.
+copy of non-excluded data. Reflinks clone individual files, but the directory-tree copy is not an atomic
+database snapshot; concurrent changes can still result in inconsistent data. Stop
+databases and other stateful services before copying.
 `/var/tmp`, `/var/cache`, `/var/log/journal`, and `/var/lib/containers` are always
 excluded. Repeat `--preserve-var-skip PATH` to add further exclusions using paths
-relative to `/var` (a path or one direct child path, such as `lib/rpm`). The
+relative to `/var`: each exclusion must be either one component (such as `lib`) or
+exactly one child (such as `lib/pgsql`). `/var` itself and deeper paths are not
+accepted. Excluded data is not migrated and must be handled separately. The
 ostree-only `--merge-etc` option instead performs a three-way merge of the
 host's `/etc` customizations into the new deployment before the first reboot. See the
 [to-existing-root man page](man/bootc-install-to-existing-root.8.md) for details.

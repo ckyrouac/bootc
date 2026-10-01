@@ -21,8 +21,9 @@
 //! Two strategies are tried in order:
 //!
 //! - **Strategy C — reflink copy** (btrfs / XFS with reflinks): `cp --reflink=always`
-//!   performs an instantaneous copy-on-write clone.  No extra disk space is used
-//!   until data diverges.
+//!   clones files copy-on-write, avoiding an immediate second copy of their data.
+//!   Files are cloned individually, so this is not an atomic snapshot of the
+//!   `/var` tree or of a live database.
 //!
 //! - **Strategy D — plain copy** (ext4 and other non-reflink filesystems):
 //!   `cp -a` copies each non-ephemeral subdirectory of `/var` into the new
@@ -347,14 +348,18 @@ fn copy_dir_skip_subdir(
 ///
 /// The correct fix is to run this migration only after stopping all stateful
 /// services that write to `/var`, or — better — to migrate the filesystem to
-/// btrfs or XFS (which support reflinks, Strategy C) so that the copy is
-/// instantaneous and atomic from the kernel's perspective.
+/// btrfs or XFS (which support reflinks, Strategy C) to avoid copying every
+/// file's data immediately. Reflinks clone files individually; they do not
+/// provide an atomic snapshot of the `/var` tree or of a live database.
 ///
-/// A future improvement would be to accept a user-supplied exclusion list so
-/// that specific high-risk directories (e.g. `/var/lib/pgsql`) can be skipped
-/// and migrated manually.  For now, operators are responsible for stopping
-/// affected services before running `bootc install to-existing-root --preserve-var`
-/// on ext4 (or other non-reflink) filesystems.
+/// Exclusions can be configured with install configuration or repeated
+/// `--preserve-var-skip` options. Paths are relative to `/var` and may be one
+/// component (such as `lib`) or exactly one child (such as `lib/pgsql`). `/var`
+/// itself and deeper paths are not accepted. Excluded state is not migrated by
+/// this command and must be handled separately. Exclusions do not make a live database copy
+/// consistent: any database state that is copied while it is being written can
+/// still be corrupted. Stop stateful services before copying their data, or use
+/// a consistent snapshot.
 ///
 /// See: <https://github.com/bootc-dev/bootc/issues/2220>
 #[context("Copying /var into new deployment (Strategy D)")]

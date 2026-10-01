@@ -41,13 +41,17 @@ environment data fail closed. The option cannot be combined with `--cleanup`,
 and does not preserve `/var` or merge `/etc`.
 
 `--preserve-var` copies the old `/var` into the new stateroot. Where supported,
-the copy uses filesystem reflinks; otherwise it performs a full copy. A full copy
-can be unsafe while databases or other stateful services are running, so stop
-those services before installation when a full copy will be used. The paths
+the copy uses filesystem reflinks; otherwise it performs a regular copy of the
+non-excluded contents. A regular copy
+can be unsafe while databases or other stateful services are running. Reflinks
+clone individual files, but the directory-tree copy is not an atomic database
+snapshot; concurrent changes can still result in inconsistent data. Stop those
+services before copying. The paths
 `tmp`, `cache`, `log/journal`, and `lib/containers` are always excluded. Use the
 repeatable `--preserve-var-skip` option to add exclusions relative to `/var`;
-each path may be one component or a direct child path (for example, `tmp` or
-`lib/rpm`).
+each path must be either one component (for example, `lib`) or exactly one child
+(for example, `lib/pgsql`). `/var` itself and deeper paths such as `lib/pgsql/data`
+are not accepted. Excluded data is not migrated and must be handled separately.
 
 `--merge-etc` performs a three-way merge that applies the running host's `/etc`
 customizations to the new deployment before its first reboot. Without this
