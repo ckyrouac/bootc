@@ -88,20 +88,26 @@ To run a specific test:
 just test-tmt readonly
 ```
 
-The package-mode tests use a separate TMT plan with two disposable VMs. Set
-`test_disk_image` to a TMT-compatible VM image containing the package-mode test
-artifacts in `/var/share/test-artifacts/*.src.rpm`, then run:
+The package-mode tests use a separate TMT plan with two disposable VMs. By
+default, `just test-tmt-package-mode` uses TMT's `fedora` image alias (the latest
+released Fedora image). To use a different image, set `test_disk_image`:
 
 ```bash
-export test_disk_image=/path/to/package-mode-test-image.qcow2
+# Uses the latest released Fedora image.
 just test-tmt-package-mode
+
+# Optional: use another TMT-compatible image.
+test_disk_image=/path/to/package-mode-test-image.qcow2 just test-tmt-package-mode
 ```
 
 This runs the `/tmt/plans/package-mode` plan with `running_env=packit`; unlike
 `just test-tmt`, it does not build the regular integration-test images. The
 package-mode test performs a destructive migration inside its target VM, so use
 only a disposable image/environment. TMT and its virtual provisioning backend
-must be installed and configured locally.
+must be installed and configured locally. Note that the plan also expects
+Testing Farm artifacts (`/var/share/test-artifacts/*.src.rpm`, the
+`test-artifacts` repository configuration, and `/var/ARTIFACTS`) in the harness
+VM; a stock Fedora image alone does not provide them.
 
 ### Faster iteration cycles
 
