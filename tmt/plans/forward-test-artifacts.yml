@@ -1,0 +1,74 @@
+---
+- name: Forward Testing Farm artifacts from the TMT controller to the harness
+  hosts: harness
+  gather_facts: false
+  tasks:
+    - name: Check the controller artifact repository exists
+      ansible.builtin.stat:
+        path: /var/share/test-artifacts
+      delegate_to: localhost
+      register: artifact_repository
+
+    - name: Check the controller artifact repository configuration exists
+      ansible.builtin.stat:
+        path: /etc/yum.repos.d/test-artifacts.repo
+      delegate_to: localhost
+      register: artifact_repository_config
+
+    - name: Check the controller ARTIFACTS directory exists
+      ansible.builtin.stat:
+        path: /var/ARTIFACTS
+      delegate_to: localhost
+      register: artifacts_directory
+
+    - name: Validate controller artifact paths
+      ansible.builtin.assert:
+        that:
+          - artifact_repository.stat.exists
+          - artifact_repository.stat.isdir
+          - artifact_repository_config.stat.exists
+          - artifact_repository_config.stat.isreg
+          - artifacts_directory.stat.exists
+        fail_msg: >-
+          Cannot forward package-mode test artifacts: the TMT controller must
+          provide /var/share/test-artifacts/, /etc/yum.repos.d/test-artifacts.repo,
+          and /var/ARTIFACTS.
+
+    - name: Find source RPMs in the controller artifact repository
+      ansible.builtin.find:
+        paths: /var/share/test-artifacts
+        patterns: '*.src.rpm'
+        recurse: true
+        file_type: file
+      delegate_to: localhost
+      register: source_rpms
+
+    - name: Validate the controller artifact repository contains a source RPM
+      ansible.builtin.assert:
+        that:
+          - source_rpms.matched | int > 0
+        fail_msg: >-
+          Cannot forward package-mode test artifacts: no .src.rpm file was
+          found in /var/share/test-artifacts/ on the TMT controller.
+
+    - name: Copy the full artifact repository to the harness
+      ansible.builtin.copy:
+        src: /var/share/test-artifacts/
+        dest: /var/share/test-artifacts/
+        owner: root
+        group: root
+
+    - name: Copy the artifact repository configuration to the harness
+      ansible.builtin.copy:
+        src: /etc/yum.repos.d/test-artifacts.repo
+        dest: /etc/yum.repos.d/test-artifacts.repo
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Copy ARTIFACTS to the harness
+      ansible.builtin.copy:
+        src: /var/ARTIFACTS
+        dest: /var/
+        owner: root
+        group: root
