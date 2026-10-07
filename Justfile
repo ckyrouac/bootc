@@ -192,6 +192,15 @@ test-tmt *ARGS: build
     @just _build-upgrade-image
     @just test-tmt-nobuild {{ARGS}}
 
+# Run the package-mode TMT plan using its two TMT-provisioned guests.
+[group('core')]
+test-tmt-package-mode:
+    @if test -z "${test_disk_image:-}"; then \
+        echo "Set test_disk_image to a TMT-compatible package-mode VM image" >&2; \
+        exit 1; \
+    fi
+    @tmt --context=running_env=packit --context="test_disk_image=${test_disk_image}" run plans --name '^/tmt/plans/package-mode$'
+
 # Split out from `test-container` because, unlike the container integration tests,
 # unit tests don't depend on variant/filesystem/bootloader/boot_type/seal_state, so
 # CI runs this once per OS (in the `package` job) instead of once per test-integration

@@ -88,6 +88,21 @@ To run a specific test:
 just test-tmt readonly
 ```
 
+The package-mode tests use a separate TMT plan with two disposable VMs. Set
+`test_disk_image` to a TMT-compatible VM image containing the package-mode test
+artifacts in `/var/share/test-artifacts/*.src.rpm`, then run:
+
+```bash
+export test_disk_image=/path/to/package-mode-test-image.qcow2
+just test-tmt-package-mode
+```
+
+This runs the `/tmt/plans/package-mode` plan with `running_env=packit`; unlike
+`just test-tmt`, it does not build the regular integration-test images. The
+package-mode test performs a destructive migration inside its target VM, so use
+only a disposable image/environment. TMT and its virtual provisioning backend
+must be installed and configured locally.
+
 ### Faster iteration cycles
 
 The test cycle currently builds a disk image and creates a new ephemeral
