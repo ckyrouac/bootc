@@ -195,7 +195,7 @@ test-tmt *ARGS: build
 # Run the package-mode TMT plan using its two TMT-provisioned guests.
 [group('core')]
 test-tmt-package-mode:
-    @tmt --context=running_env=packit --context=test_artifacts_source=controller --context="test_disk_image=${test_disk_image:-fedora}" run plans --name '^/tmt/plans/package-mode$'
+    @tmt --context=running_env=packit --context="test_disk_image=${test_disk_image:-fedora}" run plans --name '^/tmt/plans/package-mode$'
 
 # Split out from `test-container` because, unlike the container integration tests,
 # unit tests don't depend on variant/filesystem/bootloader/boot_type/seal_state, so

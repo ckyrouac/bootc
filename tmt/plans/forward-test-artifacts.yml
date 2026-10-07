@@ -29,16 +29,18 @@
           - artifact_repository_config.stat.exists
           - artifact_repository_config.stat.isreg
           - artifacts_directory.stat.exists
+          - artifacts_directory.stat.isdir
         fail_msg: >-
           Cannot forward package-mode test artifacts: the TMT controller must
-          provide /var/share/test-artifacts/, /etc/yum.repos.d/test-artifacts.repo,
-          and /var/ARTIFACTS.
+          provide the /var/share/test-artifacts/ directory,
+          /etc/yum.repos.d/test-artifacts.repo file, and /var/ARTIFACTS
+          directory.
 
     - name: Find source RPMs in the controller artifact repository
       ansible.builtin.find:
         paths: /var/share/test-artifacts
         patterns: '*.src.rpm'
-        recurse: true
+        recurse: false
         file_type: file
       delegate_to: localhost
       register: source_rpms
@@ -46,10 +48,11 @@
     - name: Validate the controller artifact repository contains a source RPM
       ansible.builtin.assert:
         that:
-          - source_rpms.matched | int > 0
+          - source_rpms.matched | int == 1
         fail_msg: >-
-          Cannot forward package-mode test artifacts: no .src.rpm file was
-          found in /var/share/test-artifacts/ on the TMT controller.
+          Cannot forward package-mode test artifacts: exactly one top-level
+          .src.rpm file must be present in /var/share/test-artifacts/ on the
+          TMT controller.
 
     - name: Copy the full artifact repository to the harness
       ansible.builtin.copy:

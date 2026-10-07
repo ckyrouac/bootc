@@ -11,13 +11,13 @@ provision:
     image: $@{test_disk_image}
     user: root
 prepare:
-  # Testing Farm's reserved artifacts live on the TMT controller, not the
-  # package-mode harness guest. Forward them before harness setup consumes them.
+  # Forward Testing Farm's reserved artifacts before harness setup consumes
+  # them.
   - how: ansible
     order: 96
     playbook: forward-test-artifacts.yml
     where: harness
-    when: test_artifacts_source == controller
+    when: running_env != image_mode
   # This is the normal integration guest setup, restricted to the harness.
   - how: install
     order: 97
