@@ -118,7 +118,9 @@ the harness when present, but is an optional Testing Farm pass-through, not a
 test prerequisite. Local `just test-tmt-package-mode` runs use
 `package_source=local` and need none of those controller artifact paths; they
 skip Packit provisioning and the harness reboot while retaining the shared
-migration test and archive transfer.
+migration test and archive transfer. Local mode tests migration behavior using
+the image built from the checkout; it does not validate the SRPM, repository, or
+Packit provisioning path.
 
 ### Faster iteration cycles
 
