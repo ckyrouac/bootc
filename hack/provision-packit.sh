@@ -15,7 +15,9 @@ trap 'rm -rf -- "$BOOTC_TEMPDIR"' EXIT
 cp -a . "$BOOTC_TEMPDIR"
 
 # Keep testing farm run folder
-cp -r /var/ARTIFACTS "$BOOTC_TEMPDIR"
+if [[ -d /var/ARTIFACTS ]]; then
+    cp -r /var/ARTIFACTS "$BOOTC_TEMPDIR"
+fi
 
 # Copy bootc repo
 cp -r /var/share/test-artifacts "$BOOTC_TEMPDIR"

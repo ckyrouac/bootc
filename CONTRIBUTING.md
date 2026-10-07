@@ -89,8 +89,12 @@ just test-tmt readonly
 ```
 
 The package-mode tests use a separate TMT plan with two disposable VMs. By
-default, `just test-tmt-package-mode` uses TMT's `fedora` image alias (the latest
-released Fedora image). To use a different image, set `test_disk_image`:
+default, `just test-tmt-package-mode` builds `localhost/bootc` from the latest
+Fedora bootc base and uses TMT's `fedora` image alias (the latest released
+Fedora image). This performs a full local image build, so it takes longer and
+uses more disk/network than simply launching the VM test. The build archive is
+stored under the ignored `target/` directory and copied to the harness VM.
+To use a different guest image, set `test_disk_image`:
 
 ```bash
 # Uses the latest released Fedora image.
@@ -100,18 +104,21 @@ just test-tmt-package-mode
 test_disk_image=/path/to/package-mode-test-image.qcow2 just test-tmt-package-mode
 ```
 
-This runs the `/tmt/plans/package-mode` plan with `running_env=packit`; unlike
-`just test-tmt`, it does not build the regular integration-test images. The
-package-mode test performs a destructive migration inside its target VM, so use
-only a disposable image/environment. TMT and its virtual provisioning backend
-must be installed and configured locally.
+The local build base can be overridden with `BOOTC_base`; when changing the
+guest image, choose a matching bootc base (for example, Fedora guests should use
+the corresponding `quay.io/fedora/fedora-bootc` release). The package-mode test
+performs a destructive migration inside its target VM, so use only a disposable
+image/environment. TMT and its virtual provisioning backend must be installed
+and configured locally.
 
-The plan automatically forwards Testing Farm's controller paths to the
-harness before setup: `/var/share/test-artifacts/` (with exactly one top-level
-`.src.rpm`), `/etc/yum.repos.d/test-artifacts.repo`, and the `/var/ARTIFACTS/`
-directory. Local runs need those same paths on the TMT controller. This only
-forwards artifacts to the harness; it does not make nested VM provisioning
-available in environments where TMT's virtual guests cannot be provisioned.
+Packit runs the same plan with `package_source=artifacts`: the TMT controller
+must provide `/var/share/test-artifacts/` with exactly one top-level `.src.rpm`
+and `/etc/yum.repos.d/test-artifacts.repo`. `/var/ARTIFACTS/` is forwarded to
+the harness when present, but is an optional Testing Farm pass-through, not a
+test prerequisite. Local `just test-tmt-package-mode` runs use
+`package_source=local` and need none of those controller artifact paths; they
+skip Packit provisioning and the harness reboot while retaining the shared
+migration test and archive transfer.
 
 ### Faster iteration cycles
 

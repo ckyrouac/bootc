@@ -48,7 +48,17 @@ erofs_version := env("BOOTC_erofs_version", "v1")
 # Baseconfigs to inject into the image for testing (e.g. "etc-transient" or "root-transient")
 baseconfigs := env("BOOTC_baseconfigs", "")
 # Base container image to build from
-base := env("BOOTC_base", "quay.io/centos-bootc/centos-bootc:stream10")
+default_base := "quay.io/centos-bootc/centos-bootc:stream10"
+base := env("BOOTC_base", default_base)
+# Package-mode tests default to Fedora to match test_disk_image=fedora.
+# Honor BOOTC_base or a Justfile `base=` override when explicitly provided.
+package_mode_base := if base != default_base {
+    base
+} else if env("BOOTC_base", "") != "" {
+    base
+} else {
+    "quay.io/fedora/fedora-bootc:latest"
+}
 # Buildroot base image
 buildroot_base := env("BOOTC_buildroot_base", "quay.io/centos/centos:stream10")
 # Optional: path to extra source (e.g. composefs-rs) for local development
@@ -195,7 +205,20 @@ test-tmt *ARGS: build
 # Run the package-mode TMT plan using its two TMT-provisioned guests.
 [group('core')]
 test-tmt-package-mode:
-    @tmt --context=running_env=packit --context="test_disk_image=${test_disk_image:-fedora}" run plans --name '^/tmt/plans/package-mode$'
+    #!/bin/bash
+    set -euo pipefail
+    just base={{package_mode_base}} build
+    if [[ "{{base_img}}" != localhost/bootc ]]; then
+        podman tag {{base_img}} localhost/bootc
+    fi
+    mkdir -p target
+    podman save --format oci-archive \
+        --output target/package-mode-local.oci localhost/bootc
+    tmt \
+        --context=running_env=packit \
+        --context=package_source=local \
+        --context="test_disk_image=${test_disk_image:-fedora}" \
+        run plans --name '^/tmt/plans/package-mode$'
 
 # Split out from `test-container` because, unlike the container integration tests,
 # unit tests don't depend on variant/filesystem/bootloader/boot_type/seal_state, so

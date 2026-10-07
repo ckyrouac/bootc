@@ -1,4 +1,6 @@
 summary: Test package-mode to-existing-root migration flags
+environment:
+  PACKAGE_SOURCE: $@{package_source}
 provision:
   - name: harness
     role: harness
@@ -11,14 +13,32 @@ provision:
     image: $@{test_disk_image}
     user: root
 prepare:
-  # Forward Testing Farm's reserved artifacts before harness setup consumes
-  # them.
+  # Reject missing/unknown sources before any mode-specific setup runs.
+  - how: shell
+    order: 95
+    script: |
+      case "${PACKAGE_SOURCE:-}" in
+        artifacts|local) ;;
+        *)
+          printf 'package_source must be artifacts or local (got %q)\n' "${PACKAGE_SOURCE:-}" >&2
+          exit 1
+          ;;
+      esac
+    where: harness
+  # Forward Testing Farm artifacts before harness setup consumes them.
   - how: ansible
     order: 96
     playbook: tmt/plans/forward-test-artifacts.yml
     where: harness
-    when: running_env != image_mode
-  # This is the normal integration guest setup, restricted to the harness.
+    when: package_source == artifacts
+  # The local archive is copied from this checkout, independent of any
+  # Testing Farm controller paths.
+  - how: ansible
+    order: 96
+    playbook: tmt/plans/copy-local-test-image.yml
+    where: harness
+    when: package_source == local
+  # Packit provisioning needs the full integration toolchain.
   - how: install
     order: 97
     package:
@@ -37,28 +57,46 @@ prepare:
       - dosfstools
       - e2fsprogs
     where: harness
-    when: running_env != image_mode
+    when: package_source == artifacts
+  # Local mode only needs Podman to derive and save the marker image.
+  - how: install
+    order: 97
+    package:
+      - podman
+    where: harness
+    when: package_source == local
   - how: shell
     order: 98
     script:
       - mkdir -p bootc && cp /var/share/test-artifacts/*.src.rpm bootc
       - cd bootc && rpm2cpio *.src.rpm > pkg.cpio && cpio -idmv < pkg.cpio && rm pkg.cpio && rm -f *-vendor.tar.zstd && zstd -d *.tar.zstd && tar -xvf *.tar -C . --strip-components=1 && ls -al
       - cd bootc/hack && ./provision-packit.sh
-      - |
-        workdir=$(mktemp -d)
-        trap 'rm -rf -- "$workdir"' EXIT
-        cat > "$workdir/Containerfile" <<'EOF'
-        FROM localhost/bootc
-        RUN mkdir -p /etc/bootc-tmt-merge && \
-            printf '%s\n' image-default > /etc/bootc-tmt-merge/default.conf && \
-            printf '%s\n' image-only > /etc/bootc-tmt-merge/image-only.conf
-        EOF
-        podman build -t localhost/bootc-to-existing-root-preserve-var-merge-etc:latest "$workdir"
-        podman save --format oci-archive \
-          --output /var/tmp/bootc-to-existing-root-preserve-var-merge-etc.oci \
-          localhost/bootc-to-existing-root-preserve-var-merge-etc:latest
     where: harness
-    when: running_env != image_mode
+    when: package_source == artifacts
+  - how: shell
+    order: 98
+    script: podman load --input /var/tmp/bootc-package-mode-local.oci
+    where: harness
+    when: package_source == local
+  # Both sources now provide localhost/bootc. Derive the marker image once so
+  # the migration test consumes the same archive in either execution mode.
+  - how: shell
+    order: 99
+    script: |
+      workdir=$(mktemp -d)
+      trap 'rm -rf -- "$workdir"' EXIT
+      cat > "$workdir/Containerfile" <<'EOF'
+      FROM localhost/bootc
+      RUN mkdir -p /etc/bootc-tmt-merge && \
+          printf '%s\n' image-default > /etc/bootc-tmt-merge/default.conf && \
+          printf '%s\n' image-only > /etc/bootc-tmt-merge/image-only.conf
+      EOF
+      podman build -t localhost/bootc-to-existing-root-preserve-var-merge-etc:latest "$workdir"
+      podman save --format oci-archive \
+        --output /var/tmp/bootc-to-existing-root-preserve-var-merge-etc.oci \
+        localhost/bootc-to-existing-root-preserve-var-merge-etc:latest
+    where: harness
+    when: package_source == artifacts or package_source == local
   - how: install
     order: 97
     package:
@@ -66,26 +104,26 @@ prepare:
       - jq
       - bootc
     where: target
-    when: running_env != image_mode
+    when: package_source == artifacts or package_source == local
   # Reboot only the image-mode harness after system-reinstall-bootc.
   - how: ansible
-    order: 99
+    order: 100
     playbook:
       - https://github.com/bootc-dev/bootc/raw/refs/heads/main/hack/packit-reboot.yml
     where: harness
-    when: running_env != image_mode
+    when: package_source == artifacts
   # Fetch to the TMT controller, then copy that exact archive to the target.
   # Separate ordered steps avoid relying on shared storage or guest ordering.
   - how: ansible
-    order: 100
+    order: 101
     playbook: tmt/plans/fetch-test-image.yml
     where: harness
-    when: running_env != image_mode
+    when: package_source == artifacts or package_source == local
   - how: ansible
-    order: 101
+    order: 102
     playbook: tmt/plans/copy-test-image.yml
     where: target
-    when: running_env != image_mode
+    when: package_source == artifacts or package_source == local
 execute:
   how: tmt
 discover:

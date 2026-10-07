@@ -15,7 +15,7 @@
       delegate_to: localhost
       register: artifact_repository_config
 
-    - name: Check the controller ARTIFACTS directory exists
+    - name: Check whether the controller ARTIFACTS directory exists
       ansible.builtin.stat:
         path: /var/ARTIFACTS
       delegate_to: localhost
@@ -28,13 +28,10 @@
           - artifact_repository.stat.isdir
           - artifact_repository_config.stat.exists
           - artifact_repository_config.stat.isreg
-          - artifacts_directory.stat.exists
-          - artifacts_directory.stat.isdir
         fail_msg: >-
           Cannot forward package-mode test artifacts: the TMT controller must
           provide the /var/share/test-artifacts/ directory,
-          /etc/yum.repos.d/test-artifacts.repo file, and /var/ARTIFACTS
-          directory.
+          and /etc/yum.repos.d/test-artifacts.repo file.
 
     - name: Find source RPMs in the controller artifact repository
       ansible.builtin.find:
@@ -75,3 +72,4 @@
         dest: /var/
         owner: root
         group: root
+      when: artifacts_directory.stat.exists and artifacts_directory.stat.isdir
