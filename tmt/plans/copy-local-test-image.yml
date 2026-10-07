@@ -1,0 +1,11 @@
+---
+- name: Copy locally built package-mode image archive to the harness
+  hosts: harness
+  tasks:
+    - name: Copy the local image archive from the repository checkout
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../target/package-mode-local.oci"
+        dest: /var/tmp/bootc-package-mode-local.oci
+        owner: root
+        group: root
+        mode: '0600'

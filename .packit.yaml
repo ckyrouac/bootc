@@ -121,6 +121,7 @@ jobs:
         - tmt:
             context:
               running_env: "packit"
+              package_source: "artifacts"
 
   # ci/merge: full target set
   - job: tests
@@ -164,6 +165,7 @@ jobs:
         - tmt:
             context:
               running_env: "packit"
+              package_source: "artifacts"
 
   - job: propose_downstream
     trigger: release
