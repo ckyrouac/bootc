@@ -80,7 +80,7 @@ impl PackageBootEntry {
                     initrd,
                     options,
                 } => {
-                    let Ok(linux) = safe_boot_path(linux.as_str()) else {
+                    let Ok(linux) = normalize_boot_path(linux.as_str()) else {
                         continue;
                     };
                     if linux != running.kernel_path {
@@ -92,7 +92,7 @@ impl PackageBootEntry {
                     let path = match key {
                         crate::parsers::bls_config::EFIKey::Efi(path)
                         | crate::parsers::bls_config::EFIKey::Uki(path) => {
-                            safe_boot_path(path.as_str())
+                            normalize_boot_path(path.as_str())
                         }
                     };
                     let Ok(path) = path else {
@@ -150,11 +150,11 @@ impl PackageBootEntry {
             assets.extend(
                 initrd
                     .iter()
-                    .map(|path| safe_boot_path(path.as_str()))
+                    .map(|path| normalize_boot_path(path.as_str()))
                     .collect::<Result<Vec<_>>>()?,
             );
             if let Some(devicetree) = config.extra.get("devicetree") {
-                assets.push(safe_boot_path(devicetree)?);
+                assets.push(normalize_boot_path(devicetree)?);
             }
             let assets = identify_assets(&boot_path, assets)?;
             matches.push((path, contents, title, assets));
@@ -242,7 +242,7 @@ impl RunningCmdline {
         } else {
             boot_image
         };
-        let kernel_path = safe_boot_path(image_path).context("Invalid BOOT_IMAGE path")?;
+        let kernel_path = normalize_boot_path(image_path).context("Invalid BOOT_IMAGE path")?;
         Ok(Self {
             args,
             root,
@@ -347,8 +347,12 @@ fn validate_grub_bls(boot_path: &Path) -> Result<PathBuf> {
     Ok(config)
 }
 
-fn safe_boot_path(path: &str) -> Result<PathBuf> {
+fn normalize_boot_path(path: &str) -> Result<PathBuf> {
     reject_grub_variable_expansion(path, "boot asset")?;
+    // BLS paths may include the mountpoint even though this root is already
+    // the mounted boot filesystem. Keep traditional /vmlinuz paths relative
+    // to that root, while treating /boot/vmlinuz the same way.
+    let path = path.strip_prefix("/boot/").unwrap_or(path);
     let path = Path::new(path);
     let path = path.strip_prefix("/").unwrap_or(path);
     ensure!(
@@ -623,7 +627,7 @@ mod tests {
         symlink(outside.path(), boot.join("external"))?;
         fs::write(
             boot.join("loader/entries/pkg-6.9.0.conf"),
-            "title Package OS\nversion 6.9.0\nlinux /vmlinuz-6.9.0\ninitrd /external/initramfs-6.9.0.img\ndevicetree /devicetree-6.9.0.dtb\noptions root=UUID=old-root ro quiet\n",
+            "title Package OS\nversion 6.9.0\nlinux /vmlinuz-6.9.0\ninitrd /boot/external/initramfs-6.9.0.img\ndevicetree /devicetree-6.9.0.dtb\noptions root=UUID=old-root ro quiet\n",
         )?;
 
         let error = PackageBootEntry::preflight(root.path(), "6.9.0", running_cmdline())
@@ -725,6 +729,61 @@ mod tests {
             ),
         )?;
         PackageBootEntry::preflight(root.path(), "6.9.0", running_cmdline())?;
+        Ok(())
+    }
+
+    #[test]
+    fn normalizes_boot_mountpoint_conventions_and_retains_assets() -> Result<()> {
+        for (bls_prefix, image_prefix) in [("/boot", ""), ("", "/boot")] {
+            let root = tempfile::tempdir()?;
+            fixture(root.path())?;
+            let boot = root.path().join("boot");
+            fs::write(boot.join("intel-ucode.img"), b"microcode")?;
+            let entry_path = boot.join("loader/entries/pkg-6.9.0.conf");
+            let contents = fs::read_to_string(&entry_path)?;
+            let contents = contents
+                .replace("/vmlinuz-6.9.0", &format!("{bls_prefix}/vmlinuz-6.9.0"))
+                .replace(
+                    "/initramfs-6.9.0.img",
+                    &format!("{bls_prefix}/initramfs-6.9.0.img"),
+                )
+                .replace(
+                    "/devicetree-6.9.0.dtb",
+                    &format!("{bls_prefix}/devicetree-6.9.0.dtb"),
+                );
+            let contents = contents.replace(
+                &format!("initrd {bls_prefix}/initramfs-6.9.0.img\n"),
+                &format!(
+                    "initrd {bls_prefix}/intel-ucode.img\ninitrd {bls_prefix}/initramfs-6.9.0.img\n"
+                ),
+            );
+            fs::write(&entry_path, contents)?;
+
+            let cmdline = format!(
+                "BOOT_IMAGE=(hd0,gpt2){image_prefix}/vmlinuz-6.9.0 root=UUID=old-root ro quiet"
+            );
+            let entry = PackageBootEntry::preflight(root.path(), "6.9.0", &cmdline)?;
+            entry.verify_retained()?;
+
+            fs::write(boot.join("intel-ucode.img"), b"changed microcode")?;
+            let error = entry.verify_retained().unwrap_err().to_string();
+            assert!(error.contains("intel-ucode.img"), "{error}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn normalizes_only_exact_boot_mountpoint_prefixes() -> Result<()> {
+        for (input, expected) in [
+            ("/boot/vmlinuz", "vmlinuz"),
+            ("/vmlinuz", "vmlinuz"),
+            ("/booted/vmlinuz", "booted/vmlinuz"),
+        ] {
+            assert_eq!(normalize_boot_path(input)?, PathBuf::from(expected));
+        }
+
+        let error = normalize_boot_path("/boot/../outside").unwrap_err();
+        assert!(error.to_string().contains("Unsafe BLS boot asset path"));
         Ok(())
     }
 
