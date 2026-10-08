@@ -73,6 +73,7 @@ case ${TMT_REBOOT_COUNT:-0} in
         podman --remote=false run --rm --privileged --pid=host --user=root:root \
             -v /dev:/dev \
             -v /:/target \
+            -v /boot:/target/boot \
             -v /var/lib/containers:/var/lib/containers \
             --security-opt label=type:unconfined_t \
             "$target_image" \
