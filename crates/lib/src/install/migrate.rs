@@ -59,7 +59,7 @@
 
 mod package_boot;
 
-pub(crate) use package_boot::PackageBootEntry;
+pub(crate) use package_boot::{PackageBootEntry, PackageBootLoaderHandoff};
 
 use std::path::{Component, Path};
 use std::{

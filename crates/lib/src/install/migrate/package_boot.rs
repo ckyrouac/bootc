@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use cap_std_ext::cap_std::fs::Dir;
 use rustix::fs::{RenameFlags, renameat_with};
+use rustix::io::Errno;
 
 use crate::parsers::bls_config::{BLSConfigType, parse_bls_config};
 
@@ -193,7 +195,7 @@ impl PackageBootEntry {
     /// its boot files available to the installed GRUB BLS loader.
     pub(crate) fn verify_retained(&self) -> Result<()> {
         validate_grub_bls(&self.boot_path)?;
-        let entries_path = loader_entries_path(&self.boot_path, false)?;
+        let entries_path = loader_entries_path(&self.boot_path, true)?;
         let entry_path = entries_path.join(
             self.entry_path
                 .file_name()
@@ -249,6 +251,19 @@ impl PackageBootEntry {
         let backup_path = self.boot_path.join(&backup_name);
 
         copy_loader_directory(&loader, &stage_path)?;
+        let loader0_metadata = match fs::symlink_metadata(&stage_path) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                let cleanup = fs::remove_dir_all(&stage_path)
+                    .with_context(|| format!("Removing staged loader {}", stage_path.display()));
+                return combine_operation_and_cleanup(
+                    Err(err).with_context(|| {
+                        format!("Inspecting staged loader {}", stage_path.display())
+                    }),
+                    cleanup,
+                );
+            }
+        };
         if let Err(err) = renameat_with(
             &boot_dir,
             &stage_name,
@@ -306,6 +321,11 @@ impl PackageBootEntry {
         Ok(Some(PackageBootLoaderHandoff {
             boot_path: self.boot_path.clone(),
             backup_name,
+            original_device: metadata.dev(),
+            original_inode: metadata.ino(),
+            loader0_device: loader0_metadata.dev(),
+            loader0_inode: loader0_metadata.ino(),
+            original_restored: false,
         }))
     }
 
@@ -342,29 +362,11 @@ impl PackageBootEntry {
             temp_file.write_all(self.entry_contents.as_bytes())?;
             temp_file.sync_all()?;
             drop(temp_file);
-            match fs::hard_link(&temp_path, &entry_path) {
-                Ok(()) => Ok(()),
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    ensure!(
-                        existing_entry_matches(&entry_path, self.entry_contents.as_bytes())?,
-                        "Refusing to overwrite different package BLS entry {}",
-                        entry_path.display()
-                    );
-                    Ok(())
-                }
-                Err(err) => Err(err).with_context(|| {
-                    format!(
-                        "Atomically restoring package BLS entry {}",
-                        entry_path.display()
-                    )
-                }),
-            }
+            publish_entry(&temp_path, &entry_path, self.entry_contents.as_bytes())
         })();
-        let remove_result = fs::remove_file(&temp_path)
+        let remove_result = remove_file_if_exists(&temp_path)
             .with_context(|| format!("Removing temporary BLS entry {}", temp_path.display()));
-        write_result?;
-        remove_result?;
-        Ok(())
+        combine_operation_and_cleanup(write_result, remove_result)
     }
 }
 
@@ -410,67 +412,140 @@ fn loader_entries_path(boot_path: &Path, require_symlink: bool) -> Result<PathBu
     Ok(entries)
 }
 
-/// Holds the displaced package loader until install completion so ordinary
-/// failures can restore it. The temporary backup is intentionally retained
-/// across the async install operation; the directory exchange itself is atomic.
+/// Holds the displaced package loader until `to-existing-root` fully completes,
+/// so failures in install or post-install migration can restore it. The
+/// temporary backup is intentionally retained across the entire operation.
 #[derive(Debug)]
 pub(crate) struct PackageBootLoaderHandoff {
     boot_path: PathBuf,
     backup_name: String,
+    original_device: u64,
+    original_inode: u64,
+    loader0_device: u64,
+    loader0_inode: u64,
+    original_restored: bool,
 }
 
 impl PackageBootLoaderHandoff {
     /// Restore the original package directory at /boot/loader after a failed
     /// install. The currently active OSTree loader is displaced, not deleted.
-    pub(crate) fn rollback(self) -> Result<()> {
+    pub(crate) fn rollback(&mut self) -> Result<()> {
         let boot_dir =
             Dir::open_ambient_dir(&self.boot_path, cap_std_ext::cap_std::ambient_authority())?;
         let backup_path = self.boot_path.join(&self.backup_name);
-        let backup_metadata = fs::symlink_metadata(&backup_path).with_context(|| {
-            format!("Inspecting package loader backup {}", backup_path.display())
-        })?;
-        ensure!(
-            backup_metadata.is_dir() && !backup_metadata.file_type().is_symlink(),
-            "Package loader backup is no longer a real directory: {}",
-            backup_path.display()
-        );
+        if !self.original_restored {
+            let backup_metadata = fs::symlink_metadata(&backup_path).with_context(|| {
+                format!("Inspecting package loader backup {}", backup_path.display())
+            })?;
+            ensure!(
+                backup_metadata.is_dir()
+                    && !backup_metadata.file_type().is_symlink()
+                    && backup_metadata.dev() == self.original_device
+                    && backup_metadata.ino() == self.original_inode,
+                "Package loader backup is no longer a real directory: {}",
+                backup_path.display()
+            );
 
-        match renameat_with(
-            &boot_dir,
-            "loader",
-            &boot_dir,
-            &self.backup_name,
-            RenameFlags::EXCHANGE,
-        ) {
-            Ok(()) => {
-                fs::remove_file(&backup_path).with_context(|| {
-                    format!("Removing displaced OSTree loader {}", backup_path.display())
-                })?;
-                Ok(())
-            }
-            Err(exchange_err) => {
-                // If a failed install removed /boot/loader, a no-replace rename
-                // can still recover the original package layout.
-                match renameat_with(
-                    &boot_dir,
-                    &self.backup_name,
-                    &boot_dir,
-                    "loader",
-                    RenameFlags::NOREPLACE,
-                ) {
-                    Ok(()) => Ok(()),
-                    Err(restore_err) => Err(anyhow!(
-                        "Exchanging original package loader back into place failed ({exchange_err}); fallback restore also failed ({restore_err})"
-                    )),
+            match renameat_with(
+                &boot_dir,
+                "loader",
+                &boot_dir,
+                &self.backup_name,
+                RenameFlags::EXCHANGE,
+            ) {
+                Ok(()) => self.original_restored = true,
+                Err(exchange_err) => {
+                    // If a failed install removed /boot/loader, a no-replace rename
+                    // can still recover the original package layout.
+                    match renameat_with(
+                        &boot_dir,
+                        &self.backup_name,
+                        &boot_dir,
+                        "loader",
+                        RenameFlags::NOREPLACE,
+                    ) {
+                        Ok(()) => self.original_restored = true,
+                        Err(restore_err) => {
+                            return Err(anyhow!(
+                                "Exchanging original package loader back into place failed ({exchange_err}); fallback restore also failed ({restore_err})"
+                            ));
+                        }
+                    }
                 }
             }
         }
+
+        // The exchange leaves the former active loader at the private backup
+        // name. Remove only the relative loader symlink, never its target tree.
+        match fs::symlink_metadata(&backup_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = fs::read_link(&backup_path).with_context(|| {
+                    format!("Reading displaced loader {}", backup_path.display())
+                })?;
+                ensure!(
+                    target == Path::new("loader.0") || target == Path::new("loader.1"),
+                    "Refusing to remove unexpected displaced loader symlink {} -> {}",
+                    backup_path.display(),
+                    target.display()
+                );
+                fs::remove_file(&backup_path).with_context(|| {
+                    format!(
+                        "Removing displaced loader symlink {}",
+                        backup_path.display()
+                    )
+                })?;
+            }
+            Ok(_) => bail!(
+                "Refusing to remove unexpected displaced loader state {}",
+                backup_path.display()
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("Inspecting {}", backup_path.display()));
+            }
+        }
+
+        let loader0 = self.boot_path.join("loader.0");
+        match fs::symlink_metadata(&loader0) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.is_dir()
+                        && !metadata.file_type().is_symlink()
+                        && metadata.dev() == self.loader0_device
+                        && metadata.ino() == self.loader0_inode,
+                    "Refusing to remove loader.0 not created by this handoff: {}",
+                    loader0.display()
+                );
+                fs::remove_dir_all(&loader0).with_context(|| {
+                    format!("Removing handoff-created loader {}", loader0.display())
+                })?;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("Inspecting {}", loader0.display()));
+            }
+        }
+        Ok(())
     }
 
     /// Remove the retained original directory after install and postflight
     /// validation have succeeded.
     pub(crate) fn commit(self) -> Result<()> {
         let backup_path = self.boot_path.join(&self.backup_name);
+        let backup_metadata = fs::symlink_metadata(&backup_path).with_context(|| {
+            format!(
+                "Inspecting retained package loader {}",
+                backup_path.display()
+            )
+        })?;
+        ensure!(
+            backup_metadata.is_dir()
+                && !backup_metadata.file_type().is_symlink()
+                && backup_metadata.dev() == self.original_device
+                && backup_metadata.ino() == self.original_inode,
+            "Refusing to remove package loader backup not created by this handoff: {}",
+            backup_path.display()
+        );
         fs::remove_dir_all(&backup_path)
             .with_context(|| format!("Removing retained package loader {}", backup_path.display()))
     }
@@ -564,6 +639,110 @@ fn existing_entry_matches(path: &Path, contents: &[u8]) -> Result<bool> {
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err).with_context(|| format!("Inspecting {}", path.display())),
+    }
+}
+
+fn publish_entry(temp_path: &Path, entry_path: &Path, contents: &[u8]) -> Result<()> {
+    ensure!(
+        temp_path.parent() == entry_path.parent(),
+        "Temporary and published BLS entries must share a directory"
+    );
+    let entries_dir = Dir::open_ambient_dir(
+        entry_path.parent().context("BLS entry has no parent")?,
+        cap_std_ext::cap_std::ambient_authority(),
+    )?;
+    let temp_name = temp_path
+        .file_name()
+        .context("Temporary BLS entry has no filename")?;
+    let entry_name = entry_path
+        .file_name()
+        .context("BLS entry has no filename")?;
+    match renameat_with(
+        &entries_dir,
+        temp_name,
+        &entries_dir,
+        entry_name,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => Ok(()),
+        Err(Errno::EXIST) => ensure_existing_entry_matches(entry_path, contents),
+        Err(err) if no_replace_rename_unsupported(err) => {
+            publish_entry_exclusive(entry_path, contents)
+        }
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "Atomically restoring package BLS entry {}",
+                entry_path.display()
+            )
+        }),
+    }
+}
+
+fn no_replace_rename_unsupported(err: Errno) -> bool {
+    matches!(err, Errno::NOSYS | Errno::INVAL | Errno::OPNOTSUPP)
+}
+
+/// Filesystems without renameat2 no-replace support still get a no-clobber
+/// publication: create_new reserves the destination before writing any bytes.
+fn publish_entry_exclusive(entry_path: &Path, contents: &[u8]) -> Result<()> {
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(entry_path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            return ensure_existing_entry_matches(entry_path, contents);
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("Creating {} exclusively", entry_path.display()));
+        }
+    };
+    let metadata = file.metadata().with_context(|| {
+        format!(
+            "Inspecting newly created BLS entry {}",
+            entry_path.display()
+        )
+    })?;
+    let write_result = (|| -> Result<()> {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(write_err) = write_result {
+        let cleanup = remove_created_file(entry_path, metadata.dev(), metadata.ino());
+        return combine_operation_and_cleanup(Err(write_err), cleanup);
+    }
+    Ok(())
+}
+
+fn ensure_existing_entry_matches(entry_path: &Path, contents: &[u8]) -> Result<()> {
+    ensure!(
+        existing_entry_matches(entry_path, contents)?,
+        "Refusing to overwrite different package BLS entry {}",
+        entry_path.display()
+    );
+    Ok(())
+}
+
+fn remove_created_file(path: &Path, device: u64, inode: u64) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.dev() == device && metadata.ino() == inode => {
+            fs::remove_file(path)
+                .with_context(|| format!("Removing incomplete BLS entry {}", path.display()))
+        }
+        Ok(_) => bail!("Refusing to remove replaced BLS entry {}", path.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("Inspecting {}", path.display())),
+    }
+}
+
+fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
     }
 }
 
@@ -926,6 +1105,8 @@ mod tests {
         let root = tempfile::tempdir()?;
         fixture(root.path())?;
         let entry = PackageBootEntry::preflight(root.path(), "6.9.0", running_cmdline())?;
+        assert!(entry.verify_retained().is_err());
+        let handoff = entry.prepare_ostree_loader()?.unwrap();
         entry.verify_retained()?;
 
         fs::write(
@@ -933,6 +1114,18 @@ mod tests {
             b"replacement kernel",
         )?;
         assert!(entry.verify_retained().is_err());
+        handoff.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn postflight_requires_ostree_loader_symlink() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fixture(root.path())?;
+        let entry = PackageBootEntry::preflight(root.path(), "6.9.0", running_cmdline())?;
+
+        let error = entry.verify_retained().unwrap_err();
+        assert!(error.to_string().contains("must be a symlink"));
         Ok(())
     }
 
@@ -944,7 +1137,7 @@ mod tests {
         let entry_contents = fs::read(boot.join("loader/entries/pkg-6.9.0.conf"))?;
         let entry = PackageBootEntry::preflight(root.path(), "6.9.0", running_cmdline())?;
 
-        let handoff = entry.prepare_ostree_loader()?.unwrap();
+        let mut handoff = entry.prepare_ostree_loader()?.unwrap();
 
         assert_eq!(fs::read_link(boot.join("loader"))?, Path::new("loader.0"));
         assert_eq!(
@@ -963,19 +1156,27 @@ mod tests {
         let boot = root.path().join("boot");
         let original_entry = fs::read(boot.join("loader/entries/pkg-6.9.0.conf"))?;
         let entry = PackageBootEntry::preflight(root.path(), "6.9.0", running_cmdline())?;
-        let handoff = entry.prepare_ostree_loader()?.unwrap();
+        let mut handoff = entry.prepare_ostree_loader()?.unwrap();
 
         fs::create_dir_all(boot.join("loader.1/entries"))?;
         fs::remove_file(boot.join("loader"))?;
         std::os::unix::fs::symlink("loader.1", boot.join("loader"))?;
         handoff.rollback()?;
+        handoff.rollback()?;
 
         assert!(fs::symlink_metadata(boot.join("loader"))?.is_dir());
+        assert!(boot.join("loader.1/entries").is_dir());
+        assert!(fs::symlink_metadata(boot.join("loader.0")).is_err());
         assert_eq!(
             fs::read(boot.join("loader/entries/pkg-6.9.0.conf"))?,
             original_entry
         );
-        entry.verify_retained()?;
+        assert!(entry.verify_retained().is_err());
+
+        let mut retry = entry.prepare_ostree_loader()?.unwrap();
+        assert_eq!(fs::read_link(boot.join("loader"))?, Path::new("loader.0"));
+        retry.rollback()?;
+        assert!(fs::symlink_metadata(boot.join("loader.0")).is_err());
         Ok(())
     }
 
@@ -989,7 +1190,7 @@ mod tests {
         let link_target = outside.path().to_path_buf();
         std::os::unix::fs::symlink(&link_target, boot.join("loader/external"))?;
         let entry = PackageBootEntry::preflight(root.path(), "6.9.0", running_cmdline())?;
-        let handoff = entry.prepare_ostree_loader()?.unwrap();
+        let mut handoff = entry.prepare_ostree_loader()?.unwrap();
 
         let copied_link = boot.join("loader.0/external");
         assert!(fs::symlink_metadata(&copied_link)?.file_type().is_symlink());
@@ -1033,6 +1234,8 @@ mod tests {
         );
         entry.verify_retained()?;
         handoff.commit()?;
+        assert_eq!(fs::read_link(boot.join("loader"))?, Path::new("loader.1"));
+        assert!(boot.join("loader.0/entries/pkg-6.9.0.conf").is_file());
 
         let conflicting_root = tempfile::tempdir()?;
         fixture(conflicting_root.path())?;
@@ -1053,6 +1256,21 @@ mod tests {
             b"different BLS entry\n"
         );
         handoff.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn exclusive_entry_publish_does_not_overwrite_existing_content() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let entry = root.path().join("pkg.conf");
+        fs::write(&entry, b"existing\n")?;
+
+        assert!(publish_entry_exclusive(&entry, b"replacement\n").is_err());
+        assert_eq!(fs::read(&entry)?, b"existing\n");
+
+        let new_entry = root.path().join("new.conf");
+        publish_entry_exclusive(&new_entry, b"new entry\n")?;
+        assert_eq!(fs::read(new_entry)?, b"new entry\n");
         Ok(())
     }
 

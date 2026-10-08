@@ -2082,6 +2082,7 @@ async fn ostree_install(
     rootfs: &RootSetup,
     cleanup: Cleanup,
     package_boot_entry: Option<&migrate::PackageBootEntry>,
+    loader_handoff: &mut Option<migrate::PackageBootLoaderHandoff>,
 ) -> Result<camino::Utf8PathBuf> {
     // We verify this upfront because it's currently required by bootupd
     let boot_uuid = rootfs
@@ -2094,11 +2095,9 @@ async fn ostree_install(
 
     // Initialize the ostree sysroot (repo, stateroot, etc.)
 
-    let loader_handoff = if let Some(entry) = package_boot_entry {
-        entry.prepare_ostree_loader()?
-    } else {
-        None
-    };
+    if let Some(entry) = package_boot_entry {
+        *loader_handoff = entry.prepare_ostree_loader()?;
+    }
 
     let install_result = async {
         let deployment_path = {
@@ -2144,20 +2143,7 @@ async fn ostree_install(
     }
     .await;
 
-    match (install_result, loader_handoff) {
-        (Ok(path), Some(handoff)) => {
-            handoff.commit()?;
-            Ok(path)
-        }
-        (Ok(path), None) => Ok(path),
-        (Err(install_error), Some(handoff)) => match handoff.rollback() {
-            Ok(()) => Err(install_error),
-            Err(rollback_error) => Err(anyhow!(
-                "{install_error:#}; restoring the original package boot loader also failed: {rollback_error:#}"
-            )),
-        },
-        (Err(install_error), None) => Err(install_error),
-    }
+    install_result
 }
 
 async fn install_to_filesystem_impl(
@@ -2165,6 +2151,7 @@ async fn install_to_filesystem_impl(
     rootfs: &mut RootSetup,
     cleanup: Cleanup,
     package_boot_entry: Option<&migrate::PackageBootEntry>,
+    loader_handoff: &mut Option<migrate::PackageBootLoaderHandoff>,
 ) -> Result<Option<camino::Utf8PathBuf>> {
     if matches!(state.selinux_state, SELinuxFinalState::ForceTargetDisabled) {
         rootfs.kargs.extend(&Cmdline::from("selinux=0"));
@@ -2259,7 +2246,8 @@ async fn install_to_filesystem_impl(
         }
         None
     } else {
-        let deployment_path = ostree_install(state, rootfs, cleanup, package_boot_entry).await?;
+        let deployment_path =
+            ostree_install(state, rootfs, cleanup, package_boot_entry, loader_handoff).await?;
 
         // For s390x, we set zipl as the bootloader
         // this needs to be done after the ostree commit is deployed,
@@ -2382,7 +2370,15 @@ pub(crate) async fn install_to_disk(mut opts: InstallToDiskOpts) -> Result<()> {
         (rootfs, loopback_dev)
     };
 
-    install_to_filesystem_impl(&state, &mut rootfs, Cleanup::Skip, None).await?;
+    let mut loader_handoff = None;
+    install_to_filesystem_impl(
+        &state,
+        &mut rootfs,
+        Cleanup::Skip,
+        None,
+        &mut loader_handoff,
+    )
+    .await?;
 
     // Drop all data about the root except the bits we need to ensure any file descriptors etc. are closed.
     let (root_path, luksdev) = rootfs.into_storage();
@@ -2658,6 +2654,17 @@ pub(crate) async fn install_to_filesystem(
     opts: InstallToFilesystemOpts,
     targeting_host_root: bool,
     cleanup: Cleanup,
+) -> Result<Option<camino::Utf8PathBuf>> {
+    let mut loader_handoff = None;
+    install_to_filesystem_with_handoff(opts, targeting_host_root, cleanup, &mut loader_handoff)
+        .await
+}
+
+async fn install_to_filesystem_with_handoff(
+    opts: InstallToFilesystemOpts,
+    targeting_host_root: bool,
+    cleanup: Cleanup,
+    loader_handoff: &mut Option<migrate::PackageBootLoaderHandoff>,
 ) -> Result<Option<camino::Utf8PathBuf>> {
     validate_package_boot_source(
         opts.preserve_package_boot,
@@ -2987,9 +2994,14 @@ pub(crate) async fn install_to_filesystem(
         skip_finalize,
     };
 
-    let deployment_path =
-        install_to_filesystem_impl(&state, &mut rootfs, cleanup, package_boot_entry.as_ref())
-            .await?;
+    let deployment_path = install_to_filesystem_impl(
+        &state,
+        &mut rootfs,
+        cleanup,
+        package_boot_entry.as_ref(),
+        loader_handoff,
+    )
+    .await?;
     // Drop all data about the root except the path to ensure any file descriptors etc. are closed.
     drop(rootfs);
 
@@ -3065,42 +3077,63 @@ pub(crate) async fn install_to_existing_root(opts: InstallToExistingRootOpts) ->
         preserve_package_boot,
     };
 
-    let deployment_path = install_to_filesystem(fs_opts, true, cleanup).await?;
+    let mut loader_handoff = None;
+    let install_result = async {
+        let deployment_path =
+            install_to_filesystem_with_handoff(fs_opts, true, cleanup, &mut loader_handoff).await?;
 
-    // Post-install migration steps (run after the ostree deploy is complete).
-    if preserve_var {
-        println!();
-        println!("Preserving /var...");
-        let deployment_path = deployment_path
-            .as_ref()
-            .context("Install did not produce an ostree deployment")?;
-        let physical_root = if root_path.join("sysroot/ostree").exists() {
-            root_path.join("sysroot")
-        } else {
-            root_path.clone()
-        };
-        let deploy_dir = physical_root.join(deployment_path);
-        let new_var = migrate::deployment_var_path(&deploy_dir)?;
-        migrate::preserve_var(&root_path.join("var"), &new_var, &preserve_var_skip)
-            .context("Post-install /var preservation")?;
+        // Post-install migration steps (run after the ostree deploy is complete).
+        if preserve_var {
+            println!();
+            println!("Preserving /var...");
+            let deployment_path = deployment_path
+                .as_ref()
+                .context("Install did not produce an ostree deployment")?;
+            let physical_root = if root_path.join("sysroot/ostree").exists() {
+                root_path.join("sysroot")
+            } else {
+                root_path.clone()
+            };
+            let deploy_dir = physical_root.join(deployment_path);
+            let new_var = migrate::deployment_var_path(&deploy_dir)?;
+            migrate::preserve_var(&root_path.join("var"), &new_var, &preserve_var_skip)
+                .context("Post-install /var preservation")?;
+        }
+
+        if merge_etc {
+            println!();
+            println!("Merging running /etc into new deployment...");
+            let deployment_path = deployment_path
+                .as_ref()
+                .context("Install did not produce an ostree deployment")?;
+            let physical_root = if root_path.join("sysroot/ostree").exists() {
+                root_path.join("sysroot")
+            } else {
+                root_path.clone()
+            };
+            migrate::merge_etc_into_deployment(&root_path, &physical_root.join(deployment_path))
+                .context("Post-install /etc merge")?;
+        }
+
+        Ok::<(), anyhow::Error>(())
     }
+    .await;
 
-    if merge_etc {
-        println!();
-        println!("Merging running /etc into new deployment...");
-        let deployment_path = deployment_path
-            .as_ref()
-            .context("Install did not produce an ostree deployment")?;
-        let physical_root = if root_path.join("sysroot/ostree").exists() {
-            root_path.join("sysroot")
-        } else {
-            root_path.clone()
-        };
-        migrate::merge_etc_into_deployment(&root_path, &physical_root.join(deployment_path))
-            .context("Post-install /etc merge")?;
+    match install_result {
+        Ok(()) => match loader_handoff {
+            Some(handoff) => handoff.commit(),
+            None => Ok(()),
+        },
+        Err(install_error) => match loader_handoff.as_mut() {
+            Some(handoff) => match handoff.rollback() {
+                Ok(()) => Err(install_error),
+                Err(rollback_error) => Err(anyhow!(
+                    "{install_error:#}; restoring the original package boot loader also failed: {rollback_error:#}"
+                )),
+            },
+            None => Err(install_error),
+        },
     }
-
-    Ok(())
 }
 
 /// Read the /boot entry from /etc/fstab, if it exists
