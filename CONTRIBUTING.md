@@ -94,10 +94,12 @@ Fedora bootc base and uses TMT's `fedora` image alias (the latest released
 Fedora image). This performs a full local image build, so it takes longer and
 uses more disk/network than simply launching the VM test. The build archive is
 stored under the ignored `target/` directory and copied to the harness VM.
-TMT's run workdir defaults to `target/tmt-package-mode-runs`. This directory
-must be visible at the same absolute path to both the TMT container and the
-host session-libvirt process so libvirt can access seed images created by TMT.
-Set `TMT_WORKDIR_ROOT` to use a different shared directory:
+TMT's run workdir defaults to
+`${XDG_CACHE_HOME:-$HOME/.cache}/bootc/tmt-package-mode-runs`. It must be outside
+the fmf root (the checkout) and visible at the same absolute path to both the
+TMT container and the host session-libvirt process so libvirt can access seed
+images created by TMT. Set `TMT_WORKDIR_ROOT` to use a different shared
+directory that meets both requirements:
 
 ```bash
 TMT_WORKDIR_ROOT=/shared/tmt-package-mode-runs just test-tmt-package-mode

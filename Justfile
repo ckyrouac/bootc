@@ -211,7 +211,7 @@ test-tmt-package-mode:
     if [[ "{{base_img}}" != localhost/bootc ]]; then
         podman tag {{base_img}} localhost/bootc
     fi
-    workdir_root="${TMT_WORKDIR_ROOT:-target/tmt-package-mode-runs}"
+    workdir_root="${TMT_WORKDIR_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/bootc/tmt-package-mode-runs}"
     mkdir -p -- "$workdir_root"
     workdir_root="$(realpath -- "$workdir_root")"
     podman save --format oci-archive \
