@@ -47,6 +47,26 @@
 
     - name: Copy and verify the staged image archive
       block:
+        - name: Inspect the controller staging directory
+          ansible.builtin.stat:
+            path: "{{ package_mode_staging_dir }}"
+          delegate_to: localhost
+          register: package_mode_staging
+
+        - name: Require a real controller staging directory
+          ansible.builtin.assert:
+            that:
+              - package_mode_staging.stat.exists
+              - package_mode_staging.stat.isdir
+              - not (package_mode_staging.stat.islnk | default(false))
+            fail_msg: >-
+              The package-mode staging path must be a real directory;
+              symlinks and non-directories are not allowed.
+
+        - name: Mark the controller staging directory safe to clean up
+          ansible.builtin.set_fact:
+            package_mode_staging_dir_valid: true
+
         - name: Inspect the staged image archive on the controller
           ansible.builtin.stat:
             path: "{{ package_mode_archive }}"
@@ -106,3 +126,4 @@
             path: "{{ package_mode_staging_dir }}"
             state: absent
           delegate_to: localhost
+          when: package_mode_staging_dir_valid | default(false)
