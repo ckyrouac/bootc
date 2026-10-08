@@ -14,6 +14,7 @@ use rustix::fs::{RenameFlags, renameat_with};
 use crate::parsers::bls_config::{BLSConfigType, parse_bls_config};
 
 static ENTRY_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+static LOADER_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 /// A validated running-kernel BLS entry whose files must survive install.
 #[derive(Debug)]
@@ -210,14 +211,17 @@ impl PackageBootEntry {
     }
 
     /// Make the package BLS directory bootversion 0 before OSTree initializes
-    /// its sysroot. OSTree expects /boot/loader to be a symlink.
-    pub(crate) fn prepare_ostree_loader(&self) -> Result<()> {
+    /// its sysroot. OSTree expects /boot/loader to be a symlink. The copied
+    /// loader and atomic exchange ensure /boot/loader is never absent, but this
+    /// is not crash-safe: a power loss may leave the original directory under
+    /// its temporary backup name.
+    pub(crate) fn prepare_ostree_loader(&self) -> Result<Option<PackageBootLoaderHandoff>> {
         let loader = self.boot_path.join("loader");
         let metadata = fs::symlink_metadata(&loader)
             .with_context(|| format!("Inspecting package boot loader {}", loader.display()))?;
         if metadata.file_type().is_symlink() {
             loader_entries_path(&self.boot_path, true)?;
-            return Ok(());
+            return Ok(None);
         }
         ensure!(
             metadata.is_dir(),
@@ -234,36 +238,75 @@ impl PackageBootEntry {
             }
         }
 
+        // Validate the existing BLS tree before copying it. In particular, do
+        // not allow an entries symlink to redirect validation outside /boot.
+        loader_entries_path(&self.boot_path, false)?;
+
         let boot_dir =
             Dir::open_ambient_dir(&self.boot_path, cap_std_ext::cap_std::ambient_authority())?;
-        renameat_with(
+        let (stage_name, backup_name) = unique_loader_names();
+        let stage_path = self.boot_path.join(&stage_name);
+        let backup_path = self.boot_path.join(&backup_name);
+
+        copy_loader_directory(&loader, &stage_path)?;
+        if let Err(err) = renameat_with(
             &boot_dir,
-            "loader",
+            &stage_name,
             &boot_dir,
             "loader.0",
             RenameFlags::NOREPLACE,
-        )
-        .with_context(|| format!("Renaming {} to {}", loader.display(), loader0.display()))?;
-
-        if let Err(create_error) = std::os::unix::fs::symlink("loader.0", &loader) {
-            let restore = renameat_with(
-                &boot_dir,
-                "loader.0",
-                &boot_dir,
-                "loader",
-                RenameFlags::NOREPLACE,
+        ) {
+            let cleanup = fs::remove_dir_all(&stage_path)
+                .with_context(|| format!("Removing staged loader {}", stage_path.display()));
+            return combine_operation_and_cleanup(
+                Err(err)
+                    .with_context(|| format!("Publishing staged loader as {}", loader0.display())),
+                cleanup,
             );
-            return match restore {
-                Ok(()) => Err(create_error).with_context(|| {
-                    format!("Creating relative symlink {} -> loader.0", loader.display())
-                }),
-                Err(restore_error) => Err(anyhow!(
-                    "Creating {} -> loader.0 failed ({create_error}); restoring the original loader directory also failed ({restore_error})",
-                    loader.display()
-                )),
-            };
         }
-        Ok(())
+
+        if let Err(err) = std::os::unix::fs::symlink("loader.0", &backup_path) {
+            let cleanup = fs::remove_dir_all(&loader0)
+                .with_context(|| format!("Removing staged loader {}", loader0.display()));
+            return combine_operation_and_cleanup(
+                Err(err).with_context(|| {
+                    format!(
+                        "Creating temporary loader symlink {}",
+                        backup_path.display()
+                    )
+                }),
+                cleanup,
+            );
+        }
+
+        if let Err(err) = renameat_with(
+            &boot_dir,
+            "loader",
+            &boot_dir,
+            &backup_name,
+            RenameFlags::EXCHANGE,
+        ) {
+            let remove_link = fs::remove_file(&backup_path)
+                .with_context(|| format!("Removing temporary symlink {}", backup_path.display()));
+            let remove_copy = fs::remove_dir_all(&loader0)
+                .with_context(|| format!("Removing staged loader {}", loader0.display()));
+            let cleanup = combine_operation_and_cleanup(remove_link, remove_copy);
+            return combine_operation_and_cleanup(
+                Err(err).with_context(|| {
+                    format!(
+                        "Atomically exchanging {} with {}",
+                        loader.display(),
+                        backup_path.display()
+                    )
+                }),
+                cleanup,
+            );
+        }
+
+        Ok(Some(PackageBootLoaderHandoff {
+            boot_path: self.boot_path.clone(),
+            backup_name,
+        }))
     }
 
     /// Restore the preflight-validated entry into bootupd's active loader
@@ -357,14 +400,151 @@ fn loader_entries_path(boot_path: &Path, require_symlink: bool) -> Result<PathBu
         );
     }
     let entries = loader.join("entries");
+    let entries_metadata = fs::symlink_metadata(&entries)
+        .with_context(|| format!("Inspecting BLS entries directory {}", entries.display()))?;
     ensure!(
-        fs::symlink_metadata(&entries)
-            .with_context(|| format!("Inspecting BLS entries directory {}", entries.display()))?
-            .is_dir(),
+        entries_metadata.is_dir() && !entries_metadata.file_type().is_symlink(),
         "BLS entries path is not a directory: {}",
         entries.display()
     );
     Ok(entries)
+}
+
+/// Holds the displaced package loader until install completion so ordinary
+/// failures can restore it. The temporary backup is intentionally retained
+/// across the async install operation; the directory exchange itself is atomic.
+#[derive(Debug)]
+pub(crate) struct PackageBootLoaderHandoff {
+    boot_path: PathBuf,
+    backup_name: String,
+}
+
+impl PackageBootLoaderHandoff {
+    /// Restore the original package directory at /boot/loader after a failed
+    /// install. The currently active OSTree loader is displaced, not deleted.
+    pub(crate) fn rollback(self) -> Result<()> {
+        let boot_dir =
+            Dir::open_ambient_dir(&self.boot_path, cap_std_ext::cap_std::ambient_authority())?;
+        let backup_path = self.boot_path.join(&self.backup_name);
+        let backup_metadata = fs::symlink_metadata(&backup_path).with_context(|| {
+            format!("Inspecting package loader backup {}", backup_path.display())
+        })?;
+        ensure!(
+            backup_metadata.is_dir() && !backup_metadata.file_type().is_symlink(),
+            "Package loader backup is no longer a real directory: {}",
+            backup_path.display()
+        );
+
+        match renameat_with(
+            &boot_dir,
+            "loader",
+            &boot_dir,
+            &self.backup_name,
+            RenameFlags::EXCHANGE,
+        ) {
+            Ok(()) => {
+                fs::remove_file(&backup_path).with_context(|| {
+                    format!("Removing displaced OSTree loader {}", backup_path.display())
+                })?;
+                Ok(())
+            }
+            Err(exchange_err) => {
+                // If a failed install removed /boot/loader, a no-replace rename
+                // can still recover the original package layout.
+                match renameat_with(
+                    &boot_dir,
+                    &self.backup_name,
+                    &boot_dir,
+                    "loader",
+                    RenameFlags::NOREPLACE,
+                ) {
+                    Ok(()) => Ok(()),
+                    Err(restore_err) => Err(anyhow!(
+                        "Exchanging original package loader back into place failed ({exchange_err}); fallback restore also failed ({restore_err})"
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Remove the retained original directory after install and postflight
+    /// validation have succeeded.
+    pub(crate) fn commit(self) -> Result<()> {
+        let backup_path = self.boot_path.join(&self.backup_name);
+        fs::remove_dir_all(&backup_path)
+            .with_context(|| format!("Removing retained package loader {}", backup_path.display()))
+    }
+}
+
+fn unique_loader_names() -> (String, String) {
+    let id = LOADER_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let unique = format!("{}-{id}", std::process::id());
+    (
+        format!(".bootc-loader-stage-{unique}"),
+        format!(".bootc-loader-backup-{unique}"),
+    )
+}
+
+fn copy_loader_directory(source: &Path, destination: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("Inspecting package loader directory {}", source.display()))?;
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "Package loader is not a real directory: {}",
+        source.display()
+    );
+    fs::create_dir(destination)
+        .with_context(|| format!("Creating staged loader directory {}", destination.display()))?;
+
+    let result = (|| -> Result<()> {
+        for entry in fs::read_dir(source)
+            .with_context(|| format!("Reading package loader directory {}", source.display()))?
+        {
+            let entry = entry?;
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            let metadata = fs::symlink_metadata(&source_path)
+                .with_context(|| format!("Inspecting {}", source_path.display()))?;
+            if metadata.file_type().is_symlink() {
+                let target = fs::read_link(&source_path)
+                    .with_context(|| format!("Reading symlink {}", source_path.display()))?;
+                std::os::unix::fs::symlink(&target, &destination_path)
+                    .with_context(|| format!("Copying symlink {}", source_path.display()))?;
+            } else if metadata.is_dir() {
+                copy_loader_directory(&source_path, &destination_path)?;
+            } else if metadata.is_file() {
+                fs::copy(&source_path, &destination_path).with_context(|| {
+                    format!("Copying package loader file {}", source_path.display())
+                })?;
+            } else {
+                bail!(
+                    "Unsupported special file in package loader: {}",
+                    source_path.display()
+                );
+            }
+        }
+        fs::set_permissions(destination, metadata.permissions())
+            .with_context(|| format!("Setting permissions on {}", destination.display()))?;
+        Ok(())
+    })();
+
+    if let Err(copy_err) = result {
+        let cleanup = fs::remove_dir_all(destination)
+            .with_context(|| format!("Removing incomplete loader copy {}", destination.display()));
+        return combine_operation_and_cleanup(Err(copy_err), cleanup);
+    }
+    Ok(())
+}
+
+fn combine_operation_and_cleanup<T>(operation: Result<T>, cleanup: Result<()>) -> Result<T> {
+    match (operation, cleanup) {
+        (Err(operation_err), Ok(())) => Err(operation_err),
+        (Err(operation_err), Err(cleanup_err)) => Err(anyhow!(
+            "{operation_err:#}; cleanup also failed: {cleanup_err:#}"
+        )),
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(cleanup_err)) => Err(cleanup_err),
+    }
 }
 
 fn existing_entry_matches(path: &Path, contents: &[u8]) -> Result<bool> {
@@ -764,7 +944,7 @@ mod tests {
         let entry_contents = fs::read(boot.join("loader/entries/pkg-6.9.0.conf"))?;
         let entry = PackageBootEntry::preflight(root.path(), "6.9.0", running_cmdline())?;
 
-        entry.prepare_ostree_loader()?;
+        let handoff = entry.prepare_ostree_loader()?.unwrap();
 
         assert_eq!(fs::read_link(boot.join("loader"))?, Path::new("loader.0"));
         assert_eq!(
@@ -772,6 +952,63 @@ mod tests {
             entry_contents
         );
         entry.verify_retained()?;
+        handoff.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_restores_original_loader_after_conversion() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fixture(root.path())?;
+        let boot = root.path().join("boot");
+        let original_entry = fs::read(boot.join("loader/entries/pkg-6.9.0.conf"))?;
+        let entry = PackageBootEntry::preflight(root.path(), "6.9.0", running_cmdline())?;
+        let handoff = entry.prepare_ostree_loader()?.unwrap();
+
+        fs::create_dir_all(boot.join("loader.1/entries"))?;
+        fs::remove_file(boot.join("loader"))?;
+        std::os::unix::fs::symlink("loader.1", boot.join("loader"))?;
+        handoff.rollback()?;
+
+        assert!(fs::symlink_metadata(boot.join("loader"))?.is_dir());
+        assert_eq!(
+            fs::read(boot.join("loader/entries/pkg-6.9.0.conf"))?,
+            original_entry
+        );
+        entry.verify_retained()?;
+        Ok(())
+    }
+
+    #[test]
+    fn copies_loader_symlinks_without_following_them_and_rejects_entries_escape() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fixture(root.path())?;
+        let boot = root.path().join("boot");
+        let outside = tempfile::tempdir()?;
+        fs::write(outside.path().join("sentinel"), b"outside")?;
+        let link_target = outside.path().to_path_buf();
+        std::os::unix::fs::symlink(&link_target, boot.join("loader/external"))?;
+        let entry = PackageBootEntry::preflight(root.path(), "6.9.0", running_cmdline())?;
+        let handoff = entry.prepare_ostree_loader()?.unwrap();
+
+        let copied_link = boot.join("loader.0/external");
+        assert!(fs::symlink_metadata(&copied_link)?.file_type().is_symlink());
+        assert_eq!(fs::read_link(copied_link)?, link_target);
+        assert_eq!(
+            fs::read(boot.join("loader.0/entries/pkg-6.9.0.conf"))?,
+            entry.entry_contents.as_bytes().to_vec()
+        );
+        handoff.rollback()?;
+
+        let unsafe_root = tempfile::tempdir()?;
+        fixture(unsafe_root.path())?;
+        let unsafe_boot = unsafe_root.path().join("boot");
+        let external_entries = tempfile::tempdir()?;
+        fs::remove_dir_all(unsafe_boot.join("loader/entries"))?;
+        std::os::unix::fs::symlink(external_entries.path(), unsafe_boot.join("loader/entries"))?;
+        assert!(
+            PackageBootEntry::preflight(unsafe_root.path(), "6.9.0", running_cmdline()).is_err()
+        );
         Ok(())
     }
 
@@ -783,7 +1020,7 @@ mod tests {
         let original_entry = boot.join("loader/entries/pkg-6.9.0.conf");
         let original_contents = fs::read(&original_entry)?;
         let entry = PackageBootEntry::preflight(root.path(), "6.9.0", running_cmdline())?;
-        entry.prepare_ostree_loader()?;
+        let handoff = entry.prepare_ostree_loader()?.unwrap();
 
         fs::create_dir_all(boot.join("loader.1/entries"))?;
         fs::remove_file(boot.join("loader"))?;
@@ -795,13 +1032,14 @@ mod tests {
             original_contents
         );
         entry.verify_retained()?;
+        handoff.commit()?;
 
         let conflicting_root = tempfile::tempdir()?;
         fixture(conflicting_root.path())?;
         let conflicting_boot = conflicting_root.path().join("boot");
         let conflicting =
             PackageBootEntry::preflight(conflicting_root.path(), "6.9.0", running_cmdline())?;
-        conflicting.prepare_ostree_loader()?;
+        let handoff = conflicting.prepare_ostree_loader()?.unwrap();
         fs::create_dir_all(conflicting_boot.join("loader.1/entries"))?;
         fs::write(
             conflicting_boot.join("loader.1/entries/pkg-6.9.0.conf"),
@@ -814,6 +1052,7 @@ mod tests {
             fs::read(conflicting_boot.join("loader.1/entries/pkg-6.9.0.conf"))?,
             b"different BLS entry\n"
         );
+        handoff.commit()?;
         Ok(())
     }
 
@@ -863,7 +1102,7 @@ mod tests {
         std::os::unix::fs::symlink("loader.1", boot.join("loader"))?;
         let entry = PackageBootEntry::preflight(root.path(), "6.9.0", running_cmdline())?;
 
-        entry.prepare_ostree_loader()?;
+        assert!(entry.prepare_ostree_loader()?.is_none());
 
         assert_eq!(fs::read_link(boot.join("loader"))?, Path::new("loader.1"));
         assert!(boot.join("loader.0").symlink_metadata().is_err());

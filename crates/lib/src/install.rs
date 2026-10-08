@@ -2094,45 +2094,70 @@ async fn ostree_install(
 
     // Initialize the ostree sysroot (repo, stateroot, etc.)
 
-    let deployment_path = {
-        if let Some(entry) = package_boot_entry {
-            entry.prepare_ostree_loader()?;
-        }
-        let (sysroot, has_ostree) = initialize_ostree_root(state, rootfs).await?;
-
-        let deployment_path = install_with_sysroot(
-            state,
-            rootfs,
-            &sysroot,
-            &boot_uuid,
-            bound_images,
-            has_ostree,
-        )
-        .await?;
-        if let Some(entry) = package_boot_entry {
-            entry.restore_active_entry()?;
-        }
-        let ostree = sysroot.get_ostree()?;
-
-        if matches!(cleanup, Cleanup::TriggerOnNextBoot) {
-            let sysroot_dir = crate::utils::sysroot_dir(ostree)?;
-            tracing::debug!("Writing {DESTRUCTIVE_CLEANUP}");
-            sysroot_dir.atomic_write(DESTRUCTIVE_CLEANUP, b"")?;
-        }
-
-        // Ensure the image storage is SELinux-labeled. This must happen
-        // after all image pulls are complete.
-        sysroot.ensure_imgstore_labeled()?;
-
-        // We must drop the sysroot here in order to close any open file
-        // descriptors.
-        deployment_path
+    let loader_handoff = if let Some(entry) = package_boot_entry {
+        entry.prepare_ostree_loader()?
+    } else {
+        None
     };
 
-    // Run this on every install as the penultimate step
-    install_finalize(&rootfs.physical_root_path).await?;
+    let install_result = async {
+        let deployment_path = {
+            let (sysroot, has_ostree) = initialize_ostree_root(state, rootfs).await?;
 
-    Ok(deployment_path)
+            let deployment_path = install_with_sysroot(
+                state,
+                rootfs,
+                &sysroot,
+                &boot_uuid,
+                bound_images,
+                has_ostree,
+            )
+            .await?;
+            if let Some(entry) = package_boot_entry {
+                entry.restore_active_entry()?;
+                entry.verify_retained()?;
+            }
+            let ostree = sysroot.get_ostree()?;
+
+            if matches!(cleanup, Cleanup::TriggerOnNextBoot) {
+                let sysroot_dir = crate::utils::sysroot_dir(ostree)?;
+                tracing::debug!("Writing {DESTRUCTIVE_CLEANUP}");
+                sysroot_dir.atomic_write(DESTRUCTIVE_CLEANUP, b"")?;
+            }
+
+            // Ensure the image storage is SELinux-labeled. This must happen
+            // after all image pulls are complete.
+            sysroot.ensure_imgstore_labeled()?;
+
+            // We must drop the sysroot here in order to close any open file
+            // descriptors.
+            deployment_path
+        };
+
+        // Run this on every install as the penultimate step
+        install_finalize(&rootfs.physical_root_path).await?;
+        if let Some(entry) = package_boot_entry {
+            entry.verify_retained()?;
+        }
+
+        Ok(deployment_path)
+    }
+    .await;
+
+    match (install_result, loader_handoff) {
+        (Ok(path), Some(handoff)) => {
+            handoff.commit()?;
+            Ok(path)
+        }
+        (Ok(path), None) => Ok(path),
+        (Err(install_error), Some(handoff)) => match handoff.rollback() {
+            Ok(()) => Err(install_error),
+            Err(rollback_error) => Err(anyhow!(
+                "{install_error:#}; restoring the original package boot loader also failed: {rollback_error:#}"
+            )),
+        },
+        (Err(install_error), None) => Err(install_error),
+    }
 }
 
 async fn install_to_filesystem_impl(
@@ -2965,10 +2990,6 @@ pub(crate) async fn install_to_filesystem(
     let deployment_path =
         install_to_filesystem_impl(&state, &mut rootfs, cleanup, package_boot_entry.as_ref())
             .await?;
-    if let Some(entry) = &package_boot_entry {
-        entry.verify_retained()?;
-    }
-
     // Drop all data about the root except the path to ensure any file descriptors etc. are closed.
     drop(rootfs);
 
