@@ -126,6 +126,35 @@
                 target_archive.stat.checksum == staged_archive.stat.checksum
             fail_msg: The generated image archive SHA256 differs after transfer to the target.
 
+        - name: Load the verified image archive on the target
+          ansible.builtin.command:
+            argv:
+              - podman
+              - load
+              - --input
+              - /var/lib/bootc-tmt/bootc-to-existing-root-preserve-var-merge-etc.oci
+
+        - name: Check that the target image is available
+          ansible.builtin.command:
+            argv:
+              - podman
+              - image
+              - exists
+              - localhost/bootc-to-existing-root-preserve-var-merge-etc:latest
+          register: target_image_exists
+          changed_when: false
+
+        - name: Require the target image to be available
+          ansible.builtin.assert:
+            that:
+              - target_image_exists.rc == 0
+            fail_msg: The generated image archive did not load the expected target image.
+
+        - name: Remove the loaded image archive from the target
+          ansible.builtin.file:
+            path: /var/lib/bootc-tmt/bootc-to-existing-root-preserve-var-merge-etc.oci
+            state: absent
+
       always:
         - name: Remove controller staging after copy attempt
           ansible.builtin.file:

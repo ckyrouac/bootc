@@ -144,18 +144,6 @@ prepare:
     playbook: tmt/plans/copy-test-image.yml
     where: target
     when: package_source == artifacts or package_source == local
-  # Load only after the verified archive has been copied to the target. Test
-  # execution can happen later, after its prepare-time archive path is gone.
-  - how: shell
-    order: 103
-    script: |
-      target_image_archive=/var/lib/bootc-tmt/bootc-to-existing-root-preserve-var-merge-etc.oci
-      target_image=localhost/bootc-to-existing-root-preserve-var-merge-etc:latest
-      podman load --input "$target_image_archive"
-      podman image exists "$target_image"
-      rm -- "$target_image_archive"
-    where: target
-    when: package_source == artifacts or package_source == local
 execute:
   how: tmt
 discover:
