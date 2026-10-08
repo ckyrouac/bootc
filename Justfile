@@ -207,13 +207,19 @@ test-tmt *ARGS: build
 test-tmt-package-mode:
     #!/bin/bash
     set -euo pipefail
+    workdir_root="${TMT_WORKDIR_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/bootc/tmt-package-mode-runs}"
+    repo_root="$(git rev-parse --show-toplevel)"
+    repo_root="$(realpath -- "$repo_root")"
+    workdir_root="$(realpath -m -- "$workdir_root")"
+    if [[ "$workdir_root" == "$repo_root" || "$workdir_root" == "$repo_root/"* ]]; then
+        echo "TMT workdir root must be outside the checkout (fmf root): $workdir_root" >&2
+        exit 1
+    fi
+    mkdir -p -- "$workdir_root"
     just base={{package_mode_base}} build
     if [[ "{{base_img}}" != localhost/bootc ]]; then
         podman tag {{base_img}} localhost/bootc
     fi
-    workdir_root="${TMT_WORKDIR_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/bootc/tmt-package-mode-runs}"
-    mkdir -p -- "$workdir_root"
-    workdir_root="$(realpath -- "$workdir_root")"
     podman save --format oci-archive \
         --output target/package-mode-local.oci localhost/bootc
     tmt \
