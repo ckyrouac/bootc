@@ -139,12 +139,22 @@ case ${TMT_REBOOT_COUNT:-0} in
 
         # The original package-mode entry and all of its assets must remain
         # selectable after bootupd installs the new GRUB BLS loader.
-        rollback_entry="/boot/loader/entries/$(<"/sysroot$package_entry")"
+        package_entry_name=$(<"/sysroot$package_entry")
+        test -n "$package_entry_name"
+        case $package_entry_name in
+            *.conf) ;;
+            *)
+                echo "Saved package-mode BLS entry filename does not end in .conf: $package_entry_name" >&2
+                exit 1
+                ;;
+        esac
+        rollback_entry="/boot/loader/entries/$package_entry_name"
         test -f "$rollback_entry"
         cmp "$rollback_entry" "/sysroot$package_entry_copy"
         rollback_title=$(sed -n 's/^title //p' "$rollback_entry")
         test -n "$rollback_title"
-        rollback_id=$(<"/sysroot$package_entry")
+        # GRUB strips .conf from BLS filenames when forming menuentry IDs.
+        rollback_id=${package_entry_name%.conf}
         test -n "$rollback_id"
         test "$(sed -n 's/^version //p' "$rollback_entry")" = "$(<"/sysroot$package_kernel")"
         while read -r _ assets; do
