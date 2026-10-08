@@ -144,6 +144,8 @@ case ${TMT_REBOOT_COUNT:-0} in
         cmp "$rollback_entry" "/sysroot$package_entry_copy"
         rollback_title=$(sed -n 's/^title //p' "$rollback_entry")
         test -n "$rollback_title"
+        rollback_id=$(<"/sysroot$package_entry")
+        test -n "$rollback_id"
         test "$(sed -n 's/^version //p' "$rollback_entry")" = "$(<"/sysroot$package_kernel")"
         while read -r _ assets; do
             for asset in $assets; do
@@ -153,7 +155,8 @@ case ${TMT_REBOOT_COUNT:-0} in
         ! grep -q '^options .*ostree=' "$rollback_entry"
         test "$(<"/sysroot$package_marker")" = package-mode
 
-        grub2-reboot "$rollback_title"
+        grub2-reboot "$rollback_id"
+        grub2-editenv list | grep -Fx -- "next_entry=$rollback_id"
         reboot_with_tmt -c 'systemctl reboot'
         ;;
     2)
