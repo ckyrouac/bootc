@@ -2,9 +2,17 @@
 - name: Fetch build-under-test image archive to the TMT controller
   hosts: harness
   gather_facts: false
-  vars:
-    package_mode_staging_dir: "{{ playbook_dir }}/../../target/package-mode-transfer"
   tasks:
+    - name: Require TMT plan data directory
+      ansible.builtin.assert:
+        that:
+          - lookup('ansible.builtin.env', 'TMT_PLAN_DATA') | length > 0
+        fail_msg: TMT_PLAN_DATA must be set before staging the package-mode archive.
+
+    - name: Set the run-specific controller staging directory
+      ansible.builtin.set_fact:
+        package_mode_staging_dir: "{{ lookup('ansible.builtin.env', 'TMT_PLAN_DATA') }}/package-mode-transfer"
+
     - name: Inspect the generated image archive on the harness
       ansible.builtin.stat:
         path: /var/tmp/bootc-to-existing-root-preserve-var-merge-etc.oci
@@ -18,7 +26,7 @@
           - harness_archive.stat.isreg
         fail_msg: The generated package-mode image archive is missing on the harness.
 
-    - name: Create ignored controller staging directory
+    - name: Create run-specific controller staging directory
       ansible.builtin.file:
         path: "{{ package_mode_staging_dir }}"
         state: directory
