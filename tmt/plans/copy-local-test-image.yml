@@ -3,9 +3,23 @@
   hosts: harness
   gather_facts: false
   tasks:
+    - name: Read the local image archive path from the controller environment
+      ansible.builtin.set_fact:
+        local_archive_path: "{{ lookup('ansible.builtin.env', 'PACKAGE_MODE_IMAGE_ARCHIVE') }}"
+
+    - name: Require an absolute local image archive path
+      ansible.builtin.assert:
+        that:
+          - local_archive_path | length > 0
+          - local_archive_path is match('^/')
+        fail_msg: >-
+          PACKAGE_MODE_IMAGE_ARCHIVE must be set to the absolute path of the
+          local package-mode OCI archive by the Just invocation.
+      delegate_to: localhost
+
     - name: Inspect the local image archive on the controller
       ansible.builtin.stat:
-        path: "{{ playbook_dir }}/../../target/package-mode-local.oci"
+        path: "{{ local_archive_path }}"
         checksum_algorithm: sha256
       delegate_to: localhost
       register: local_archive
@@ -17,12 +31,13 @@
           - local_archive.stat.isreg
         fail_msg: >-
           The local package-mode OCI archive was not found at
-          target/package-mode-local.oci. Build it with
-          just test-tmt-package-mode before running the TMT plan.
+          {{ local_archive_path }}. Build it with just
+          test-tmt-package-mode before running the TMT plan.
+      delegate_to: localhost
 
     - name: Stream the local image archive to the harness
       ansible.posix.synchronize:
-        src: "{{ playbook_dir }}/../../target/package-mode-local.oci"
+        src: "{{ local_archive_path }}"
         dest: /var/tmp/bootc-package-mode-local.oci
         mode: push
         checksum: true
