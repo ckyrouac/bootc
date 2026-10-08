@@ -137,6 +137,9 @@ migration test and archive transfer. Local mode tests migration behavior using
 the image built from the checkout; it does not validate the SRPM, repository, or
 Packit provisioning path.
 
+In both package-source modes, the target preloads the test's bound container
+images because the installer resolves those references from target-side storage.
+
 Package-mode OCI archives and artifact directories are transferred from the
 harness with `ansible.posix.synchronize` (rsync over TMT's forwarded SSH
 connection). This avoids Ansible `fetch`/`copy` falling back to a piped SSH
