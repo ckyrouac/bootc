@@ -13,6 +13,26 @@ provision:
     image: $@{test_disk_image}
     user: root
 prepare:
+  # rsync is used for all large transfers. Install it before any of the
+  # package-source-specific synchronization steps below.
+  - how: install
+    order: 93
+    package:
+      - rsync
+    where: harness
+    when: package_source == artifacts or package_source == local
+  - how: install
+    order: 93
+    package:
+      - rsync
+    where: target
+    when: package_source == artifacts or package_source == local
+  # synchronize runs rsync on the TMT controller as well as each guest.
+  - how: ansible
+    order: 94
+    playbook: tmt/plans/check-transfer-prerequisites.yml
+    where: harness
+    when: package_source == artifacts or package_source == local
   # Reject missing/unknown sources before any mode-specific setup runs.
   - how: shell
     order: 95

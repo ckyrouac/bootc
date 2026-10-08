@@ -1,0 +1,19 @@
+---
+- name: Check package-mode transfer prerequisites
+  hosts: harness
+  gather_facts: false
+  tasks:
+    - name: Check rsync is available on the TMT controller
+      ansible.builtin.command: rsync --version
+      delegate_to: localhost
+      register: controller_rsync
+      changed_when: false
+      failed_when: false
+
+    - name: Require rsync on the TMT controller
+      ansible.builtin.assert:
+        that:
+          - controller_rsync.rc == 0
+        fail_msg: >-
+          Package-mode image and artifact transfers require rsync on the TMT
+          controller. Install rsync and rerun the test.

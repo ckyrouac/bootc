@@ -122,6 +122,15 @@ migration test and archive transfer. Local mode tests migration behavior using
 the image built from the checkout; it does not validate the SRPM, repository, or
 Packit provisioning path.
 
+Package-mode OCI archives and artifact directories are transferred with
+`ansible.posix.synchronize` (rsync over TMT's forwarded SSH connection) and
+SHA256-verified at the destination. This avoids Ansible `fetch`/`copy` falling
+back to a piped SSH transfer that can buffer a 1 GB+ archive in
+controller memory; the original SFTP/SCP errors were not recorded. The TMT
+controller must have `rsync` and the `ansible.posix` collection installed.
+The plan installs `rsync` on both guests from their configured base
+repositories before synchronizing any payloads.
+
 ### Faster iteration cycles
 
 The test cycle currently builds a disk image and creates a new ephemeral

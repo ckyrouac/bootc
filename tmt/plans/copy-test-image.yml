@@ -1,11 +1,55 @@
 ---
 - name: Copy build-under-test image archive from the TMT controller to target
   hosts: target
+  gather_facts: false
+  vars:
+    package_mode_staging_dir: "{{ playbook_dir }}/../../target/package-mode-transfer"
+    package_mode_archive: "{{ package_mode_staging_dir }}/bootc-to-existing-root-preserve-var-merge-etc.oci"
   tasks:
-    - name: Copy the same image archive to the target
-      ansible.builtin.copy:
-        src: /tmp/bootc-to-existing-root-preserve-var-merge-etc.oci
+    - name: Inspect the staged image archive on the controller
+      ansible.builtin.stat:
+        path: "{{ package_mode_archive }}"
+        checksum_algorithm: sha256
+      delegate_to: localhost
+      register: staged_archive
+
+    - name: Require the staged image archive
+      ansible.builtin.assert:
+        that:
+          - staged_archive.stat.exists
+          - staged_archive.stat.isreg
+        fail_msg: >-
+          The generated image archive is missing from the ignored controller
+          staging directory. The harness-to-controller transfer must complete
+          before copying it to the target.
+
+    - name: Stream the generated image archive to the target
+      ansible.posix.synchronize:
+        src: "{{ package_mode_archive }}"
         dest: /var/tmp/bootc-to-existing-root-preserve-var-merge-etc.oci
-        owner: root
-        group: root
-        mode: '0600'
+        mode: push
+        checksum: true
+        owner: false
+        group: false
+        rsync_opts:
+          - --chmod=F600
+        use_ssh_args: true
+
+    - name: Inspect the copied image archive on the target
+      ansible.builtin.stat:
+        path: /var/tmp/bootc-to-existing-root-preserve-var-merge-etc.oci
+        checksum_algorithm: sha256
+      register: target_archive
+
+    - name: Verify the generated image archive transfer to the target
+      ansible.builtin.assert:
+        that:
+          - target_archive.stat.exists
+          - target_archive.stat.checksum == staged_archive.stat.checksum
+        fail_msg: The generated image archive SHA256 differs after transfer to the target.
+
+    - name: Remove controller staging after successful transfer
+      ansible.builtin.file:
+        path: "{{ package_mode_staging_dir }}"
+        state: absent
+      delegate_to: localhost
