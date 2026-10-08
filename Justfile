@@ -211,14 +211,16 @@ test-tmt-package-mode:
     if [[ "{{base_img}}" != localhost/bootc ]]; then
         podman tag {{base_img}} localhost/bootc
     fi
-    mkdir -p target
+    workdir_root="${TMT_WORKDIR_ROOT:-target/tmt-package-mode-runs}"
+    mkdir -p "$workdir_root"
+    workdir_root="$(realpath "$workdir_root")"
     podman save --format oci-archive \
         --output target/package-mode-local.oci localhost/bootc
     tmt \
         --context=running_env=packit \
         --context=package_source=local \
         --context="test_disk_image=${test_disk_image:-fedora}" \
-        run plans --name '^/tmt/plans/package-mode$'
+        run --workdir-root "$workdir_root" plans --name '^/tmt/plans/package-mode$'
 
 # Split out from `test-container` because, unlike the container integration tests,
 # unit tests don't depend on variant/filesystem/bootloader/boot_type/seal_state, so
