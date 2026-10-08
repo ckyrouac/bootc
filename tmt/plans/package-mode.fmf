@@ -132,17 +132,13 @@ prepare:
       - https://github.com/bootc-dev/bootc/raw/refs/heads/main/hack/packit-reboot.yml
     where: harness
     when: package_source == artifacts
-  # Fetch to the TMT controller, then copy that exact archive to the target.
-  # Separate ordered steps avoid relying on shared storage or guest ordering.
+  # Stage and verify the archive on the controller. TMT pushes plan data to the
+  # selected test guest before execute, so no separate controller-to-target
+  # transfer is needed.
   - how: ansible
     order: 101
     playbook: tmt/plans/fetch-test-image.yml
     where: harness
-    when: package_source == artifacts or package_source == local
-  - how: ansible
-    order: 102
-    playbook: tmt/plans/copy-test-image.yml
-    where: target
     when: package_source == artifacts or package_source == local
 execute:
   how: tmt
@@ -151,3 +147,8 @@ discover:
   where: target
   test:
     - /tmt/tests/test-50-to-existing-root-preserve-var-merge-etc
+finish:
+  - how: ansible
+    playbook: tmt/plans/cleanup-test-image.yml
+    where: harness
+    when: package_source == artifacts or package_source == local

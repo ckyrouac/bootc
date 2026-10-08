@@ -1,0 +1,69 @@
+---
+- name: Clean up the package-mode archive staging directory
+  hosts: harness
+  gather_facts: false
+  tasks:
+    - name: Read TMT plan data directory
+      ansible.builtin.set_fact:
+        package_mode_plan_data: "{{ lookup('ansible.builtin.env', 'TMT_PLAN_DATA') }}"
+
+    - name: Validate TMT plan data directory
+      ansible.builtin.assert:
+        that:
+          - package_mode_plan_data is match('^/(?:[^/]+/)*run-[^/]+/tmt/plans/package-mode/data$')
+        fail_msg: >-
+          TMT_PLAN_DATA must be an absolute path ending in
+          /run-<id>/tmt/plans/package-mode/data before removing package-mode
+          archive staging.
+
+    - name: Canonicalize TMT plan data directory on the controller
+      ansible.builtin.command:
+        argv:
+          - realpath
+          - -e
+          - --
+          - "{{ package_mode_plan_data }}"
+      delegate_to: localhost
+      register: canonical_plan_data
+      changed_when: false
+      failed_when: false
+
+    - name: Require the canonical TMT plan data directory
+      ansible.builtin.assert:
+        that:
+          - canonical_plan_data.rc == 0
+          - canonical_plan_data.stdout == package_mode_plan_data
+          - canonical_plan_data.stdout is match('^/(?:[^/]+/)*run-[^/]+/tmt/plans/package-mode/data$')
+          - canonical_plan_data.stdout is search('/tmt/plans/package-mode/data$')
+        fail_msg: >-
+          TMT_PLAN_DATA must be the canonical, existing controller path ending
+          in /tmt/plans/package-mode/data; symlinks and non-canonical paths are
+          not allowed.
+
+    - name: Set the run-specific controller staging directory
+      ansible.builtin.set_fact:
+        package_mode_staging_dir: "{{ package_mode_plan_data }}/package-mode-transfer"
+
+    - name: Inspect the controller staging path
+      ansible.builtin.stat:
+        path: "{{ package_mode_staging_dir }}"
+      delegate_to: localhost
+      register: package_mode_staging
+
+    - name: Require a safe controller staging path
+      ansible.builtin.assert:
+        that:
+          - not (package_mode_staging.stat.islnk | default(false))
+          - >-
+            not (package_mode_staging.stat.exists | default(false)) or
+            (package_mode_staging.stat.isdir | default(false))
+        fail_msg: >-
+          The package-mode staging path must be absent or a real directory;
+          symlinks and non-directories are not allowed.
+
+    - name: Remove controller staging after test completion
+      ansible.builtin.file:
+        path: "{{ package_mode_staging_dir }}"
+        state: absent
+      delegate_to: localhost
+      when: package_mode_staging.stat.exists | default(false)

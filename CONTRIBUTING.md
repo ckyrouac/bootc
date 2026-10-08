@@ -137,17 +137,19 @@ migration test and archive transfer. Local mode tests migration behavior using
 the image built from the checkout; it does not validate the SRPM, repository, or
 Packit provisioning path.
 
-Package-mode OCI archives and artifact directories are transferred with
-`ansible.posix.synchronize` (rsync over TMT's forwarded SSH connection) and
-SHA256-verified at the destination. This avoids Ansible `fetch`/`copy` falling
-back to a piped SSH transfer that can buffer a 1 GB+ archive in
-controller memory; the original SFTP/SCP errors were not recorded. The TMT
-controller must have `rsync` and the `ansible.posix` collection installed.
-The plan installs `rsync` on both guests from their configured base
-repositories before synchronizing any payloads. The controller stages the
-archive under the run-specific `TMT_PLAN_DATA` directory. The fetch playbook
-removes staging if its transfer or checksum fails, and the copy playbook always
-removes it after the target copy/checksum attempt.
+Package-mode OCI archives and artifact directories are transferred from the
+harness with `ansible.posix.synchronize` (rsync over TMT's forwarded SSH
+connection). This avoids Ansible `fetch`/`copy` falling back to a piped SSH
+transfer that can buffer a 1 GB+ archive in controller memory; the original
+SFTP/SCP errors were not recorded. The TMT controller must have `rsync` and the
+`ansible.posix` collection installed. The plan installs `rsync` on both guests
+from their configured base repositories before synchronizing any payloads.
+The verified archive and its SHA256 sidecar are staged under the run-specific
+controller `TMT_PLAN_DATA/package-mode-transfer` directory. TMT 1.79 pushes
+controller plan data to the selected test guest before execute, where the test
+checks the sidecar and loads the archive. A finish playbook removes controller
+staging after test success or failure; the fetch playbook still cleans up if
+staging or checksum verification fails during prepare.
 
 ### Faster iteration cycles
 

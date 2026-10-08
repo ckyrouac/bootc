@@ -2,7 +2,10 @@
 set -xeuo pipefail
 
 target_image=localhost/bootc-to-existing-root-preserve-var-merge-etc:latest
-target_archive=/var/lib/bootc-tmt/bootc-to-existing-root-preserve-var-merge-etc.oci
+archive_name=bootc-to-existing-root-preserve-var-merge-etc.oci
+archive_dir="${TMT_PLAN_DATA:-}/package-mode-transfer"
+target_archive="$archive_dir/$archive_name"
+target_archive_checksum="$target_archive.sha256"
 var_marker=/var/lib/bootc-tmt-preserve-var/sentinel
 etc_dir=/etc/bootc-tmt-merge
 package_marker=/root/bootc-tmt-package-mode-marker
@@ -12,13 +15,24 @@ package_entry_copy=/root/bootc-tmt-package-mode-entry.conf
 
 case ${TMT_REBOOT_COUNT:-0} in
     0)
-        # Load in the TMT execute context that will run the installer. The
-        # target archive is retained through prepare; a failed test execution
-        # discards this disposable target VM.
-        test -f "$target_archive" && test ! -L "$target_archive" && test -s "$target_archive"
+        # TMT pushes plan data to the selected test guest before execute. Fail
+        # clearly if either staged file did not arrive with that data.
+        if [[ -z "${TMT_PLAN_DATA:-}" ]]; then
+            echo 'TMT_PLAN_DATA is missing in the package-mode test guest' >&2
+            exit 1
+        fi
+        if [[ ! -f "$target_archive" || -L "$target_archive" || ! -s "$target_archive" ]]; then
+            echo "Package-mode image archive is missing or invalid: $target_archive" >&2
+            exit 1
+        fi
+        if [[ ! -f "$target_archive_checksum" || -L "$target_archive_checksum" ]]; then
+            echo "Package-mode image archive checksum is missing or invalid: $target_archive_checksum" >&2
+            exit 1
+        fi
+        (cd "$archive_dir" && sha256sum -c -- "$archive_name.sha256")
         podman --remote=false load < "$target_archive"
         podman --remote=false image exists "$target_image"
-        rm -- "$target_archive"
+        rm -- "$target_archive" "$target_archive_checksum"
 
         # The target guest must still be the original package-mode system.
         test ! -e /run/ostree-booted

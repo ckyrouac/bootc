@@ -123,7 +123,25 @@
               - staged_archive.stat.checksum == harness_archive.stat.checksum
             fail_msg: The generated image archive SHA256 differs after transfer to the controller.
 
-        - name: Mark the staged archive ready for the copy playbook
+        - name: Create the staged archive SHA256 sidecar
+          ansible.builtin.command:
+            argv:
+              - sha256sum
+              - --
+              - bootc-to-existing-root-preserve-var-merge-etc.oci
+            chdir: "{{ package_mode_staging_dir }}"
+          delegate_to: localhost
+          register: staged_archive_checksum
+          changed_when: false
+
+        - name: Save the staged archive SHA256 sidecar
+          ansible.builtin.copy:
+            content: "{{ staged_archive_checksum.stdout }}\n"
+            dest: "{{ package_mode_staging_dir }}/bootc-to-existing-root-preserve-var-merge-etc.oci.sha256"
+            mode: '0600'
+          delegate_to: localhost
+
+        - name: Mark the staged archive and checksum ready for TMT execute
           ansible.builtin.set_fact:
             package_mode_fetch_succeeded: true
       rescue:

@@ -1,8 +1,8 @@
 # The two-guest package-mode plan prepares a test image on a separate harness
-# VM and transfers its OCI archive to target. Packit reboots the harness into
-# image mode; local runs load a locally built image instead. This test installs
-# the image onto the package-mode target, reboots it, then verifies preserved
-# /var data and merged /etc configuration.
+# VM and stages its OCI archive for TMT's plan-data push to the target guest.
+# Packit reboots the harness into image mode; local runs load a locally built
+# image instead. This test installs the image onto the package-mode target,
+# reboots it, then verifies preserved /var data and merged /etc configuration.
 summary: Package-mode /var preservation and /etc merge
 duration: 45m
 adjust:
