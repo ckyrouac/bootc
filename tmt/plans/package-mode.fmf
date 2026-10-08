@@ -146,10 +146,6 @@ prepare:
     when: package_source == artifacts or package_source == local
 execute:
   how: tmt
-finish:
-  - how: ansible
-    playbook: tmt/plans/cleanup-package-mode-transfer.yml
-    where: harness
 discover:
   how: fmf
   where: target

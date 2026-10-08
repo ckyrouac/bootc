@@ -130,8 +130,9 @@ controller memory; the original SFTP/SCP errors were not recorded. The TMT
 controller must have `rsync` and the `ansible.posix` collection installed.
 The plan installs `rsync` on both guests from their configured base
 repositories before synchronizing any payloads. The controller stages the
-archive under the run-specific `TMT_PLAN_DATA` directory and removes it after
-the target copy or during TMT's finish phase if an earlier step fails.
+archive under the run-specific `TMT_PLAN_DATA` directory. The fetch playbook
+removes staging if its transfer or checksum fails, and the copy playbook always
+removes it after the target copy/checksum attempt.
 
 ### Faster iteration cycles
 

@@ -3,61 +3,74 @@
   hosts: target
   gather_facts: false
   tasks:
-    - name: Require TMT plan data directory
+    - name: Read TMT plan data directory
+      ansible.builtin.set_fact:
+        package_mode_plan_data: "{{ lookup('ansible.builtin.env', 'TMT_PLAN_DATA') }}"
+
+    - name: Validate TMT plan data directory
       ansible.builtin.assert:
         that:
-          - lookup('ansible.builtin.env', 'TMT_PLAN_DATA') | length > 0
-        fail_msg: TMT_PLAN_DATA must be set before accessing the package-mode archive.
+          - package_mode_plan_data is match('^/(?:[^/]+/)*run-[^/]+/tmt/plans/package-mode/data$')
+          - "'.' not in package_mode_plan_data.split('/')"
+          - "'..' not in package_mode_plan_data.split('/')"
+          - "'' not in package_mode_plan_data.split('/')[1:]"
+        fail_msg: >-
+          TMT_PLAN_DATA must be an absolute, normalized path ending in
+          /run-<id>/tmt/plans/package-mode/data before accessing the package-mode
+          archive.
 
     - name: Set the run-specific controller staging paths
       ansible.builtin.set_fact:
-        package_mode_staging_dir: "{{ lookup('ansible.builtin.env', 'TMT_PLAN_DATA') }}/package-mode-transfer"
-        package_mode_archive: "{{ lookup('ansible.builtin.env', 'TMT_PLAN_DATA') }}/package-mode-transfer/bootc-to-existing-root-preserve-var-merge-etc.oci"
+        package_mode_staging_dir: "{{ package_mode_plan_data }}/package-mode-transfer"
+        package_mode_archive: "{{ package_mode_plan_data }}/package-mode-transfer/bootc-to-existing-root-preserve-var-merge-etc.oci"
 
-    - name: Inspect the staged image archive on the controller
-      ansible.builtin.stat:
-        path: "{{ package_mode_archive }}"
-        checksum_algorithm: sha256
-      delegate_to: localhost
-      register: staged_archive
+    - name: Copy and verify the staged image archive
+      block:
+        - name: Inspect the staged image archive on the controller
+          ansible.builtin.stat:
+            path: "{{ package_mode_archive }}"
+            checksum_algorithm: sha256
+          delegate_to: localhost
+          register: staged_archive
 
-    - name: Require the staged image archive
-      ansible.builtin.assert:
-        that:
-          - staged_archive.stat.exists
-          - staged_archive.stat.isreg
-        fail_msg: >-
-          The generated image archive is missing from the ignored controller
-          staging directory. The harness-to-controller transfer must complete
-          before copying it to the target.
+        - name: Require the staged image archive
+          ansible.builtin.assert:
+            that:
+              - staged_archive.stat.exists
+              - staged_archive.stat.isreg
+            fail_msg: >-
+              The generated image archive is missing from the controller
+              staging directory. The harness-to-controller transfer must
+              complete before copying it to the target.
 
-    - name: Stream the generated image archive to the target
-      ansible.posix.synchronize:
-        src: "{{ package_mode_archive }}"
-        dest: /var/tmp/bootc-to-existing-root-preserve-var-merge-etc.oci
-        mode: push
-        checksum: true
-        owner: false
-        group: false
-        rsync_opts:
-          - --chmod=F600
-        use_ssh_args: true
+        - name: Stream the generated image archive to the target
+          ansible.posix.synchronize:
+            src: "{{ package_mode_archive }}"
+            dest: /var/tmp/bootc-to-existing-root-preserve-var-merge-etc.oci
+            mode: push
+            checksum: true
+            owner: false
+            group: false
+            rsync_opts:
+              - --chmod=F600
+            use_ssh_args: true
 
-    - name: Inspect the copied image archive on the target
-      ansible.builtin.stat:
-        path: /var/tmp/bootc-to-existing-root-preserve-var-merge-etc.oci
-        checksum_algorithm: sha256
-      register: target_archive
+        - name: Inspect the copied image archive on the target
+          ansible.builtin.stat:
+            path: /var/tmp/bootc-to-existing-root-preserve-var-merge-etc.oci
+            checksum_algorithm: sha256
+          register: target_archive
 
-    - name: Verify the generated image archive transfer to the target
-      ansible.builtin.assert:
-        that:
-          - target_archive.stat.exists
-          - target_archive.stat.checksum == staged_archive.stat.checksum
-        fail_msg: The generated image archive SHA256 differs after transfer to the target.
+        - name: Verify the generated image archive transfer to the target
+          ansible.builtin.assert:
+            that:
+              - target_archive.stat.exists
+              - target_archive.stat.checksum == staged_archive.stat.checksum
+            fail_msg: The generated image archive SHA256 differs after transfer to the target.
 
-    - name: Remove controller staging after successful transfer
-      ansible.builtin.file:
-        path: "{{ package_mode_staging_dir }}"
-        state: absent
-      delegate_to: localhost
+      always:
+        - name: Remove controller staging after copy attempt
+          ansible.builtin.file:
+            path: "{{ package_mode_staging_dir }}"
+            state: absent
+          delegate_to: localhost

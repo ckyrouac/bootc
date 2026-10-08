@@ -3,55 +3,77 @@
   hosts: harness
   gather_facts: false
   tasks:
-    - name: Require TMT plan data directory
+    - name: Read TMT plan data directory
+      ansible.builtin.set_fact:
+        package_mode_plan_data: "{{ lookup('ansible.builtin.env', 'TMT_PLAN_DATA') }}"
+
+    - name: Validate TMT plan data directory
       ansible.builtin.assert:
         that:
-          - lookup('ansible.builtin.env', 'TMT_PLAN_DATA') | length > 0
-        fail_msg: TMT_PLAN_DATA must be set before staging the package-mode archive.
+          - package_mode_plan_data is match('^/(?:[^/]+/)*run-[^/]+/tmt/plans/package-mode/data$')
+          - "'.' not in package_mode_plan_data.split('/')"
+          - "'..' not in package_mode_plan_data.split('/')"
+          - "'' not in package_mode_plan_data.split('/')[1:]"
+        fail_msg: >-
+          TMT_PLAN_DATA must be an absolute, normalized path ending in
+          /run-<id>/tmt/plans/package-mode/data before staging the package-mode
+          archive.
 
     - name: Set the run-specific controller staging directory
       ansible.builtin.set_fact:
-        package_mode_staging_dir: "{{ lookup('ansible.builtin.env', 'TMT_PLAN_DATA') }}/package-mode-transfer"
+        package_mode_staging_dir: "{{ package_mode_plan_data }}/package-mode-transfer"
 
-    - name: Inspect the generated image archive on the harness
-      ansible.builtin.stat:
-        path: /var/tmp/bootc-to-existing-root-preserve-var-merge-etc.oci
-        checksum_algorithm: sha256
-      register: harness_archive
+    - name: Stage and verify the generated image archive
+      block:
+        - name: Inspect the generated image archive on the harness
+          ansible.builtin.stat:
+            path: /var/tmp/bootc-to-existing-root-preserve-var-merge-etc.oci
+            checksum_algorithm: sha256
+          register: harness_archive
 
-    - name: Require the generated image archive
-      ansible.builtin.assert:
-        that:
-          - harness_archive.stat.exists
-          - harness_archive.stat.isreg
-        fail_msg: The generated package-mode image archive is missing on the harness.
+        - name: Require the generated image archive
+          ansible.builtin.assert:
+            that:
+              - harness_archive.stat.exists
+              - harness_archive.stat.isreg
+            fail_msg: The generated package-mode image archive is missing on the harness.
 
-    - name: Create run-specific controller staging directory
-      ansible.builtin.file:
-        path: "{{ package_mode_staging_dir }}"
-        state: directory
-        mode: '0700'
-      delegate_to: localhost
+        - name: Create run-specific controller staging directory
+          ansible.builtin.file:
+            path: "{{ package_mode_staging_dir }}"
+            state: directory
+            mode: '0700'
+          delegate_to: localhost
 
-    - name: Stream the generated image archive to controller staging
-      ansible.posix.synchronize:
-        mode: pull
-        src: /var/tmp/bootc-to-existing-root-preserve-var-merge-etc.oci
-        dest: "{{ package_mode_staging_dir }}/bootc-to-existing-root-preserve-var-merge-etc.oci"
-        checksum: true
-        archive: false
-        use_ssh_args: true
+        - name: Stream the generated image archive to controller staging
+          ansible.posix.synchronize:
+            mode: pull
+            src: /var/tmp/bootc-to-existing-root-preserve-var-merge-etc.oci
+            dest: "{{ package_mode_staging_dir }}/bootc-to-existing-root-preserve-var-merge-etc.oci"
+            checksum: true
+            archive: false
+            use_ssh_args: true
 
-    - name: Inspect the staged image archive on the controller
-      ansible.builtin.stat:
-        path: "{{ package_mode_staging_dir }}/bootc-to-existing-root-preserve-var-merge-etc.oci"
-        checksum_algorithm: sha256
-      delegate_to: localhost
-      register: staged_archive
+        - name: Inspect the staged image archive on the controller
+          ansible.builtin.stat:
+            path: "{{ package_mode_staging_dir }}/bootc-to-existing-root-preserve-var-merge-etc.oci"
+            checksum_algorithm: sha256
+          delegate_to: localhost
+          register: staged_archive
 
-    - name: Verify the generated image archive transfer
-      ansible.builtin.assert:
-        that:
-          - staged_archive.stat.exists
-          - staged_archive.stat.checksum == harness_archive.stat.checksum
-        fail_msg: The generated image archive SHA256 differs after transfer to the controller.
+        - name: Verify the generated image archive transfer
+          ansible.builtin.assert:
+            that:
+              - staged_archive.stat.exists
+              - staged_archive.stat.checksum == harness_archive.stat.checksum
+            fail_msg: The generated image archive SHA256 differs after transfer to the controller.
+      rescue:
+        - name: Remove controller staging after a failed fetch
+          ansible.builtin.file:
+            path: "{{ package_mode_staging_dir }}"
+            state: absent
+          delegate_to: localhost
+
+        - name: Fail after cleaning up the failed fetch
+          ansible.builtin.fail:
+            msg: Fetching or verifying the package-mode image archive failed.
