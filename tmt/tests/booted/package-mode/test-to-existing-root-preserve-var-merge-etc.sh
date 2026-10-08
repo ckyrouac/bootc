@@ -16,8 +16,8 @@ case ${TMT_REBOOT_COUNT:-0} in
         # target archive is retained through prepare; a failed test execution
         # discards this disposable target VM.
         test -f "$target_archive" && test ! -L "$target_archive" && test -s "$target_archive"
-        podman load --input "$target_archive"
-        podman image exists "$target_image"
+        podman --remote=false load --input "$target_archive"
+        podman --remote=false image exists "$target_image"
         rm -- "$target_archive"
 
         # The target guest must still be the original package-mode system.
@@ -56,7 +56,7 @@ case ${TMT_REBOOT_COUNT:-0} in
 
         # The flags require the OSTree backend. Run the current build-under-test
         # as a privileged installer, with the package-mode root mounted at /target.
-        podman run --rm --privileged --pid=host --user=root:root \
+        podman --remote=false run --rm --privileged --pid=host --user=root:root \
             -v /dev:/dev \
             -v /:/target \
             -v /var/lib/containers:/var/lib/containers \
