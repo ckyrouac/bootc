@@ -11,13 +11,34 @@
       ansible.builtin.assert:
         that:
           - package_mode_plan_data is match('^/(?:[^/]+/)*run-[^/]+/tmt/plans/package-mode/data$')
-          - "'.' not in package_mode_plan_data.split('/')"
-          - "'..' not in package_mode_plan_data.split('/')"
-          - "'' not in package_mode_plan_data.split('/')[1:]"
         fail_msg: >-
-          TMT_PLAN_DATA must be an absolute, normalized path ending in
+          TMT_PLAN_DATA must be an absolute path ending in
           /run-<id>/tmt/plans/package-mode/data before accessing the package-mode
           archive.
+
+    - name: Canonicalize TMT plan data directory on the controller
+      ansible.builtin.command:
+        argv:
+          - realpath
+          - -e
+          - --
+          - "{{ package_mode_plan_data }}"
+      delegate_to: localhost
+      register: canonical_plan_data
+      changed_when: false
+      failed_when: false
+
+    - name: Require the canonical TMT plan data directory
+      ansible.builtin.assert:
+        that:
+          - canonical_plan_data.rc == 0
+          - canonical_plan_data.stdout == package_mode_plan_data
+          - canonical_plan_data.stdout is match('^/(?:[^/]+/)*run-[^/]+/tmt/plans/package-mode/data$')
+          - canonical_plan_data.stdout is search('/tmt/plans/package-mode/data$')
+        fail_msg: >-
+          TMT_PLAN_DATA must be the canonical, existing controller path ending
+          in /tmt/plans/package-mode/data; symlinks and non-canonical paths are
+          not allowed.
 
     - name: Set the run-specific controller staging paths
       ansible.builtin.set_fact:
@@ -54,18 +75,29 @@
             rsync_opts:
               - --chmod=F600
             use_ssh_args: true
+          ignore_unreachable: true
+          register: archive_transfer
+
+        - name: Require a reachable target transfer
+          ansible.builtin.assert:
+            that:
+              - not (archive_transfer.unreachable | default(false))
+            fail_msg: The target became unreachable while copying the package-mode archive.
 
         - name: Inspect the copied image archive on the target
           ansible.builtin.stat:
             path: /var/tmp/bootc-to-existing-root-preserve-var-merge-etc.oci
             checksum_algorithm: sha256
+          ignore_unreachable: true
           register: target_archive
 
         - name: Verify the generated image archive transfer to the target
           ansible.builtin.assert:
             that:
-              - target_archive.stat.exists
-              - target_archive.stat.checksum == staged_archive.stat.checksum
+              - >-
+                not (target_archive.unreachable | default(false)) and
+                target_archive.stat.exists and
+                target_archive.stat.checksum == staged_archive.stat.checksum
             fail_msg: The generated image archive SHA256 differs after transfer to the target.
 
       always:

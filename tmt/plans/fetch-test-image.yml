@@ -11,13 +11,34 @@
       ansible.builtin.assert:
         that:
           - package_mode_plan_data is match('^/(?:[^/]+/)*run-[^/]+/tmt/plans/package-mode/data$')
-          - "'.' not in package_mode_plan_data.split('/')"
-          - "'..' not in package_mode_plan_data.split('/')"
-          - "'' not in package_mode_plan_data.split('/')[1:]"
         fail_msg: >-
-          TMT_PLAN_DATA must be an absolute, normalized path ending in
+          TMT_PLAN_DATA must be an absolute path ending in
           /run-<id>/tmt/plans/package-mode/data before staging the package-mode
           archive.
+
+    - name: Canonicalize TMT plan data directory on the controller
+      ansible.builtin.command:
+        argv:
+          - realpath
+          - -e
+          - --
+          - "{{ package_mode_plan_data }}"
+      delegate_to: localhost
+      register: canonical_plan_data
+      changed_when: false
+      failed_when: false
+
+    - name: Require the canonical TMT plan data directory
+      ansible.builtin.assert:
+        that:
+          - canonical_plan_data.rc == 0
+          - canonical_plan_data.stdout == package_mode_plan_data
+          - canonical_plan_data.stdout is match('^/(?:[^/]+/)*run-[^/]+/tmt/plans/package-mode/data$')
+          - canonical_plan_data.stdout is search('/tmt/plans/package-mode/data$')
+        fail_msg: >-
+          TMT_PLAN_DATA must be the canonical, existing controller path ending
+          in /tmt/plans/package-mode/data; symlinks and non-canonical paths are
+          not allowed.
 
     - name: Set the run-specific controller staging directory
       ansible.builtin.set_fact:
@@ -29,13 +50,15 @@
           ansible.builtin.stat:
             path: /var/tmp/bootc-to-existing-root-preserve-var-merge-etc.oci
             checksum_algorithm: sha256
+          ignore_unreachable: true
           register: harness_archive
 
         - name: Require the generated image archive
           ansible.builtin.assert:
             that:
-              - harness_archive.stat.exists
-              - harness_archive.stat.isreg
+              - >-
+                not (harness_archive.unreachable | default(false)) and
+                harness_archive.stat.exists and harness_archive.stat.isreg
             fail_msg: The generated package-mode image archive is missing on the harness.
 
         - name: Create run-specific controller staging directory
@@ -53,6 +76,14 @@
             checksum: true
             archive: false
             use_ssh_args: true
+          ignore_unreachable: true
+          register: archive_transfer
+
+        - name: Require a reachable harness transfer
+          ansible.builtin.assert:
+            that:
+              - not (archive_transfer.unreachable | default(false))
+            fail_msg: The harness became unreachable while transferring the package-mode archive.
 
         - name: Inspect the staged image archive on the controller
           ansible.builtin.stat:
@@ -67,13 +98,18 @@
               - staged_archive.stat.exists
               - staged_archive.stat.checksum == harness_archive.stat.checksum
             fail_msg: The generated image archive SHA256 differs after transfer to the controller.
+
+        - name: Mark the staged archive ready for the copy playbook
+          ansible.builtin.set_fact:
+            package_mode_fetch_succeeded: true
       rescue:
+        - name: Report the failed archive fetch
+          ansible.builtin.fail:
+            msg: Fetching or verifying the package-mode image archive failed.
+      always:
         - name: Remove controller staging after a failed fetch
           ansible.builtin.file:
             path: "{{ package_mode_staging_dir }}"
             state: absent
           delegate_to: localhost
-
-        - name: Fail after cleaning up the failed fetch
-          ansible.builtin.fail:
-            msg: Fetching or verifying the package-mode image archive failed.
+          when: not (package_mode_fetch_succeeded | default(false))
