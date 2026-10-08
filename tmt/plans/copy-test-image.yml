@@ -171,6 +171,7 @@
           ansible.builtin.file:
             path: /var/lib/bootc-tmt/bootc-to-existing-root-preserve-var-merge-etc.oci
             state: absent
+          ignore_errors: true
           ignore_unreachable: true
           register: target_archive_cleanup
 
@@ -192,4 +193,13 @@
         (target_archive.unreachable | default(false)) or
         (target_image_load.unreachable | default(false)) or
         (target_image_exists.unreachable | default(false)) or
+        (target_archive_cleanup.unreachable | default(false))
+
+    - name: Require target archive cleanup to succeed
+      ansible.builtin.fail:
+        msg: >-
+          Failed to remove the image archive from the target after the copy
+          attempt; see the target archive cleanup result above.
+      when: >-
+        (target_archive_cleanup.failed | default(false)) or
         (target_archive_cleanup.unreachable | default(false))
