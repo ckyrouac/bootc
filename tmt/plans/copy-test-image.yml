@@ -89,6 +89,8 @@
             path: /var/lib/bootc-tmt
             state: directory
             mode: "0700"
+          ignore_unreachable: true
+          register: target_archive_directory
 
         - name: Stream the generated image archive to the target
           ansible.posix.synchronize:
@@ -104,18 +106,13 @@
           ignore_unreachable: true
           register: archive_transfer
 
-        - name: Require a reachable target transfer
-          ansible.builtin.assert:
-            that:
-              - not (archive_transfer.unreachable | default(false))
-            fail_msg: The target became unreachable while copying the package-mode archive.
-
         - name: Inspect the copied image archive on the target
           ansible.builtin.stat:
             path: /var/lib/bootc-tmt/bootc-to-existing-root-preserve-var-merge-etc.oci
             checksum_algorithm: sha256
           ignore_unreachable: true
           register: target_archive
+          when: not (archive_transfer.unreachable | default(false))
 
         - name: Verify the generated image archive transfer to the target
           ansible.builtin.assert:
@@ -125,6 +122,10 @@
                 target_archive.stat.exists and
                 target_archive.stat.checksum == staged_archive.stat.checksum
             fail_msg: The generated image archive SHA256 differs after transfer to the target.
+          when:
+            - not (archive_transfer.unreachable | default(false))
+            - not (target_archive.unreachable | default(false))
+            - not (target_archive.skipped | default(false))
 
         - name: Load the verified image archive on the target
           ansible.builtin.command:
@@ -133,6 +134,14 @@
               - load
               - --input
               - /var/lib/bootc-tmt/bootc-to-existing-root-preserve-var-merge-etc.oci
+          ignore_unreachable: true
+          register: target_image_load
+          when:
+            - not (archive_transfer.unreachable | default(false))
+            - not (target_archive.unreachable | default(false))
+            - not (target_archive.skipped | default(false))
+            - target_archive.stat.exists
+            - target_archive.stat.checksum == staged_archive.stat.checksum
 
         - name: Check that the target image is available
           ansible.builtin.command:
@@ -143,12 +152,19 @@
               - localhost/bootc-to-existing-root-preserve-var-merge-etc:latest
           register: target_image_exists
           changed_when: false
+          ignore_unreachable: true
+          when:
+            - not (target_image_load.unreachable | default(false))
+            - not (target_image_load.skipped | default(false))
 
         - name: Require the target image to be available
           ansible.builtin.assert:
             that:
               - target_image_exists.rc == 0
             fail_msg: The generated image archive did not load the expected target image.
+          when:
+            - not (target_image_exists.unreachable | default(false))
+            - not (target_image_exists.skipped | default(false))
 
       always:
         - name: Remove the image archive from the target after the copy attempt
@@ -156,6 +172,7 @@
             path: /var/lib/bootc-tmt/bootc-to-existing-root-preserve-var-merge-etc.oci
             state: absent
           ignore_unreachable: true
+          register: target_archive_cleanup
 
         - name: Remove controller staging after copy attempt
           ansible.builtin.file:
@@ -163,3 +180,16 @@
             state: absent
           delegate_to: localhost
           when: package_mode_staging_dir_valid | default(false)
+
+    - name: Fail if the target became unreachable during image preparation
+      ansible.builtin.fail:
+        msg: >-
+          The target became unreachable during package-mode image preparation;
+          controller staging has been cleaned up.
+      when: >-
+        (target_archive_directory.unreachable | default(false)) or
+        (archive_transfer.unreachable | default(false)) or
+        (target_archive.unreachable | default(false)) or
+        (target_image_load.unreachable | default(false)) or
+        (target_image_exists.unreachable | default(false)) or
+        (target_archive_cleanup.unreachable | default(false))
