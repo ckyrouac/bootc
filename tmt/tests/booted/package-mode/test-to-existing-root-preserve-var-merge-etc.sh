@@ -16,7 +16,7 @@ case ${TMT_REBOOT_COUNT:-0} in
         # target archive is retained through prepare; a failed test execution
         # discards this disposable target VM.
         test -f "$target_archive" && test ! -L "$target_archive" && test -s "$target_archive"
-        podman --remote=false load --input "$target_archive"
+        podman --remote=false load < "$target_archive"
         podman --remote=false image exists "$target_image"
         rm -- "$target_archive"
 
