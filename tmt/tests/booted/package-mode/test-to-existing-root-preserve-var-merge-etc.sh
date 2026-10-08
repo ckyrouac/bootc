@@ -48,22 +48,32 @@ case ${TMT_REBOOT_COUNT:-0} in
 
         # Preserve TMT's reboot helpers under /var so the bootc image can use
         # them after migration with --preserve-var.
-        if ! tmt_reboot_source=$(command -v tmt-reboot); then
+        if ! tmt_reboot_command_path=$(command -v tmt-reboot); then
             echo 'Cannot preserve TMT reboot helpers: tmt-reboot is unavailable before migration' >&2
             exit 1
         fi
-        if ! tmt_reboot_source=$(readlink -f -- "$tmt_reboot_source"); then
-            echo "Cannot resolve TMT reboot helper: $tmt_reboot_source" >&2
+        if ! tmt_reboot_source=$(readlink -f -- "$tmt_reboot_command_path"); then
+            echo "Cannot resolve TMT reboot helper: $tmt_reboot_command_path" >&2
             exit 1
         fi
         tmt_reboot_source_dir=${tmt_reboot_source%/*}
-        if [[ ! -f "$tmt_reboot_source_dir/tmt-reboot-core" ]]; then
-            echo "Cannot preserve TMT reboot helpers: tmt-reboot-core is missing from $tmt_reboot_source_dir" >&2
-            exit 1
-        fi
+        for helper in tmt-reboot tmt-reboot-core; do
+            helper_path="$tmt_reboot_source_dir/$helper"
+            if [[ ! -f "$helper_path" || -L "$helper_path" || ! -x "$helper_path" ]]; then
+                echo "Cannot preserve TMT reboot helpers: $helper_path is not a regular executable file" >&2
+                exit 1
+            fi
+        done
         install -d -m 0700 /var/lib/bootc-tmt "$tmt_scripts"
         cp -a "$tmt_reboot_source_dir/." "$tmt_scripts/"
         chmod 0700 "$tmt_scripts"
+        for helper in tmt-reboot tmt-reboot-core; do
+            helper_path="$tmt_scripts/$helper"
+            if [[ ! -f "$helper_path" || -L "$helper_path" || ! -x "$helper_path" ]]; then
+                echo "Preserved TMT reboot helper is not a regular executable file: $helper_path" >&2
+                exit 1
+            fi
+        done
 
         # Exercise both an admin-created file and an admin modification of an
         # image default. The derived image below supplies the pristine values.
