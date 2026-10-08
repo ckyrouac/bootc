@@ -2,19 +2,36 @@
 set -xeuo pipefail
 
 target_image=localhost/bootc-to-existing-root-preserve-var-merge-etc:latest
-target_image_archive=/var/tmp/bootc-to-existing-root-preserve-var-merge-etc.oci
+archive_name=bootc-to-existing-root-preserve-var-merge-etc.oci
+archive_dir="${TMT_PLAN_DATA:-}/package-mode-transfer"
+target_archive="$archive_dir/$archive_name"
+target_archive_checksum="$target_archive.sha256"
 var_marker=/var/lib/bootc-tmt-preserve-var/sentinel
 etc_dir=/etc/bootc-tmt-merge
 
 case ${TMT_REBOOT_COUNT:-0} in
     0)
+        # TMT pushes plan data to the selected test guest before execute. Fail
+        # clearly if either staged file did not arrive with that data.
+        if [[ -z "${TMT_PLAN_DATA:-}" ]]; then
+            echo 'TMT_PLAN_DATA is missing in the package-mode test guest' >&2
+            exit 1
+        fi
+        if [[ ! -f "$target_archive" || -L "$target_archive" || ! -s "$target_archive" ]]; then
+            echo "Package-mode image archive is missing or invalid: $target_archive" >&2
+            exit 1
+        fi
+        if [[ ! -f "$target_archive_checksum" || -L "$target_archive_checksum" ]]; then
+            echo "Package-mode image archive checksum is missing or invalid: $target_archive_checksum" >&2
+            exit 1
+        fi
+        (cd "$archive_dir" && sha256sum -c -- "$archive_name.sha256")
+        podman --remote=false load < "$target_archive"
+        podman --remote=false image exists "$target_image"
+        rm -- "$target_archive" "$target_archive_checksum"
+
         # The target guest must still be the original package-mode system.
         test ! -e /run/ostree-booted
-
-        # The image was built from the harness's build-under-test image and
-        # transferred as an archive; do not rebuild a potentially different image.
-        podman load --input "$target_image_archive"
-        podman image exists "$target_image"
 
         # Exercise both an admin-created file and an admin modification of an
         # image default. The derived image below supplies the pristine values.
@@ -33,7 +50,7 @@ case ${TMT_REBOOT_COUNT:-0} in
 
         # The flags require the OSTree backend. Run the current build-under-test
         # as a privileged installer, with the package-mode root mounted at /target.
-        podman run --rm --privileged --pid=host --user=root:root \
+        podman --remote=false run --rm --privileged --pid=host --user=root:root \
             -v /dev:/dev \
             -v /:/target \
             -v /var/lib/containers:/var/lib/containers \

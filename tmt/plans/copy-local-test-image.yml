@@ -1,11 +1,61 @@
 ---
 - name: Copy locally built package-mode image archive to the harness
   hosts: harness
+  gather_facts: false
   tasks:
-    - name: Copy the local image archive from the repository checkout
-      ansible.builtin.copy:
-        src: "{{ playbook_dir }}/../../target/package-mode-local.oci"
+    - name: Read the local image archive path from the controller environment
+      ansible.builtin.set_fact:
+        local_archive_path: "{{ lookup('ansible.builtin.env', 'PACKAGE_MODE_IMAGE_ARCHIVE') }}"
+
+    - name: Require an absolute local image archive path
+      ansible.builtin.assert:
+        that:
+          - local_archive_path | length > 0
+          - local_archive_path is match('^/')
+        fail_msg: >-
+          PACKAGE_MODE_IMAGE_ARCHIVE must be set to the absolute path of the
+          local package-mode OCI archive by the Just invocation.
+      delegate_to: localhost
+
+    - name: Inspect the local image archive on the controller
+      ansible.builtin.stat:
+        path: "{{ local_archive_path }}"
+        checksum_algorithm: sha256
+      delegate_to: localhost
+      register: local_archive
+
+    - name: Require the local image archive
+      ansible.builtin.assert:
+        that:
+          - local_archive.stat.exists
+          - local_archive.stat.isreg
+        fail_msg: >-
+          The local package-mode OCI archive was not found at
+          {{ local_archive_path }}. Build it with just
+          test-tmt-package-mode before running the TMT plan.
+      delegate_to: localhost
+
+    - name: Stream the local image archive to the harness
+      ansible.posix.synchronize:
+        src: "{{ local_archive_path }}"
         dest: /var/tmp/bootc-package-mode-local.oci
-        owner: root
-        group: root
-        mode: '0600'
+        mode: push
+        checksum: true
+        owner: false
+        group: false
+        rsync_opts:
+          - --chmod=F600
+        use_ssh_args: true
+
+    - name: Inspect the copied image archive on the harness
+      ansible.builtin.stat:
+        path: /var/tmp/bootc-package-mode-local.oci
+        checksum_algorithm: sha256
+      register: harness_archive
+
+    - name: Verify the local image archive transfer
+      ansible.builtin.assert:
+        that:
+          - harness_archive.stat.exists
+          - harness_archive.stat.checksum == local_archive.stat.checksum
+        fail_msg: The local image archive SHA256 differs after transfer to the harness.

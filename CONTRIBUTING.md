@@ -94,6 +94,21 @@ Fedora bootc base and uses TMT's `fedora` image alias (the latest released
 Fedora image). This performs a full local image build, so it takes longer and
 uses more disk/network than simply launching the VM test. The build archive is
 stored under the ignored `target/` directory and copied to the harness VM.
+For local Just runs, TMT uses a temporary metadata root containing only
+`.fmf/` and `tmt/`, so ignored build output is not synchronized to either VM;
+the OCI archive stays in `target/` and is synchronized separately.
+TMT's run workdir defaults to
+`${XDG_CACHE_HOME:-$HOME/.cache}/bootc/tmt-package-mode-runs`. It must be outside
+the checkout and temporary metadata root, and visible at the same absolute path
+to both the TMT container and the host session-libvirt process so libvirt can
+access seed images created by TMT. Set `TMT_WORKDIR_ROOT` to use a different
+shared directory that meets these requirements:
+
+```bash
+TMT_WORKDIR_ROOT=/shared/tmt-package-mode-runs just test-tmt-package-mode
+```
+
+The target creates the directory if needed and passes its absolute path to TMT.
 To use a different guest image, set `test_disk_image`:
 
 ```bash
@@ -121,6 +136,21 @@ skip Packit provisioning and the harness reboot while retaining the shared
 migration test and archive transfer. Local mode tests migration behavior using
 the image built from the checkout; it does not validate the SRPM, repository, or
 Packit provisioning path.
+
+Package-mode OCI archives and artifact directories are transferred from the
+harness with `ansible.posix.synchronize` (rsync over TMT's forwarded SSH
+connection). This avoids Ansible `fetch`/`copy` falling back to a piped SSH
+transfer that can buffer a 1 GB+ archive in controller memory; the original
+SFTP/SCP errors were not recorded. The TMT controller must have `rsync` and the
+`ansible.posix` collection installed. TMT 1.79 or newer is required on both the
+local and Testing Farm controllers. The plan installs `rsync` on both guests
+from their configured base repositories before synchronizing any payloads.
+The verified archive and its SHA256 sidecar are staged under the run-specific
+controller `TMT_PLAN_DATA/package-mode-transfer` directory. TMT 1.79 pushes
+controller plan data to the selected test guest before execute, where the test
+checks the sidecar and loads the archive. A finish playbook removes controller
+staging after test success or failure; the fetch playbook still cleans up if
+staging or checksum verification fails during prepare.
 
 ### Faster iteration cycles
 

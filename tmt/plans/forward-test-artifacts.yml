@@ -51,12 +51,54 @@
           .src.rpm file must be present in /var/share/test-artifacts/ on the
           TMT controller.
 
-    - name: Copy the full artifact repository to the harness
-      ansible.builtin.copy:
+    - name: Calculate SHA256 checksums for controller artifact files
+      ansible.builtin.find:
+        paths: /var/share/test-artifacts
+        recurse: true
+        file_type: file
+        get_checksum: true
+        checksum_algorithm: sha256
+      delegate_to: localhost
+      register: source_artifacts
+
+    - name: Create the artifact repository directory on the harness
+      ansible.builtin.file:
+        path: /var/share/test-artifacts
+        state: directory
+        mode: '0755'
+
+    - name: Stream the full artifact repository to the harness
+      ansible.posix.synchronize:
         src: /var/share/test-artifacts/
         dest: /var/share/test-artifacts/
-        owner: root
-        group: root
+        checksum: true
+        owner: false
+        group: false
+        use_ssh_args: true
+
+    - name: Calculate SHA256 checksums for harness artifact files
+      ansible.builtin.find:
+        paths: /var/share/test-artifacts
+        recurse: true
+        file_type: file
+        get_checksum: true
+        checksum_algorithm: sha256
+      register: harness_artifacts
+
+    - name: Verify the artifact repository transfer
+      ansible.builtin.assert:
+        that:
+          - >-
+            (source_artifacts.files | map(attribute='path')
+            | map('regex_replace', '^/var/share/test-artifacts/', '')
+            | zip(source_artifacts.files | map(attribute='checksum'))
+            | list | sort)
+            ==
+            (harness_artifacts.files | map(attribute='path')
+            | map('regex_replace', '^/var/share/test-artifacts/', '')
+            | zip(harness_artifacts.files | map(attribute='checksum'))
+            | list | sort)
+        fail_msg: The artifact repository SHA256 manifest differs after transfer to the harness.
 
     - name: Copy the artifact repository configuration to the harness
       ansible.builtin.copy:
@@ -66,10 +108,56 @@
         group: root
         mode: '0644'
 
-    - name: Copy ARTIFACTS to the harness
-      ansible.builtin.copy:
-        src: /var/ARTIFACTS
-        dest: /var/
-        owner: root
-        group: root
+    - name: Calculate SHA256 checksums for controller ARTIFACTS files
+      ansible.builtin.find:
+        paths: /var/ARTIFACTS
+        recurse: true
+        file_type: file
+        get_checksum: true
+        checksum_algorithm: sha256
+      delegate_to: localhost
+      register: source_artifacts_directory
+      when: artifacts_directory.stat.exists and artifacts_directory.stat.isdir
+
+    - name: Create the ARTIFACTS directory on the harness
+      ansible.builtin.file:
+        path: /var/ARTIFACTS
+        state: directory
+        mode: '0755'
+      when: artifacts_directory.stat.exists and artifacts_directory.stat.isdir
+
+    - name: Stream optional ARTIFACTS to the harness
+      ansible.posix.synchronize:
+        src: /var/ARTIFACTS/
+        dest: /var/ARTIFACTS/
+        checksum: true
+        owner: false
+        group: false
+        use_ssh_args: true
+      when: artifacts_directory.stat.exists and artifacts_directory.stat.isdir
+
+    - name: Calculate SHA256 checksums for harness ARTIFACTS files
+      ansible.builtin.find:
+        paths: /var/ARTIFACTS
+        recurse: true
+        file_type: file
+        get_checksum: true
+        checksum_algorithm: sha256
+      register: harness_artifacts_directory
+      when: artifacts_directory.stat.exists and artifacts_directory.stat.isdir
+
+    - name: Verify the optional ARTIFACTS transfer
+      ansible.builtin.assert:
+        that:
+          - >-
+            (source_artifacts_directory.files | map(attribute='path')
+            | map('regex_replace', '^/var/ARTIFACTS/', '')
+            | zip(source_artifacts_directory.files | map(attribute='checksum'))
+            | list | sort)
+            ==
+            (harness_artifacts_directory.files | map(attribute='path')
+            | map('regex_replace', '^/var/ARTIFACTS/', '')
+            | zip(harness_artifacts_directory.files | map(attribute='checksum'))
+            | list | sort)
+        fail_msg: The ARTIFACTS SHA256 manifest differs after transfer to the harness.
       when: artifacts_directory.stat.exists and artifacts_directory.stat.isdir

@@ -207,18 +207,36 @@ test-tmt *ARGS: build
 test-tmt-package-mode:
     #!/bin/bash
     set -euo pipefail
+    repo_root="$(git rev-parse --show-toplevel)"
+    repo_root="$(realpath -- "$repo_root")"
+    metadata_root="$(realpath -- "$(mktemp -d "${TMPDIR:-/tmp}/bootc-tmt-package-mode.XXXXXXXX")")"
+    trap 'rm -rf -- "$metadata_root"' EXIT
+    cp -a -- "$repo_root/.fmf" "$metadata_root/"
+    cp -a -- "$repo_root/tmt" "$metadata_root/"
+    workdir_root="${TMT_WORKDIR_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/bootc/tmt-package-mode-runs}"
+    workdir_root="$(realpath -m -- "$workdir_root")"
+    if [[ "$workdir_root" == "$repo_root" || "$workdir_root" == "$repo_root/"* ]]; then
+        echo "TMT workdir root must be outside the checkout (fmf root): $workdir_root" >&2
+        exit 1
+    fi
+    if [[ "$workdir_root" == "$metadata_root" || "$workdir_root" == "$metadata_root/"* ]]; then
+        echo "TMT workdir root must be outside the temporary metadata root: $workdir_root" >&2
+        exit 1
+    fi
+    mkdir -p -- "$workdir_root"
     just base={{package_mode_base}} build
     if [[ "{{base_img}}" != localhost/bootc ]]; then
         podman tag {{base_img}} localhost/bootc
     fi
-    mkdir -p target
     podman save --format oci-archive \
         --output target/package-mode-local.oci localhost/bootc
-    tmt \
+    archive_path="$(realpath -- target/package-mode-local.oci)"
+    PACKAGE_MODE_IMAGE_ARCHIVE="$archive_path" tmt \
+        --root "$metadata_root" \
         --context=running_env=packit \
         --context=package_source=local \
         --context="test_disk_image=${test_disk_image:-fedora}" \
-        run plans --name '^/tmt/plans/package-mode$'
+        run --workdir-root "$workdir_root" plans --name '^/tmt/plans/package-mode$'
 
 # Split out from `test-container` because, unlike the container integration tests,
 # unit tests don't depend on variant/filesystem/bootloader/boot_type/seal_state, so
