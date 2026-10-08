@@ -13,6 +13,17 @@ package_kernel=/root/bootc-tmt-package-kernel
 package_entry=/root/bootc-tmt-package-mode-entry
 package_entry_copy=/root/bootc-tmt-package-mode-entry.conf
 
+reboot_with_tmt() {
+    local tmt_scripts=/var/lib/tmt/scripts
+    PATH="$tmt_scripts${PATH:+:$PATH}"
+    export PATH
+    if [[ ! -x "$tmt_scripts/tmt-reboot" ]]; then
+        echo "TMT reboot helper is not executable: $tmt_scripts/tmt-reboot" >&2
+        return 1
+    fi
+    tmt-reboot "$@"
+}
+
 case ${TMT_REBOOT_COUNT:-0} in
     0)
         # TMT pushes plan data to the selected test guest before execute. Fail
@@ -86,7 +97,7 @@ case ${TMT_REBOOT_COUNT:-0} in
         bootc status
         # Ask the guest to reboot itself; this is more reliable than
         # testcloud's ACPI soft-poweroff for a full bootc deployment reboot.
-        tmt-reboot -c 'systemctl reboot'
+        reboot_with_tmt -c 'systemctl reboot'
         ;;
     1)
         test -e /run/ostree-booted
@@ -116,7 +127,7 @@ case ${TMT_REBOOT_COUNT:-0} in
         test "$(<"/sysroot$package_marker")" = package-mode
 
         grub2-reboot "$rollback_title"
-        tmt-reboot -c 'systemctl reboot'
+        reboot_with_tmt -c 'systemctl reboot'
         ;;
     2)
         # Actually boot the previous package-mode OS, not merely retain a BLS
