@@ -84,10 +84,16 @@
               staging directory. The harness-to-controller transfer must
               complete before copying it to the target.
 
+        - name: Create persistent target archive directory
+          ansible.builtin.file:
+            path: /var/lib/bootc-tmt
+            state: directory
+            mode: "0700"
+
         - name: Stream the generated image archive to the target
           ansible.posix.synchronize:
             src: "{{ package_mode_archive }}"
-            dest: /var/tmp/bootc-to-existing-root-preserve-var-merge-etc.oci
+            dest: /var/lib/bootc-tmt/bootc-to-existing-root-preserve-var-merge-etc.oci
             mode: push
             checksum: true
             owner: false
@@ -106,7 +112,7 @@
 
         - name: Inspect the copied image archive on the target
           ansible.builtin.stat:
-            path: /var/tmp/bootc-to-existing-root-preserve-var-merge-etc.oci
+            path: /var/lib/bootc-tmt/bootc-to-existing-root-preserve-var-merge-etc.oci
             checksum_algorithm: sha256
           ignore_unreachable: true
           register: target_archive
