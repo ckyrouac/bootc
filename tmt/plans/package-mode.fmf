@@ -125,6 +125,16 @@ prepare:
       - bootc
     where: target
     when: package_source == artifacts or package_source == local
+  # The installer resolves stored LBI references against target-side Podman
+  # storage, so preload every image used by the shared migration test.
+  - how: shell
+    order: 98
+    script: |
+      podman --remote=false pull quay.io/curl/curl:latest
+      podman --remote=false pull quay.io/curl/curl-base:latest
+      podman --remote=false pull registry.access.redhat.com/ubi9/podman:latest
+    where: target
+    when: package_source == artifacts or package_source == local
   # Reboot only the image-mode harness after system-reinstall-bootc.
   - how: ansible
     order: 100
