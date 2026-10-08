@@ -2081,6 +2081,7 @@ async fn ostree_install(
     state: &State,
     rootfs: &RootSetup,
     cleanup: Cleanup,
+    package_boot_entry: Option<&migrate::PackageBootEntry>,
 ) -> Result<camino::Utf8PathBuf> {
     // We verify this upfront because it's currently required by bootupd
     let boot_uuid = rootfs
@@ -2094,6 +2095,9 @@ async fn ostree_install(
     // Initialize the ostree sysroot (repo, stateroot, etc.)
 
     let deployment_path = {
+        if let Some(entry) = package_boot_entry {
+            entry.prepare_ostree_loader()?;
+        }
         let (sysroot, has_ostree) = initialize_ostree_root(state, rootfs).await?;
 
         let deployment_path = install_with_sysroot(
@@ -2105,6 +2109,9 @@ async fn ostree_install(
             has_ostree,
         )
         .await?;
+        if let Some(entry) = package_boot_entry {
+            entry.restore_active_entry()?;
+        }
         let ostree = sysroot.get_ostree()?;
 
         if matches!(cleanup, Cleanup::TriggerOnNextBoot) {
@@ -2132,6 +2139,7 @@ async fn install_to_filesystem_impl(
     state: &State,
     rootfs: &mut RootSetup,
     cleanup: Cleanup,
+    package_boot_entry: Option<&migrate::PackageBootEntry>,
 ) -> Result<Option<camino::Utf8PathBuf>> {
     if matches!(state.selinux_state, SELinuxFinalState::ForceTargetDisabled) {
         rootfs.kargs.extend(&Cmdline::from("selinux=0"));
@@ -2226,7 +2234,7 @@ async fn install_to_filesystem_impl(
         }
         None
     } else {
-        let deployment_path = ostree_install(state, rootfs, cleanup).await?;
+        let deployment_path = ostree_install(state, rootfs, cleanup, package_boot_entry).await?;
 
         // For s390x, we set zipl as the bootloader
         // this needs to be done after the ostree commit is deployed,
@@ -2349,7 +2357,7 @@ pub(crate) async fn install_to_disk(mut opts: InstallToDiskOpts) -> Result<()> {
         (rootfs, loopback_dev)
     };
 
-    install_to_filesystem_impl(&state, &mut rootfs, Cleanup::Skip).await?;
+    install_to_filesystem_impl(&state, &mut rootfs, Cleanup::Skip, None).await?;
 
     // Drop all data about the root except the bits we need to ensure any file descriptors etc. are closed.
     let (root_path, luksdev) = rootfs.into_storage();
@@ -2954,7 +2962,9 @@ pub(crate) async fn install_to_filesystem(
         skip_finalize,
     };
 
-    let deployment_path = install_to_filesystem_impl(&state, &mut rootfs, cleanup).await?;
+    let deployment_path =
+        install_to_filesystem_impl(&state, &mut rootfs, cleanup, package_boot_entry.as_ref())
+            .await?;
     if let Some(entry) = &package_boot_entry {
         entry.verify_retained()?;
     }
