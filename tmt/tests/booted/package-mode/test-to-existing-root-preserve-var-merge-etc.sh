@@ -12,16 +12,14 @@ package_marker=/root/bootc-tmt-package-mode-marker
 package_kernel=/root/bootc-tmt-package-kernel
 package_entry=/root/bootc-tmt-package-mode-entry
 package_entry_copy=/root/bootc-tmt-package-mode-entry.conf
+tmt_scripts=/var/lib/bootc-tmt/tmt-scripts
 
 reboot_with_tmt() {
-    local tmt_scripts=/var/lib/tmt/scripts
-    PATH="$tmt_scripts${PATH:+:$PATH}"
-    export PATH
     if [[ ! -f "$tmt_scripts/tmt-reboot" || ! -x "$tmt_scripts/tmt-reboot" ]]; then
         echo "TMT reboot helper is not a regular executable file: $tmt_scripts/tmt-reboot" >&2
         return 1
     fi
-    tmt-reboot "$@"
+    PATH="$tmt_scripts${PATH:+:$PATH}" "$tmt_scripts/tmt-reboot" "$@"
 }
 
 case ${TMT_REBOOT_COUNT:-0} in
@@ -47,6 +45,25 @@ case ${TMT_REBOOT_COUNT:-0} in
 
         # The target guest must still be the original package-mode system.
         test ! -e /run/ostree-booted
+
+        # Preserve TMT's reboot helpers under /var so the bootc image can use
+        # them after migration with --preserve-var.
+        if ! tmt_reboot_source=$(command -v tmt-reboot); then
+            echo 'Cannot preserve TMT reboot helpers: tmt-reboot is unavailable before migration' >&2
+            exit 1
+        fi
+        if ! tmt_reboot_source=$(readlink -f -- "$tmt_reboot_source"); then
+            echo "Cannot resolve TMT reboot helper: $tmt_reboot_source" >&2
+            exit 1
+        fi
+        tmt_reboot_source_dir=${tmt_reboot_source%/*}
+        if [[ ! -f "$tmt_reboot_source_dir/tmt-reboot-core" ]]; then
+            echo "Cannot preserve TMT reboot helpers: tmt-reboot-core is missing from $tmt_reboot_source_dir" >&2
+            exit 1
+        fi
+        install -d -m 0700 /var/lib/bootc-tmt "$tmt_scripts"
+        cp -a "$tmt_reboot_source_dir/." "$tmt_scripts/"
+        chmod 0700 "$tmt_scripts"
 
         # Exercise both an admin-created file and an admin modification of an
         # image default. The derived image below supplies the pristine values.
