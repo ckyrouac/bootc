@@ -17,8 +17,8 @@ reboot_with_tmt() {
     local tmt_scripts=/var/lib/tmt/scripts
     PATH="$tmt_scripts${PATH:+:$PATH}"
     export PATH
-    if [[ ! -x "$tmt_scripts/tmt-reboot" ]]; then
-        echo "TMT reboot helper is not executable: $tmt_scripts/tmt-reboot" >&2
+    if [[ ! -f "$tmt_scripts/tmt-reboot" || ! -x "$tmt_scripts/tmt-reboot" ]]; then
+        echo "TMT reboot helper is not a regular executable file: $tmt_scripts/tmt-reboot" >&2
         return 1
     fi
     tmt-reboot "$@"
