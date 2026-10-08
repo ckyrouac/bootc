@@ -3,6 +3,44 @@
   hosts: harness
   gather_facts: false
   tasks:
+    - name: Check TMT is available on the controller
+      ansible.builtin.command: tmt --version
+      delegate_to: localhost
+      register: controller_tmt_version_output
+      changed_when: false
+      failed_when: false
+
+    - name: Require TMT version output on the controller
+      ansible.builtin.assert:
+        that:
+          - controller_tmt_version_output.rc == 0
+        fail_msg: >-
+          Unable to run tmt --version on the TMT controller. Install TMT 1.79.0
+          or newer and rerun the test.
+
+    - name: Parse the TMT controller version
+      ansible.builtin.set_fact:
+        controller_tmt_version: >-
+          {{ controller_tmt_version_output.stdout
+             | regex_search('(?<![0-9A-Za-z.+-])[0-9]+[.][0-9]+[.][0-9]+(?:-[0-9A-Za-z.-]+)?(?:[+][0-9A-Za-z.-]+)?(?![0-9A-Za-z.+-])') }}
+
+    - name: Require a parseable TMT semantic version
+      ansible.builtin.assert:
+        that:
+          - controller_tmt_version is not none
+        fail_msg: >-
+          Could not parse a semantic version from TMT controller output:
+          {{ controller_tmt_version_output.stdout | default('') }}.
+          TMT 1.79.0 or newer is required.
+
+    - name: Require TMT 1.79.0 or newer on the controller
+      ansible.builtin.assert:
+        that:
+          - controller_tmt_version is version('1.79.0', '>=', version_type='semver')
+        fail_msg: >-
+          TMT {{ controller_tmt_version }} is too old on the TMT controller;
+          version 1.79.0 or newer is required to push plan data before execute.
+
     - name: Check rsync is available on the TMT controller
       ansible.builtin.command: rsync --version
       delegate_to: localhost

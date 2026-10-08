@@ -142,7 +142,8 @@ harness with `ansible.posix.synchronize` (rsync over TMT's forwarded SSH
 connection). This avoids Ansible `fetch`/`copy` falling back to a piped SSH
 transfer that can buffer a 1 GB+ archive in controller memory; the original
 SFTP/SCP errors were not recorded. The TMT controller must have `rsync` and the
-`ansible.posix` collection installed. The plan installs `rsync` on both guests
+`ansible.posix` collection installed. TMT 1.79 or newer is required on both the
+local and Testing Farm controllers. The plan installs `rsync` on both guests
 from their configured base repositories before synchronizing any payloads.
 The verified archive and its SHA256 sidecar are staged under the run-specific
 controller `TMT_PLAN_DATA/package-mode-transfer` directory. TMT 1.79 pushes
