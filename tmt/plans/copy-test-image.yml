@@ -150,12 +150,13 @@
               - target_image_exists.rc == 0
             fail_msg: The generated image archive did not load the expected target image.
 
-        - name: Remove the loaded image archive from the target
+      always:
+        - name: Remove the image archive from the target after the copy attempt
           ansible.builtin.file:
             path: /var/lib/bootc-tmt/bootc-to-existing-root-preserve-var-merge-etc.oci
             state: absent
+          ignore_unreachable: true
 
-      always:
         - name: Remove controller staging after copy attempt
           ansible.builtin.file:
             path: "{{ package_mode_staging_dir }}"
