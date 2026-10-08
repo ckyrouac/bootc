@@ -212,8 +212,8 @@ test-tmt-package-mode:
         podman tag {{base_img}} localhost/bootc
     fi
     workdir_root="${TMT_WORKDIR_ROOT:-target/tmt-package-mode-runs}"
-    mkdir -p "$workdir_root"
-    workdir_root="$(realpath "$workdir_root")"
+    mkdir -p -- "$workdir_root"
+    workdir_root="$(realpath -- "$workdir_root")"
     podman save --format oci-archive \
         --output target/package-mode-local.oci localhost/bootc
     tmt \
