@@ -22,12 +22,12 @@
       ansible.builtin.set_fact:
         controller_tmt_version: >-
           {{ controller_tmt_version_output.stdout
-             | regex_search('(?<![0-9A-Za-z.+-])[0-9]+[.][0-9]+[.][0-9]+(?:-[0-9A-Za-z.-]+)?(?:[+][0-9A-Za-z.-]+)?(?![0-9A-Za-z.+-])') }}
+             | regex_search('(?<![0-9A-Za-z.+-])[0-9]+[.][0-9]+[.][0-9]+(?![0-9A-Za-z.+-])') }}
 
     - name: Require a parseable TMT semantic version
       ansible.builtin.assert:
         that:
-          - controller_tmt_version is not none
+          - controller_tmt_version | default('', true) | length > 0
         fail_msg: >-
           Could not parse a semantic version from TMT controller output:
           {{ controller_tmt_version_output.stdout | default('') }}.
