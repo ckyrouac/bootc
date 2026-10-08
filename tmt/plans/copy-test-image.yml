@@ -127,54 +127,7 @@
             - not (target_archive.unreachable | default(false))
             - not (target_archive.skipped | default(false))
 
-        - name: Load the verified image archive on the target
-          ansible.builtin.command:
-            argv:
-              - podman
-              - load
-              - --input
-              - /var/lib/bootc-tmt/bootc-to-existing-root-preserve-var-merge-etc.oci
-          ignore_unreachable: true
-          register: target_image_load
-          when:
-            - not (archive_transfer.unreachable | default(false))
-            - not (target_archive.unreachable | default(false))
-            - not (target_archive.skipped | default(false))
-            - target_archive.stat.exists
-            - target_archive.stat.checksum == staged_archive.stat.checksum
-
-        - name: Check that the target image is available
-          ansible.builtin.command:
-            argv:
-              - podman
-              - image
-              - exists
-              - localhost/bootc-to-existing-root-preserve-var-merge-etc:latest
-          register: target_image_exists
-          changed_when: false
-          ignore_unreachable: true
-          when:
-            - not (target_image_load.unreachable | default(false))
-            - not (target_image_load.skipped | default(false))
-
-        - name: Require the target image to be available
-          ansible.builtin.assert:
-            that:
-              - target_image_exists.rc == 0
-            fail_msg: The generated image archive did not load the expected target image.
-          when:
-            - not (target_image_exists.unreachable | default(false))
-            - not (target_image_exists.skipped | default(false))
-
       always:
-        - name: Remove the image archive from the target after the copy attempt
-          ansible.builtin.file:
-            path: /var/lib/bootc-tmt/bootc-to-existing-root-preserve-var-merge-etc.oci
-            state: absent
-          ignore_errors: true
-          ignore_unreachable: true
-          register: target_archive_cleanup
-
         - name: Remove controller staging after copy attempt
           ansible.builtin.file:
             path: "{{ package_mode_staging_dir }}"
@@ -190,16 +143,4 @@
       when: >-
         (target_archive_directory.unreachable | default(false)) or
         (archive_transfer.unreachable | default(false)) or
-        (target_archive.unreachable | default(false)) or
-        (target_image_load.unreachable | default(false)) or
-        (target_image_exists.unreachable | default(false)) or
-        (target_archive_cleanup.unreachable | default(false))
-
-    - name: Require target archive cleanup to succeed
-      ansible.builtin.fail:
-        msg: >-
-          Failed to remove the image archive from the target after the copy
-          attempt; see the target archive cleanup result above.
-      when: >-
-        (target_archive_cleanup.failed | default(false)) or
-        (target_archive_cleanup.unreachable | default(false))
+        (target_archive.unreachable | default(false))

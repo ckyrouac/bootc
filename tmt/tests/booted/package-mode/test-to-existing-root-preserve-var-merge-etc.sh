@@ -2,6 +2,7 @@
 set -xeuo pipefail
 
 target_image=localhost/bootc-to-existing-root-preserve-var-merge-etc:latest
+target_archive=/var/lib/bootc-tmt/bootc-to-existing-root-preserve-var-merge-etc.oci
 var_marker=/var/lib/bootc-tmt-preserve-var/sentinel
 etc_dir=/etc/bootc-tmt-merge
 package_marker=/root/bootc-tmt-package-mode-marker
@@ -11,12 +12,16 @@ package_entry_copy=/root/bootc-tmt-package-mode-entry.conf
 
 case ${TMT_REBOOT_COUNT:-0} in
     0)
+        # Load in the TMT execute context that will run the installer. The
+        # target archive is retained through prepare; a failed test execution
+        # discards this disposable target VM.
+        test -f "$target_archive" && test ! -L "$target_archive" && test -s "$target_archive"
+        podman load --input "$target_archive"
+        podman image exists "$target_image"
+        rm -- "$target_archive"
+
         # The target guest must still be the original package-mode system.
         test ! -e /run/ostree-booted
-
-        # Prepare loaded the transferred archive before test execution; do not
-        # depend on the archive path or rebuild a potentially different image.
-        podman image exists "$target_image"
 
         # Exercise both an admin-created file and an admin modification of an
         # image default. The derived image below supplies the pristine values.
