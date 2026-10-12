@@ -42,12 +42,12 @@ concurrency:
 jobs:
   # Determine the OS matrix for CI jobs based on context:
   #   - merge_group / workflow_dispatch / ci/merge label: all OSes
-  #   - ci/tier-1 label: centos-10 only (fast feedback on the primary target)
+  #   - ci/tier-1 label or push to main: centos-10 only (fast feedback on the primary target)
   #   - PR with no merge queue configured: all OSes (the PR is the only gate,
   #     so it must run the full suite; see the merge-queue check below)
   #   - plain PR (merge queue active): no heavy jobs
-  #   - push to main: no heavy jobs (already verified pre-merge; a push here
-  #     is a record of what merged, not something new to gate)
+  #   - push to main: tier-1 only (the full suite was verified pre-merge; a push
+  #     here is a record of what merged, not something new to gate)
   compute-ci-level:
     # Cheap metadata check (gh api + jq) — no need for a full VM.
     runs-on: ubuntu-slim
@@ -124,7 +124,8 @@ jobs:
             echo 'integration_os_matrix=["fedora-44","centos-9","centos-10"]' >> "$GITHUB_OUTPUT"
             echo 'upgrade_os_matrix=["fedora-44","centos-10"]' >> "$GITHUB_OUTPUT"
             echo 'run_heavy=true' >> "$GITHUB_OUTPUT"
-          elif [[ "$DOCS_ONLY" != "true" ]] && echo "$LABELS" | jq -e 'index("ci/tier-1")' > /dev/null; then
+          elif [[ "$DOCS_ONLY" != "true" ]] && { [[ "$EVENT" == "push" ]] \
+              || echo "$LABELS" | jq -e 'index("ci/tier-1")' > /dev/null; }; then
             # Tier-1 only: centos-10
             echo 'package_os_matrix=["centos-10"]' >> "$GITHUB_OUTPUT"
             echo 'integration_os_matrix=["centos-10"]' >> "$GITHUB_OUTPUT"
