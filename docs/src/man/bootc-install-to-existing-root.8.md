@@ -30,17 +30,31 @@ provide these migrations on the **ostree backend only**. They run after the
 installation completes and before the first reboot.
 
 `--preserve-var` copies the old `/var` into the new stateroot. Where supported,
-the copy uses filesystem reflinks; otherwise it performs a regular copy of the
-non-excluded contents. A regular copy
-can be unsafe while databases or other stateful services are running. Reflinks
-clone individual files, but the directory-tree copy is not an atomic database
-snapshot; concurrent changes can still result in inconsistent data. Stop those
-services before copying. The paths
+the copy uses filesystem reflinks, which avoid immediate data duplication but
+are created per file rather than as a snapshot; otherwise it performs a regular
+copy of the non-excluded contents. A regular copy can be unsafe while databases
+or other stateful services are running. Concurrent changes can still result in
+inconsistent data, even with reflinks. Stop those services before copying.
+Hardlinks wholly within one copied batch are preserved, but hardlinks crossing
+a mountpoint or exclusion split, or separate copies while merging into an
+already-existing destination directory, may not remain linked. The paths
 `tmp`, `cache`, `log/journal`, and `lib/containers` are always excluded. Use the
 repeatable `--preserve-var-skip` option to add exclusions relative to `/var`;
 each path must be either one component (for example, `lib`) or exactly one child
 (for example, `lib/pgsql`). `/var` itself and deeper paths such as `lib/pgsql/data`
 are not accepted. Excluded data is not migrated and must be handled separately.
+The contents of nested mounts under `/var` are not migrated. Each non-excluded
+nested mountpoint is represented by an empty placeholder; an explicit exclusion
+takes precedence and omits the path entirely. Mount configuration merged into the
+new `/etc`, such as `/etc/fstab`, can re-establish configured mounts at boot.
+Runtime-only mounts need separate configuration.
+Nested mountpoints are selected from a point-in-time, best-effort mountinfo
+snapshot; mounts added or removed beneath `/var` during copying can race with
+the copy, just like concurrent file changes.
+Each missing destination entry is staged and published atomically without
+replacing existing data. A failed entry leaves no partial final entry, but the
+migration is not a global transaction: entries completed before a later failure
+can remain and a retry will preserve them.
 
 `--merge-etc` performs a three-way merge that applies the running host's `/etc`
 customizations to the new deployment before its first reboot. Without this
