@@ -629,13 +629,18 @@ pub(crate) struct InstallToExistingRootOpts {
     /// Passing this flag performs the following additional steps **after** the
     /// core install completes:
     ///
-    ///   1. `/var` content is copied into the new deployment:
-    ///      - **Reflink copy** (btrfs / XFS): `cp --reflink=always` performs an
-    ///        instantaneous copy-on-write clone — no extra disk space consumed.
+    ///   1. Non-excluded `/var` content is copied into the new deployment:
+    ///      - **Reflink copy** (btrfs / XFS): reflinks avoid immediate data
+    ///        duplication, but are created per file and are not a snapshot.
     ///      - **Full copy** (filesystems without reflinks): data is copied into
     ///        the deployment's writable `/var` directory.
     ///   2. Paths listed with `--preserve-var-skip` (or in install configuration)
-    ///      are excluded. Rollback preservation is intentionally independent.
+    ///      are excluded, including any matching nested mountpoint; exclusions
+    ///      take precedence over creating mountpoint placeholders. Other nested
+    ///      mountpoints get empty placeholders, not copied contents. `/etc`
+    ///      configuration merged with `--merge-etc` can restore configured
+    ///      mounts at boot; runtime-only mounts need separate configuration.
+    ///      Rollback preservation is intentionally independent.
     ///
     /// The running system's `root_path` must be mounted (e.g. `-v /:/target`).
     #[clap(long)]

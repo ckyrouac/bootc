@@ -305,6 +305,22 @@ excluded. Repeat `--preserve-var-skip PATH` to add further exclusions using path
 relative to `/var`: each exclusion must be either one component (such as `lib`) or
 exactly one child (such as `lib/pgsql`). `/var` itself and deeper paths are not
 accepted. Excluded data is not migrated and must be handled separately. The
+contents of nested mounts under `/var` are not migrated. Each non-excluded
+nested mountpoint is represented by an empty placeholder in the new stateroot;
+an explicit exclusion takes precedence and omits that path entirely. Mount
+definitions merged into the new `/etc` (for example, `/etc/fstab`) can
+re-establish configured mounts at boot. Runtime-only mounts need separate
+configuration. Hardlinks wholly within one copied batch are preserved, but
+hardlinks crossing a mountpoint or exclusion split, or separate copies while
+merging into an already-existing destination directory, may not remain linked.
+Nested mountpoints are selected from a point-in-time, best-effort mountinfo
+snapshot; mounts added or removed beneath `/var` during copying can race with
+the copy, just like concurrent file changes.
+Reflinks avoid immediate data duplication but are created per file and are not
+a snapshot. Each missing destination entry is staged and published atomically
+without replacing existing data. A failed entry leaves no partial final entry,
+but the migration is not a global transaction: earlier completed entries can
+remain if a later entry fails. The
 ostree-only `--merge-etc` option instead performs a three-way merge of the
 host's `/etc` customizations into the new deployment before the first reboot. See the
 [to-existing-root man page](man/bootc-install-to-existing-root.8.md) for details.
