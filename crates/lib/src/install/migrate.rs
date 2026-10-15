@@ -936,22 +936,21 @@ fn restore_directory_metadata(
 ) -> Result<()> {
     use rustix::fs::{Mode, fchmod};
 
-    let dst_file = directory.as_filelike_view::<std::fs::File>();
-    let dst_fd = dst_file.as_fd();
+    let dst_fd = open_directory_for_metadata(directory)?;
     let mut errors = Vec::new();
-    if let Err(error) = preserve_metadata_owner(&snapshot.metadata, dst_fd) {
+    if let Err(error) = preserve_metadata_owner(&snapshot.metadata, &dst_fd) {
         errors.push(format!("owner/group: {error:#}"));
     }
     if let Err(error) = fchmod(
-        dst_fd,
+        &dst_fd,
         Mode::from_bits_truncate(snapshot.metadata.mode() & 0o7777),
     ) {
         errors.push(format!("mode: {error:#}"));
     }
-    if let Err(error) = apply_xattrs_exact(dst_fd, &snapshot.xattrs) {
+    if let Err(error) = apply_xattrs_exact(&dst_fd, &snapshot.xattrs) {
         errors.push(format!("xattrs: {error:#}"));
     }
-    if let Err(error) = preserve_metadata_timestamps(&snapshot.metadata, dst_fd) {
+    if let Err(error) = preserve_metadata_timestamps(&snapshot.metadata, &dst_fd) {
         errors.push(format!("timestamps: {error:#}"));
     }
     if !errors.is_empty() {
@@ -961,8 +960,23 @@ fn restore_directory_metadata(
 }
 
 fn restore_directory_timestamps(directory: &CapStdDir, metadata: &Metadata) -> Result<()> {
-    let dst_file = directory.as_filelike_view::<std::fs::File>();
-    preserve_metadata_timestamps(metadata, dst_file.as_fd())
+    let dst_fd = open_directory_for_metadata(directory)?;
+    preserve_metadata_timestamps(metadata, &dst_fd)
+}
+
+/// Open a usable fd for fd-based metadata operations while remaining anchored
+/// to the pinned directory capability. CapStdDir may hold an O_PATH fd, which
+/// cannot be used with fchmod, xattr, or timestamp operations.
+fn open_directory_for_metadata(directory: &CapStdDir) -> Result<std::os::fd::OwnedFd> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let directory_file = directory.as_filelike_view::<std::fs::File>();
+    Ok(openat(
+        directory_file.as_fd(),
+        ".",
+        OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::RDONLY,
+        Mode::empty(),
+    )?)
 }
 
 /// Preserve ownership, mode, timestamps, and available xattrs (including ACL
@@ -1273,6 +1287,20 @@ mod tests {
         CapStdDir::open_ambient_dir(path, ambient_authority()).unwrap()
     }
 
+    fn cap_dir_path(path: &Path) -> CapStdDir {
+        use rustix::fs::{Mode, OFlags, openat};
+
+        let directory = cap_dir(path);
+        let fd = openat(
+            directory.as_filelike_view::<std::fs::File>().as_fd(),
+            ".",
+            OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::PATH,
+            Mode::empty(),
+        )
+        .unwrap();
+        CapStdDir::from_std_file(std::fs::File::from(fd))
+    }
+
     #[test]
     fn exclusions_are_relative_and_normalized() {
         assert_eq!(
@@ -1569,6 +1597,42 @@ mod tests {
             Some(b"source".to_vec())
         );
         assert_eq!(destination.getxattr(".", "user.bootc_inherited")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn directory_metadata_restoration_accepts_path_capability() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let src_path = temp.path().join("src");
+        let dst_path = temp.path().join("dst");
+        fs::create_dir(&src_path)?;
+        fs::create_dir(&dst_path)?;
+        fs::set_permissions(&src_path, fs::Permissions::from_mode(0o751))?;
+
+        let source = cap_dir(&src_path);
+        let has_user_xattr = source
+            .setxattr(".", "user.bootc_path_fd", b"metadata")
+            .is_ok();
+        let destination = cap_dir_path(&dst_path);
+        let snapshot = snapshot_directory_metadata(&source)?;
+        restore_directory_metadata(&destination, &snapshot)?;
+        assert_eq!(
+            fs::metadata(&dst_path)?.permissions().mode() & 0o7777,
+            snapshot.metadata.mode() & 0o7777
+        );
+        if has_user_xattr {
+            assert_eq!(
+                destination.getxattr(".", "user.bootc_path_fd")?,
+                Some(b"metadata".to_vec())
+            );
+        }
+
+        restore_directory_timestamps(&destination, &snapshot.metadata)?;
+        let restored = fs::metadata(&dst_path)?;
+        assert_eq!(restored.atime(), snapshot.metadata.atime());
+        assert_eq!(restored.atime_nsec(), snapshot.metadata.atime_nsec());
+        assert_eq!(restored.mtime(), snapshot.metadata.mtime());
+        assert_eq!(restored.mtime_nsec(), snapshot.metadata.mtime_nsec());
         Ok(())
     }
 
