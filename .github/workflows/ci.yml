@@ -46,8 +46,9 @@ jobs:
   #   - PR with no merge queue configured: all OSes (the PR is the only gate,
   #     so it must run the full suite; see the merge-queue check below)
   #   - plain PR (merge queue active): no heavy jobs
-  #   - push to main: no heavy jobs (already verified pre-merge; a push here
-  #     is a record of what merged, not something new to gate)
+  #   - fork push to main: tier-1 jobs for feedback without needing a PR label
+  #   - upstream push to main: no heavy jobs (already verified pre-merge; a
+  #     push here is a record of what merged, not something new to gate)
   compute-ci-level:
     # Cheap metadata check (gh api + jq) — no need for a full VM.
     runs-on: ubuntu-slim
@@ -113,6 +114,7 @@ jobs:
         run: |
           LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
           EVENT='${{ github.event_name }}'
+          IS_FORK='${{ github.event.repository.fork }}'
           MERGE_QUEUE_ENABLED='${{ steps.merge-queue.outputs.enabled }}'
           DOCS_ONLY='${{ steps.docs-check.outputs.docs_only }}'
 
@@ -124,8 +126,9 @@ jobs:
             echo 'integration_os_matrix=["fedora-44","centos-9","centos-10"]' >> "$GITHUB_OUTPUT"
             echo 'upgrade_os_matrix=["fedora-44","centos-10"]' >> "$GITHUB_OUTPUT"
             echo 'run_heavy=true' >> "$GITHUB_OUTPUT"
-          elif [[ "$DOCS_ONLY" != "true" ]] && echo "$LABELS" | jq -e 'index("ci/tier-1")' > /dev/null; then
-            # Tier-1 only: centos-10
+          elif [[ "$DOCS_ONLY" != "true" ]] && { echo "$LABELS" | jq -e 'index("ci/tier-1")' > /dev/null \
+              || [[ "$EVENT" == "push" && "$IS_FORK" == "true" ]]; }; then
+            # Tier-1 only: centos-10 (ci/tier-1 PRs and fork main pushes)
             echo 'package_os_matrix=["centos-10"]' >> "$GITHUB_OUTPUT"
             echo 'integration_os_matrix=["centos-10"]' >> "$GITHUB_OUTPUT"
             echo 'upgrade_os_matrix=["centos-10"]' >> "$GITHUB_OUTPUT"
@@ -660,8 +663,9 @@ jobs:
   # active (see the merge-queue check in that job) — in that case a PR is
   # the only gate, so this must actually require the heavy jobs rather than
   # being skipped.
-  # (Deliberately not extended to plain `push`: a push to main is a record of
-  # what already merged, not something new to gate.)
+  # (Deliberately not extended to plain `push`: fork main pushes get tier-1
+  # feedback, while upstream pushes are a record of what already merged, not
+  # something new to gate.)
   # Uses always() so it still reports a failure when an upstream heavy job failed,
   # rather than being skipped along with it.
   required-checks-heavy:
