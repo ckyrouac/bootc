@@ -81,6 +81,26 @@ jobs:
     project: bootc
     enable_net: true
 
+  # Testing Farm on commits to main (fork and upstream): full PR target set and plans.
+  - job: tests
+    trigger: commit
+    branch: main
+    identifier: main-full
+    targets:
+      - centos-stream-9-x86_64
+      - centos-stream-9-aarch64
+      - centos-stream-10-x86_64
+      - centos-stream-10-aarch64
+      - fedora-all-x86_64
+      - fedora-all-aarch64
+    tmt_plan: '^/tmt/plans/(integration(/.*)?|package-mode)$'
+    tf_extra_params:
+      environments:
+        - tmt:
+            context:
+              running_env: "packit"
+              package_source: "artifacts"
+
   # Testing Farm on PRs: only runs when ci/tier-1 or ci/merge label is present.
   # ci/tier-1: centos-10 + fedora-latest-stable (primary targets)
   - job: tests
